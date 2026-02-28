@@ -1,0 +1,24 @@
+pypdf>=4.0
+ebooklib>=0.18
+beautifulsoup4>=4.12
+Pillow>=10.0
+requests>=2.31
+rapidfuzz>=3.0
+numpy>=1.24
+sentence-transformers>=2.2
+
+# Optional — OCR for image-based PDFs
+# pytesseract>=0.3.10
+# pdf2image>=1.16
+# Also requires: brew install tesseract poppler
+
+# Optional — LLM summaries (requires running: ollama serve)
+# (uses requests, no extra pip package needed)
+
+# Optional — cover scraping
+# playwright>=1.40
+# Run after install: playwright install chromium
+
+# Optional — folder watching
+# watchdog>=4.0
+

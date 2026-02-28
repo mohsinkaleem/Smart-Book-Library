@@ -1,0 +1,56 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.coverage
+.cache
+
+# Virtual environments
+.venv
+venv/
+env/
+ENV/
+
+# Project Specific Data (avoid giant JSON/media commits)
+data/*.json
+data/covers/
+data/text_excerpts/
+data/*.db
+data/*.db-*
+
+# Documentation & Plans
+IMPLEMENTATION_PLAN.md
+
+# Book Source Files
+epubs/
+pdfs/
+
+# Playwright
+.playwright-cli/
+test-results/
+playwright/.cache/
+
+# Frontend/Server Node.js
+node_modules/
+dist/
+.next/
+out/
+.npm
+npm-debug.log*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+/data
+*.png

@@ -1,0 +1,31 @@
+[project]
+name = "books"
+version = "2.0.0"
+description = "Book catalog enrichment pipeline with OCR, LLM, and smart discovery"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "beautifulsoup4>=4.12",
+    "ebooklib>=0.18",
+    "fastapi>=0.134.0",
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "pypdf>=4.0",
+    "python-multipart>=0.0.22",
+    "rapidfuzz>=3.0",
+    "requests>=2.31",
+    "sentence-transformers>=2.2",
+    "uvicorn[standard]>=0.41.0",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10", "pdf2image>=1.16"]
+covers = ["playwright>=1.40"]
+watch = ["watchdog>=4.0"]
+all = [
+    "pytesseract>=0.3.10",
+    "pdf2image>=1.16",
+    "playwright>=1.40",
+    "watchdog>=4.0",
+]
