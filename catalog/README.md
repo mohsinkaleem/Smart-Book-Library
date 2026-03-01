@@ -149,10 +149,11 @@ For higher API rate limits, set:
 export GOOGLE_BOOKS_API_KEY="your-key-here"
 ```
 
-## Future: Web App
+## Web Application
 
-The catalog JSON is designed to power a web app with:
-- Smart search (text, themes, metadata, embeddings)
-- Sort and filter system
-- Individual book pages with similar books
-- Reading view with cross-catalog comparison
+The catalog powers a full web application (see the root `README.md`) with:
+- **Smart search** — Multi-mode search (text, semantic, hybrid) with prefix matching, phrase queries, and OR operators
+- **Reactive filter sidebar** — Filter counts update dynamically based on active search and other selected filters
+- **Individual book pages** with AI-powered similar book recommendations
+- **Reading view** with LLM-powered text analysis (summarize, explain, critique, compare)
+- **Dashboard** — Visual statistics with charts for library composition

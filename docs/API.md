@@ -104,29 +104,53 @@ Full-text and/or semantic search across the library.
 | Param      | Type   | Default  | Description                                    |
 | ---------- | ------ | -------- | ---------------------------------------------- |
 | `q`        | string | required | Search query                                   |
-| `mode`     | string | `hybrid` | `fts` (full-text), `semantic`, or `hybrid`     |
-| `page`     | int    | 1        | Page number                                    |
-| `per_page` | int    | 48       | Results per page                               |
+| `mode`            | string | `text`   | `text` (full-text), `semantic`, or `hybrid`    |
+| `page`            | int    | 1        | Page number                                    |
+| `per_page`        | int    | 48       | Results per page                               |
+| `file_type`       | string | —        | Filter by `pdf` or `epub`                      |
+| `category`        | string | —        | Filter by category name                        |
+| `theme`           | string | —        | Filter by theme name                           |
+| `language`        | string | —        | Filter by language code                        |
+| `reading_status`  | string | —        | Filter by reading status                       |
+| `favorite`        | bool   | —        | Filter favorites only                          |
+| `has_cover`       | bool   | —        | Filter by cover availability                   |
+| `has_description` | bool   | —        | Filter by description availability             |
+| `year_min`        | int    | —        | Minimum publication year                       |
+| `year_max`        | int    | —        | Maximum publication year                       |
+| `author`          | string | —        | Filter by author name                          |
+| `tag`             | string | —        | Filter by user tag                             |
 
 **Search modes:**
-- **`fts`** — SQLite FTS5 with Porter stemmer. Matches against title, authors, description, themes, categories, keywords, and text excerpts.
+- **`text`** — SQLite FTS5 with Porter stemmer. Matches against title, authors, description, themes, categories, keywords, and publisher. Supports prefix matching, quoted phrase queries, OR operators, and column-scoped search (e.g. `title:python`).
 - **`semantic`** — Encodes the query with `all-MiniLM-L6-v2` and finds nearest neighbors via cosine similarity. Requires embeddings to be generated.
-- **`hybrid`** — Runs both FTS5 and semantic, then merges and re-ranks results using reciprocal rank fusion.
+- **`hybrid`** — Runs both FTS5 and semantic, then merges and re-ranks results (40% FTS + 60% semantic weighting).
 
-**Response:** Same paginated format as `GET /api/books`.
+All search modes support the full set of filter parameters, applied server-side.
+
+**Response:** Same paginated format as `GET /api/books`. Each item includes `_score` and `match_type` fields.
 
 ---
 
 ### `GET /api/search/suggest`
 
-Autocomplete suggestions for the search bar.
+Autocomplete suggestions for the search bar. Uses a multi-tier strategy:
+1. **Title prefix match** — FTS5 prefix search on the title column (highest priority)
+2. **Broad FTS match** — Full-text search across all indexed fields
+3. **LIKE fallback** — Case-insensitive substring match on title and author for fuzzy matching
 
 | Param   | Type   | Default | Description           |
 | ------- | ------ | ------- | --------------------- |
-| `q`     | string | `""`    | Partial query string  |
+| `q`     | string | `""` | Partial query string  |
 | `limit` | int    | 8       | Max suggestions (1–20)|
 
-**Response:** Array of suggestion strings.
+**Response:**
+
+```json
+[
+  { "id": "abc123", "title": "Machine Learning in Action", "author": "Peter Harrington" },
+  { "id": "def456", "title": "Hands-On Machine Learning", "author": "Aurélien Géron" }
+]
+```
 
 ---
 
@@ -134,7 +158,31 @@ Autocomplete suggestions for the search bar.
 
 ### `GET /api/filters`
 
-Get all filter facets with item counts.
+Get filter facets with counts, **reactively scoped** to current search and active filters.
+
+Each facet dimension excludes its own filter but applies all others. For example, when `category=Python` is active, the category facet shows counts as if that filter were removed (so you can see alternatives), but all other facets (themes, languages, file types, etc.) only count books in the "Python" category.
+
+**Query Parameters:**
+
+Accepts the same filter parameters as `GET /api/books`:
+
+| Param             | Type   | Description                              |
+| ----------------- | ------ | ---------------------------------------- |
+| `search`          | string | Scope facets to FTS search results       |
+| `file_type`       | string | `pdf` or `epub`                          |
+| `category`        | string | Filter by category name                  |
+| `theme`           | string | Filter by theme name                     |
+| `language`        | string | Filter by language code                  |
+| `reading_status`  | string | Filter by reading status                 |
+| `favorite`        | string | `true` to filter favorites               |
+| `has_cover`       | string | `true` to filter books with covers       |
+| `has_description` | string | `true` to filter books with descriptions |
+| `year_min`        | string | Minimum publication year                 |
+| `year_max`        | string | Maximum publication year                 |
+| `author`          | string | Filter by author name                    |
+| `tag`             | string | Filter by user tag                       |
+
+When called with no parameters, returns unfiltered global facet counts.
 
 **Response:**
 
@@ -145,7 +193,10 @@ Get all filter facets with item counts.
   "authors": [...],
   "languages": [...],
   "file_types": [...],
-  "years": [...]
+  "years": { "min": 1950, "max": 2024 },
+  "reading_statuses": [...],
+  "tags": [...],
+  "total_matching": 85
 }
 ```
 

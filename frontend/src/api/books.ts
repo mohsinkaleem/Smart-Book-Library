@@ -77,11 +77,13 @@ export function useUpdateBook() {
   });
 }
 
-export function useFilters() {
+export function useFilters(params?: Record<string, string>) {
+  const qs = params ? buildParams(params as Record<string, unknown>) : '';
   return useQuery<FilterFacets>({
-    queryKey: ['filters'],
-    queryFn: () => get('/api/filters'),
-    staleTime: 5 * 60 * 1000,
+    queryKey: ['filters', qs],
+    queryFn: () => get(`/api/filters${qs ? `?${qs}` : ''}`),
+    staleTime: 10_000,       // revalidate more often since facets are reactive
+    placeholderData: (prev) => prev,  // keep previous data while loading to avoid flicker
   });
 }
 
@@ -99,9 +101,16 @@ interface SearchParams {
   per_page?: number;
   file_type?: string;
   category?: string;
+  theme?: string;
   language?: string;
   reading_status?: string;
   favorite?: boolean;
+  has_cover?: boolean;
+  has_description?: boolean;
+  year_min?: number;
+  year_max?: number;
+  author?: string;
+  tag?: string;
 }
 
 export function useSearch(params: SearchParams) {

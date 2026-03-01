@@ -417,26 +417,106 @@ class BookDatabase:
         }
 
     def suggest(self, query: str, limit: int = 8) -> list[dict]:
-        """Autocomplete suggestions from title."""
+        """Autocomplete suggestions from title and authors.\n        
+        First tries prefix match on title, then falls back to broader FTS match.\n        """
         if not query.strip():
             return []
-        fts_q = f'title : {query.strip()}*'
-        rows = self.conn.execute("""
-            SELECT books.id, books.title, books.author_primary
-            FROM books_fts
-            JOIN books ON books.rowid = books_fts.rowid
-            WHERE books_fts MATCH ?
-            LIMIT ?
-        """, (fts_q, limit)).fetchall()
-        return [{"id": r["id"], "title": r["title"], "author": r["author_primary"]} for r in rows]
+        
+        results = []
+        seen_ids = set()
+        
+        # 1. Prefix match on title (highest priority)
+        fts_title_q = f'title : {query.strip()}*'
+        try:
+            rows = self.conn.execute("""
+                SELECT books.id, books.title, books.author_primary, bm25(books_fts) as score
+                FROM books_fts
+                JOIN books ON books.rowid = books_fts.rowid
+                WHERE books_fts MATCH ?
+                ORDER BY score
+                LIMIT ?
+            """, (fts_title_q, limit)).fetchall()
+            for r in rows:
+                if r["id"] not in seen_ids:
+                    results.append({"id": r["id"], "title": r["title"], "author": r["author_primary"]})
+                    seen_ids.add(r["id"])
+        except Exception:
+            pass
+        
+        # 2. Broader FTS match across all fields if we need more results
+        if len(results) < limit:
+            remaining = limit - len(results)
+            fts_broad_q = self._build_fts_query(query.strip())
+            try:
+                rows = self.conn.execute("""
+                    SELECT books.id, books.title, books.author_primary, bm25(books_fts) as score
+                    FROM books_fts
+                    JOIN books ON books.rowid = books_fts.rowid
+                    WHERE books_fts MATCH ?
+                    ORDER BY score
+                    LIMIT ?
+                """, (fts_broad_q, remaining + len(results))).fetchall()
+                for r in rows:
+                    if r["id"] not in seen_ids:
+                        results.append({"id": r["id"], "title": r["title"], "author": r["author_primary"]})
+                        seen_ids.add(r["id"])
+                        if len(results) >= limit:
+                            break
+            except Exception:
+                pass
+        
+        # 3. LIKE fallback for fuzzy matching if still not enough
+        if len(results) < limit:
+            remaining = limit - len(results)
+            like_q = f"%{query.strip()}%"
+            rows = self.conn.execute("""
+                SELECT id, title, author_primary FROM books
+                WHERE (title LIKE ? COLLATE NOCASE OR author_primary LIKE ? COLLATE NOCASE)
+                LIMIT ?
+            """, (like_q, like_q, remaining + len(results))).fetchall()
+            for r in rows:
+                if r["id"] not in seen_ids:
+                    results.append({"id": r["id"], "title": r["title"], "author": r["author_primary"]})
+                    seen_ids.add(r["id"])
+                    if len(results) >= limit:
+                        break
+        
+        return results[:limit]
 
     def _build_fts_query(self, query: str) -> str:
-        """Build an FTS5 query string from user input."""
+        """Build an FTS5 query string from user input.
+        
+        Handles:
+        - Quoted phrase queries: "machine learning"
+        - Prefix matching for terms > 2 chars
+        - OR operator support: python OR java
+        - Column-specific search: title:python
+        - Implicit OR between terms for broader matching
+        """
+        query = query.strip()
+        if not query:
+            return '""'
         # If it looks like a phrase query, keep as-is
         if '"' in query:
             return query
-        # Add prefix matching to each term
+        # If user explicitly uses OR, keep structure
+        if ' OR ' in query:
+            parts = query.split(' OR ')
+            built = []
+            for part in parts:
+                terms = part.strip().split()
+                built.append(" ".join(f'"{t}"*' if len(t) > 2 else f'"{t}"' for t in terms))
+            return " OR ".join(built)
+        # If user uses column: syntax, keep it
+        if ':' in query and any(query.startswith(c + ':') for c in ('title', 'authors', 'description', 'categories', 'themes', 'keywords', 'publisher')):
+            return query + '*'
+        # Default: prefix match each term, use implicit AND
         terms = query.split()
+        if len(terms) == 1:
+            # Single word: search with prefix matching
+            t = terms[0]
+            return f'"{t}"*' if len(t) > 2 else f'"{t}"'
+        # Multiple terms: each term gets prefix matching
         return " ".join(f'"{t}"*' if len(t) > 2 else f'"{t}"' for t in terms)
 
     def _apply_filters(self, where_clauses: list, params: list, filters: dict):
@@ -458,47 +538,125 @@ class BookDatabase:
             params.append(filters["reading_status"])
         if filters.get("favorite"):
             where_clauses.append("books.favorite = 1")
+        if filters.get("has_cover"):
+            where_clauses.append("books.cover_path IS NOT NULL AND books.cover_path != ''")
+        if filters.get("has_description"):
+            where_clauses.append("books.description IS NOT NULL AND books.description != ''")
+        if filters.get("year_min") is not None:
+            where_clauses.append("books.publication_year >= ?")
+            params.append(int(filters["year_min"]))
+        if filters.get("year_max") is not None:
+            where_clauses.append("books.publication_year <= ?")
+            params.append(int(filters["year_max"]))
+        if filters.get("author"):
+            where_clauses.append("books.authors LIKE ?")
+            params.append(f'%"{filters["author"]}"%')
+        if filters.get("tag"):
+            where_clauses.append("books.user_tags LIKE ?")
+            params.append(f'%"{filters["tag"]}"%')
 
     # ── Filter Facets ────────────────────────────────────────────────────
 
-    def get_filter_facets(self) -> dict:
-        """Get all filter facet values with counts."""
+    def get_filter_facets(self, **filters) -> dict:
+        """Get all filter facet values with counts, scoped to current filters.
+        
+        Each facet dimension excludes its own filter so users see what's
+        available if they change that particular filter, while all other
+        filters remain applied. This creates a truly reactive sidebar.
+        """
         facets = {}
 
-        # Categories
-        facets["categories"] = self._count_json_array_field("categories")
+        # ── Helper: build WHERE clause excluding a specific filter key ──
+        def _base_where(exclude_key: str | None = None):
+            clauses: list[str] = []
+            params: list = []
+            f = dict(filters)
+            if exclude_key and exclude_key in f:
+                del f[exclude_key]
+            self._apply_filters(clauses, params, f)
+            # Handle extra filters not covered by _apply_filters
+            if exclude_key != "has_cover" and f.get("has_cover"):
+                clauses.append("cover_path IS NOT NULL AND cover_path != ''")
+            if exclude_key != "has_description" and f.get("has_description"):
+                clauses.append("description IS NOT NULL AND description != ''")
+            if exclude_key != "year_min" and f.get("year_min"):
+                clauses.append("publication_year >= ?")
+                params.append(int(f["year_min"]))
+            if exclude_key != "year_max" and f.get("year_max"):
+                clauses.append("publication_year <= ?")
+                params.append(int(f["year_max"]))
+            # Handle search query
+            if f.get("search"):
+                fts_q = self._build_fts_query(f["search"])
+                clauses.append("books.rowid IN (SELECT books_fts.rowid FROM books_fts WHERE books_fts MATCH ?)")
+                params.append(fts_q)
+            return (" AND ".join(clauses) if clauses else "1=1"), params
+
+        # Categories (exclude own filter)
+        where, params = _base_where("category")
+        facets["categories"] = self._count_json_array_field_filtered("categories", where, params)
         # Themes
-        facets["themes"] = self._count_json_array_field("themes")
+        where, params = _base_where("theme")
+        facets["themes"] = self._count_json_array_field_filtered("themes", where, params)
         # Authors
-        facets["authors"] = self._count_json_array_field("authors")
+        where, params = _base_where("author")
+        facets["authors"] = self._count_json_array_field_filtered("authors", where, params)
         # Languages
+        where, params = _base_where("language")
         rows = self.conn.execute(
-            "SELECT language, COUNT(*) as cnt FROM books WHERE language != '' GROUP BY language ORDER BY cnt DESC"
+            f"SELECT language, COUNT(*) as cnt FROM books WHERE language != '' AND ({where}) GROUP BY language ORDER BY cnt DESC",
+            params
         ).fetchall()
         facets["languages"] = [{"name": r["language"], "count": r["cnt"]} for r in rows]
         # File types
+        where, params = _base_where("file_type")
         rows = self.conn.execute(
-            "SELECT file_type, COUNT(*) as cnt FROM books GROUP BY file_type ORDER BY cnt DESC"
+            f"SELECT file_type, COUNT(*) as cnt FROM books WHERE ({where}) GROUP BY file_type ORDER BY cnt DESC",
+            params
         ).fetchall()
         facets["file_types"] = [{"name": r["file_type"], "count": r["cnt"]} for r in rows]
         # Year range
+        where, params = _base_where("year_min")
         row = self.conn.execute(
-            "SELECT MIN(publication_year) as min_year, MAX(publication_year) as max_year FROM books WHERE publication_year IS NOT NULL"
+            f"SELECT MIN(publication_year) as min_year, MAX(publication_year) as max_year FROM books WHERE publication_year IS NOT NULL AND ({where})",
+            params
         ).fetchone()
         facets["years"] = {"min": row["min_year"], "max": row["max_year"]} if row else {"min": None, "max": None}
         # Reading status
+        where, params = _base_where("reading_status")
         rows = self.conn.execute(
-            "SELECT reading_status, COUNT(*) as cnt FROM books GROUP BY reading_status ORDER BY cnt DESC"
+            f"SELECT reading_status, COUNT(*) as cnt FROM books WHERE ({where}) GROUP BY reading_status ORDER BY cnt DESC",
+            params
         ).fetchall()
         facets["reading_statuses"] = [{"name": r["reading_status"], "count": r["cnt"]} for r in rows]
         # Tags
-        facets["tags"] = self._count_json_array_field("user_tags")
+        where, params = _base_where("tag")
+        facets["tags"] = self._count_json_array_field_filtered("user_tags", where, params)
+
+        # Total matching current full filter set
+        where_all, params_all = _base_where(None)
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) as cnt FROM books WHERE ({where_all})", params_all
+        ).fetchone()
+        facets["total_matching"] = total_row["cnt"]
 
         return facets
 
     def _count_json_array_field(self, field_name: str) -> list[dict]:
         """Count occurrences in a JSON array field."""
         rows = self.conn.execute(f"SELECT {field_name} FROM books").fetchall()
+        from collections import Counter
+        counter: Counter = Counter()
+        for row in rows:
+            items = _parse_json_field(row[field_name])
+            counter.update(items)
+        return [{"name": name, "count": count} for name, count in counter.most_common(50)]
+
+    def _count_json_array_field_filtered(self, field_name: str, where_sql: str, params: list) -> list[dict]:
+        """Count occurrences in a JSON array field, filtered by WHERE clause."""
+        rows = self.conn.execute(
+            f"SELECT {field_name} FROM books WHERE ({where_sql})", params
+        ).fetchall()
         from collections import Counter
         counter: Counter = Counter()
         for row in rows:

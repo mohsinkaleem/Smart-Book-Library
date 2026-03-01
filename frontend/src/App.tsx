@@ -106,6 +106,7 @@ function AppShell() {
                   onFilterChange={handleFilterChange}
                   onClearFilters={handleClearFilters}
                   collapsed={!sidebarOpen}
+                  searchQuery={searchQuery}
                 />
                 <main className="flex-1 overflow-y-auto">
                   <HomePage

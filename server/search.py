@@ -137,10 +137,30 @@ class SearchEngine:
             cats = book.get("categories", [])
             if filters["category"] not in cats:
                 return False
+        if filters.get("theme"):
+            themes = book.get("themes", [])
+            if filters["theme"] not in themes:
+                return False
         if filters.get("language") and book.get("language") != filters["language"]:
             return False
         if filters.get("reading_status") and book.get("reading_status") != filters["reading_status"]:
             return False
         if filters.get("favorite") and not book.get("favorite"):
             return False
+        if filters.get("has_cover") and not book.get("has_cover"):
+            return False
+        if filters.get("has_description") and not book.get("has_description"):
+            return False
+        if filters.get("year_min") is not None:
+            year = book.get("publication_year")
+            if year is None or year < int(filters["year_min"]):
+                return False
+        if filters.get("year_max") is not None:
+            year = book.get("publication_year")
+            if year is None or year > int(filters["year_max"]):
+                return False
+        if filters.get("author"):
+            authors = book.get("authors", [])
+            if filters["author"] not in authors:
+                return False
         return True

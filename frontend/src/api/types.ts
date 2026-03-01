@@ -61,6 +61,7 @@ export interface FilterFacets {
   years: { min: number | null; max: number | null };
   reading_statuses: FacetItem[];
   tags: FacetItem[];
+  total_matching?: number;
 }
 
 export interface FacetItem {

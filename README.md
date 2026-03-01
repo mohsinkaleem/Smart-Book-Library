@@ -5,14 +5,16 @@ A local-first web application for managing, cataloging, and exploring your perso
 ## Features
 
 - **Smart Cataloging** — Automatically extracts metadata (title, authors, ISBN, language, page count) from PDF and EPUB files
-- **Full-Text Search** — SQLite FTS5 with Porter stemmer for fast, typo-tolerant search across all book metadata and text
+- **Full-Text Search** — SQLite FTS5 with Porter stemmer for fast, typo-tolerant search across all book metadata and text. Supports prefix matching, phrase queries, OR operators, and column-scoped searches
 - **Semantic Search** — Sentence-transformer embeddings enable "find books like this" similarity queries
+- **Reactive Filters** — Sidebar filter counts update dynamically based on active search query and other selected filters, showing real-time availability
 - **Reading View** — In-browser text reader with adjustable font size, paragraph formatting, and copy-to-clipboard
 - **LLM Analysis** — Ollama-powered streaming analysis (summarize, explain, critique, compare) of selected text passages
 - **Cover Art** — Automatic cover extraction from files and API enrichment from Open Library / Google Books
 - **Dashboard** — Visual statistics with charts showing library composition by category, type, language, and reading progress
 - **Dark Mode** — Full dark/light theme toggle with system preference detection
 - **Responsive Grid/List Views** — Switch between grid and list layouts with sort and filter controls
+- **Smart Autocomplete** — Multi-tier search suggestions (title prefix → FTS match → fuzzy LIKE fallback) with keyboard navigation and highlight matching
 - **Reading Tracker** — Mark books as not started / in progress / finished / abandoned with progress percentage
 
 ## Tech Stack
@@ -127,7 +129,7 @@ books/
 │   └── routes/
 │       ├── books.py         # /api/books — CRUD, list, similar, text
 │       ├── search.py        # /api/search — Full-text and semantic search
-│       ├── filters.py       # /api/filters — Category/theme/author facets
+│       ├── filters.py       # /api/filters — Reactive facets scoped to search/filters
 │       ├── stats.py         # /api/stats — Library statistics
 │       ├── reading.py       # /api/reading — Reading text, compare, LLM analyze
 │       ├── pipeline.py      # /api/pipeline — Re-process, embeddings
@@ -141,9 +143,9 @@ books/
 │   │   │   ├── books/       # BookCard, BookGrid, BookList, BookCover
 │   │   │   ├── common/      # Spinner, ErrorBoundary
 │   │   │   ├── detail/      # BookHeader, SimilarBooks
-│   │   │   ├── layout/      # Header, Sidebar
+│   │   │   ├── layout/      # Header, Sidebar (reactive filter counts)
 │   │   │   ├── reading/     # ReadingView, LLMPanel
-│   │   │   ├── search/      # SearchBar
+│   │   │   ├── search/      # SearchBar (multi-mode, keyboard nav, highlighting)
 │   │   │   └── stats/       # Dashboard charts
 │   │   ├── hooks/           # Custom React hooks
 │   │   ├── pages/           # Route-level page components
@@ -220,24 +222,38 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 
 **Query parameters for `GET /api/search`:**
 
-| Param    | Type   | Description                                          |
-| -------- | ------ | ---------------------------------------------------- |
-| `q`      | string | Search query text                                    |
-| `mode`   | string | `fts` (full-text), `semantic`, or `hybrid` (default) |
-| `page`   | int    | Page number                                          |
-| `per_page` | int  | Items per page                                       |
+| Param             | Type   | Description                                          |
+| ----------------- | ------ | ---------------------------------------------------- |
+| `q`               | string | Search query text                                    |
+| `mode`            | string | `text` (full-text), `semantic`, or `hybrid` (default)|
+| `page`            | int    | Page number                                          |
+| `per_page`        | int    | Items per page                                       |
+| `file_type`       | string | Filter by type: `pdf`, `epub`                        |
+| `category`        | string | Filter by category                                   |
+| `theme`           | string | Filter by theme                                      |
+| `language`        | string | Filter by language                                   |
+| `reading_status`  | string | Filter by reading status                             |
+| `favorite`        | bool   | Filter favorites only                                |
+| `has_cover`       | bool   | Filter by cover availability                         |
+| `has_description` | bool   | Filter by description availability                   |
+| `year_min`        | int    | Minimum publication year                             |
+| `year_max`        | int    | Maximum publication year                             |
+| `author`          | string | Filter by author                                     |
+| `tag`             | string | Filter by user tag                                   |
 
 ### Filters — `/api/filters`
 
-| Method | Endpoint               | Description                     |
-| ------ | ---------------------- | ------------------------------- |
-| GET    | `/api/filters`         | All filter facets with counts   |
-| GET    | `/api/filters/categories` | Category facets              |
-| GET    | `/api/filters/themes`  | Theme facets                    |
-| GET    | `/api/filters/authors` | Author facets                   |
-| GET    | `/api/filters/languages` | Language facets               |
-| GET    | `/api/filters/years`   | Publication year facets         |
-| GET    | `/api/filters/tags`    | User tag facets                 |
+| Method | Endpoint               | Description                                    |
+| ------ | ---------------------- | ---------------------------------------------- |
+| GET    | `/api/filters`         | Reactive filter facets scoped to current query  |
+| GET    | `/api/filters/categories` | Category facets                              |
+| GET    | `/api/filters/themes`  | Theme facets                                    |
+| GET    | `/api/filters/authors` | Author facets                                   |
+| GET    | `/api/filters/languages` | Language facets                               |
+| GET    | `/api/filters/years`   | Publication year facets                         |
+| GET    | `/api/filters/tags`    | User tag facets                                 |
+
+`GET /api/filters` accepts the same filter query parameters as `GET /api/books` (e.g. `search`, `category`, `file_type`, etc.). Each facet dimension excludes its own filter but applies all others, so counts reflect what's available if the user changes that particular filter while all other constraints remain.
 
 ### Statistics — `/api/stats`
 

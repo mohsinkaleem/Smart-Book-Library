@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useFilters } from '../../api/books';
 import { ChevronDown, ChevronRight, BookOpen } from 'lucide-react';
 import clsx from 'clsx';
@@ -8,6 +8,7 @@ interface SidebarProps {
   onFilterChange: (key: string, value: string) => void;
   onClearFilters: () => void;
   collapsed: boolean;
+  searchQuery?: string;
 }
 
 function FilterSection({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
@@ -26,32 +27,64 @@ function FilterSection({ title, children, defaultOpen = true }: { title: string;
 function FilterRadio({ label, value: _value, selected, count, onChange }: {
   label: string; value: string; selected: boolean; count?: number; onChange: () => void;
 }) {
+  const isEmpty = count === 0;
   return (
     <button
       onClick={onChange}
       className={clsx(
         'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors',
-        selected ? 'bg-primary-50 text-primary-700 font-medium dark:bg-primary-900/30 dark:text-primary-300' : 'text-slate-600 hover:bg-slate-50 dark:text-slate-400 dark:hover:bg-slate-700/50',
+        selected
+          ? 'bg-primary-50 text-primary-700 font-medium dark:bg-primary-900/30 dark:text-primary-300'
+          : isEmpty
+            ? 'text-slate-300 dark:text-slate-600 cursor-default'
+            : 'text-slate-600 hover:bg-slate-50 dark:text-slate-400 dark:hover:bg-slate-700/50',
       )}
+      disabled={isEmpty && !selected}
     >
       <span className="truncate flex-1 text-left">{label}</span>
       {count !== undefined && (
-        <span className="shrink-0 text-[10px] text-slate-400">{count}</span>
+        <span className={clsx(
+          'shrink-0 tabular-nums text-[10px] min-w-[20px] text-right transition-all',
+          selected ? 'text-primary-500 font-semibold' : isEmpty ? 'text-slate-300 dark:text-slate-600' : 'text-slate-400',
+        )}>
+          {count}
+        </span>
       )}
     </button>
   );
 }
 
-export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed }: SidebarProps) {
-  const { data: facets } = useFilters();
+export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, searchQuery }: SidebarProps) {
+  // Build params for reactive facet query: include search + all active filters
+  const facetParams = useMemo(() => {
+    const params: Record<string, string> = {};
+    if (searchQuery) params.search = searchQuery;
+    // Pass all active filters so counts react to each other
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params[key] = value;
+    });
+    return params;
+  }, [filters, searchQuery]);
+
+  const { data: facets, isFetching } = useFilters(facetParams);
 
   if (collapsed) return null;
 
   return (
     <aside className="h-full w-64 shrink-0 overflow-y-auto border-r border-slate-200 bg-white px-4 py-4 dark:border-slate-700 dark:bg-slate-800/50">
-      <h2 className="mb-4 flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
-        <BookOpen size={18} className="text-primary-500" /> Filters
-      </h2>
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+          <BookOpen size={18} className="text-primary-500" /> Filters
+        </h2>
+        {isFetching && (
+          <div className="h-3 w-3 animate-spin rounded-full border-2 border-primary-400 border-t-transparent" />
+        )}
+      </div>
+      {facets?.total_matching !== undefined && (searchQuery || Object.values(filters).some(Boolean)) && (
+        <div className="mb-3 rounded-md bg-primary-50 px-2.5 py-1.5 text-xs font-medium text-primary-700 dark:bg-primary-900/30 dark:text-primary-300">
+          {facets.total_matching} book{facets.total_matching !== 1 ? 's' : ''} matching
+        </div>
+      )}
 
       {/* Categories */}
       <FilterSection title="Categories">
