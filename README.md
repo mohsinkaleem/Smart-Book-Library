@@ -57,7 +57,39 @@ Place your PDFs in `pdfs/` and EPUBs in `epubs/`, then run:
 python build_catalog.py
 ```
 
-This scans the files, extracts metadata, and populates the SQLite database at `data/catalog.db`.
+This scans the files, extracts metadata, verifies it against OpenLibrary and Google
+Books, and populates the SQLite database at `data/catalog.db`.
+
+Nothing from an external provider is written because it was *returned* — it is written
+because it *scored* against local evidence (filename, embedded metadata, title page,
+ISBN). Matches at 0.75 or above are applied in full; 0.45–0.75 contributes descriptive
+fields only and lands in the review queue; below that the result is rejected and logged.
+Every field records where it came from and how confident we are, in `field_sources`.
+
+Useful flags:
+
+```bash
+python build_catalog.py --only "Aisha.pdf"   # process one file (repeatable)
+python build_catalog.py --max 50             # first 50 books
+python build_catalog.py --type epub          # EPUBs only
+python build_catalog.py --llm                # Ollama summaries + borderline adjudication
+python build_catalog.py --verify-sources     # probe providers before running
+python build_catalog.py --force              # redo everything, ignoring stage versions
+python build_catalog.py --report             # catalog quality report
+python build_catalog.py --review             # list records needing human review
+python build_catalog.py --export-json        # write data/catalog.json (an export, not a source)
+```
+
+Re-runs are incremental: each stage carries a version, and a stage only runs again when
+its version changed, the file's content hash changed, or `--force` is given. Bumping one
+stage version in `catalog/config.py` re-runs just that stage across the catalog.
+
+**Provider API keys.** Google Books' anonymous quota is small and per-IP, so bulk runs
+get 429s. Put a key in a gitignored `.env` at the project root to lift it:
+
+```
+GOOGLE_BOOKS_API_KEY=your-key-here
+```
 
 ### 3. Build the Frontend
 
@@ -287,6 +319,18 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | GET    | `/api/pipeline/embedding-status`     | Embedding generation status    |
 | GET    | `/api/pipeline/unprocessed`          | List unprocessed books         |
 
+### Review — `/api/review`
+
+Records the verification gate could not confirm. A correction made here is pinned as
+`source: "user"`, `confidence: 1.0`, and no future pipeline run may overwrite it.
+
+| Method | Endpoint                      | Description                          |
+| ------ | ----------------------------- | ------------------------------------ |
+| GET    | `/api/review/queue`           | Records needing review, worst first  |
+| GET    | `/api/review/fields`          | Fields a human may correct           |
+| POST   | `/api/review/{id}/pin`        | Pin a corrected field value          |
+| POST   | `/api/review/{id}/resolve`    | Mark a record as reviewed            |
+
 ## Development
 
 ### Frontend Dev Server
@@ -302,7 +346,18 @@ The backend has CORS configured for `localhost:5173`.
 
 ### Database
 
-The SQLite database uses WAL mode for concurrent reads and includes an FTS5 virtual table for full-text search. The schema stores all book metadata, reading progress, user tags, and embeddings.
+`data/catalog.db` is the store of record: the pipeline writes it directly and the server
+reads it, so there is no JSON round-trip and no "which store is current?" question.
+`data/catalog.json` is produced only by `--export-json`.
+
+The database uses WAL mode for concurrent reads and an FTS5 virtual table for full-text
+search. Three tables hold book data:
+
+- `books` — everything the pipeline produces, including `field_sources` (per-field source
+  and confidence), `match_score`, `needs_review` and `stage_versions`
+- `user_data` — ratings, tags, favourites, reading progress and pinned corrections. The
+  pipeline never writes these columns, so a run (or a full rebuild) cannot destroy them
+- `embeddings` — content and metadata vectors
 
 To inspect the database:
 

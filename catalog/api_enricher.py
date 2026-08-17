@@ -1,406 +1,262 @@
 """
-API enrichment module - fetches metadata from OpenLibrary and Google Books APIs.
+API enrichment: evidence → candidates → verification → provenance-aware merge.
 
-Strategies:
-1. Search by ISBN (most accurate)
-2. Search by title + author
-3. Search by title only (fallback)
+The old flow took `docs[0]` / `items[0]` and applied it unconditionally, so a
+bad query was *guaranteed* to produce a confidently wrong record, and the wrong
+ISBN it wrote then "confirmed" the wrong book on the next run
+(see the verification gate in `evidence.py`).
 
-Implements caching to avoid redundant API calls.
+Now:
+
+* both providers are always consulted — no short-circuit on the first one that
+  answers — and every result is scored against local evidence;
+* ≥0.75 (or ≥0.85 when the title is our only evidence) applies everything;
+  0.45–0.75 applies descriptive fields only and flags the record for review;
+  below that, nothing is applied and the rejection is recorded;
+* an identifier is written only when it was *verified*, never merely returned.
 """
-import json
 import logging
-import re
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
-from .config import (
-    OPENLIBRARY_SEARCH_URL,
-    OPENLIBRARY_WORKS_URL,
-    OPENLIBRARY_BOOKS_URL,
-    OPENLIBRARY_COVERS_URL,
-    GOOGLE_BOOKS_API_URL,
-    GOOGLE_BOOKS_API_KEY,
-    API_REQUEST_TIMEOUT,
-    API_RATE_LIMIT_DELAY,
-    ENRICHMENT_CACHE_FILE,
-    COVERS_DIR,
+from .config import API_REQUEST_TIMEOUT, COVERS_DIR
+from .evidence import (
+    ACCEPT,
+    PARTIAL,
+    REJECT,
+    Candidate,
+    Evidence,
+    best_candidate,
+    collect_evidence,
 )
 from .models import BookRecord
+from .names import clean_authors
+from .providers import (
+    get_metrics,
+    google_books_by_isbn,
+    google_books_search,
+    openlibrary_by_isbn,
+    openlibrary_search,
+    openlibrary_work_details,
+    probe_sources,
+    save_cache,
+)
 
 logger = logging.getLogger(__name__)
 
-
-class APICache:
-    """Simple file-based cache for API responses."""
-
-    def __init__(self, cache_file: Path = ENRICHMENT_CACHE_FILE):
-        self.cache_file = cache_file
-        self._cache = {}
-        self._load()
-
-    def _load(self):
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, "r", encoding="utf-8") as f:
-                    self._cache = json.load(f)
-            except Exception:
-                self._cache = {}
-
-    def save(self):
-        with open(self.cache_file, "w", encoding="utf-8") as f:
-            json.dump(self._cache, f, indent=2, ensure_ascii=False)
-
-    def get(self, key: str) -> Optional[dict]:
-        return self._cache.get(key)
-
-    def set(self, key: str, value: dict):
-        self._cache[key] = value
-
-    def has(self, key: str) -> bool:
-        return key in self._cache
+# Fields a borderline match is allowed to contribute. Identity fields (title,
+# authors, ISBNs, year, publisher) are deliberately excluded.
+_DESCRIPTIVE_FIELDS = {"description", "page_count", "language", "cover_path"}
 
 
-_cache = APICache()
+def gather_candidates(evidence: Evidence, max_isbns: int = 2) -> list[Candidate]:
+    """Query both providers: ISBN lookups first, then field-scoped searches."""
+    candidates: list[Candidate] = []
+
+    for isbn in sorted(evidence.isbns, key=len, reverse=True)[:max_isbns]:
+        candidates.extend(openlibrary_by_isbn(isbn))
+        candidates.extend(google_books_by_isbn(isbn))
+
+    author = evidence.authors[0] if evidence.authors else ""
+    for title in evidence.query_titles():
+        found = [*openlibrary_search(title, author), *google_books_search(title, author)]
+        # Retry without the author only when *this* title found nothing with it;
+        # testing the accumulated list made the fallback fire for the first
+        # title only, whatever the later ones returned.
+        if author and not any(c.strategy == "title_author" for c in found):
+            found += [*openlibrary_search(title), *google_books_search(title)]
+        candidates.extend(found)
+
+    return [c for c in candidates if c.title]
 
 
-def enrich_from_apis(record: BookRecord) -> BookRecord:
+def enrich_from_apis(
+    record: BookRecord,
+    adjudicator: Optional[Callable[[BookRecord, Candidate, Evidence], Optional[bool]]] = None,
+) -> dict:
     """
-    Enrich a BookRecord using OpenLibrary and Google Books APIs.
-    Tries multiple search strategies in order of reliability.
+    Enrich one record. Returns a result dict describing what happened, which
+    the pipeline folds into its run report.
     """
-    enriched = False
+    evidence = collect_evidence(record)
+    result = {
+        "verdict": REJECT,
+        "score": 0.0,
+        "provider": "",
+        "reason": "",
+        "candidates": 0,
+        "evidence": evidence.summary(),
+    }
 
-    # Strategy 1: Search by ISBN (most reliable)
-    if record.isbn_13 or record.isbn_10:
-        isbn = record.isbn_13 or record.isbn_10
-        enriched = _enrich_openlibrary_isbn(record, isbn)
-        if not enriched:
-            enriched = _enrich_google_books_isbn(record, isbn)
+    if not evidence.has_isbn() and not evidence.title_is_searchable():
+        record.flag_review("insufficient evidence to identify this file")
+        result["reason"] = "insufficient evidence — no ISBN and no usable title"
+        return result
 
-    # Strategy 2: Search by title + author
-    if not enriched and record.title:
-        search_query = record.title
-        if record.authors:
-            search_query += " " + record.authors[0]
-        enriched = _enrich_openlibrary_search(record, search_query)
-        if not enriched:
-            enriched = _enrich_google_books_search(record, search_query)
+    candidates = gather_candidates(evidence)
+    result["candidates"] = len(candidates)
+    if not candidates:
+        record.flag_review("no provider returned a match")
+        result["reason"] = "no candidates returned"
+        return result
 
-    # Strategy 3: Title only (broader search)
-    if not enriched and record.title:
-        enriched = _enrich_google_books_search(record, record.title)
+    best, verdict, rejections = best_candidate(candidates, evidence)
+    record.rejected_candidates = rejections
+    result.update({"verdict": verdict["verdict"], "score": verdict["score"],
+                   "reason": verdict["reason"]})
 
-    _cache.save()
-    return record
+    if best is None:
+        record.match_score = verdict["score"]
+        record.flag_review(f"no candidate passed verification ({verdict['reason']})")
+        logger.info(
+            f"   ⛔ rejected all {len(candidates)} candidates for {record.file_name}: "
+            f"{verdict['reason']}"
+        )
+        return result
+
+    # Borderline matches may be adjudicated by the local LLM (§20).
+    if verdict["verdict"] == PARTIAL and adjudicator is not None:
+        decision = adjudicator(record, best, evidence)
+        if decision is True:
+            verdict = {**verdict, "verdict": ACCEPT,
+                       "reason": verdict["reason"] + " (llm-adjudicated match)"}
+            result.update({"verdict": ACCEPT, "reason": verdict["reason"]})
+        elif decision is False:
+            record.match_score = verdict["score"]
+            record.flag_review("llm rejected the borderline match")
+            result["verdict"] = REJECT
+            result["reason"] = verdict["reason"] + " (llm-adjudicated mismatch)"
+            return result
+
+    is_isbn_match = verdict["reason"].startswith("isbn match")
+    source = "isbn_match" if is_isbn_match else "api_verified"
+    confidence = float(verdict["score"])
+
+    if verdict["verdict"] == ACCEPT:
+        _apply_candidate(record, best, source, confidence, identity=True)
+        record.match_score = confidence
+        result["provider"] = best.provider
+        if best.provider not in record.api_sources:
+            record.api_sources.append(best.provider)
+        logger.info(
+            f"   ✅ {best.provider} match ({confidence:.2f}) for {record.file_name}: "
+            f"{best.full_title[:70]}"
+        )
+    else:  # PARTIAL
+        _apply_candidate(record, best, "api_partial", confidence, identity=False)
+        record.match_score = confidence
+        record.flag_review(
+            f"borderline match ({confidence:.2f}) with "
+            f"'{best.full_title[:60]}' — identity fields left untouched"
+        )
+        result["provider"] = best.provider
+        if best.provider not in record.api_sources:
+            record.api_sources.append(best.provider)
+        logger.info(
+            f"   ⚠️  borderline {best.provider} match ({confidence:.2f}) for "
+            f"{record.file_name}: {best.full_title[:70]}"
+        )
+
+    return result
 
 
-# ─── OpenLibrary ────────────────────────────────────────────────────────────────
+def _is_truncation_of(candidate_title: str, current_title: str) -> bool:
+    """
+    True when the provider's title is just a shortened form of ours.
 
-def _enrich_openlibrary_isbn(record: BookRecord, isbn: str) -> bool:
-    """Enrich using OpenLibrary ISBN API."""
-    cache_key = f"ol_isbn_{isbn}"
-    data = _cache.get(cache_key)
+    OpenLibrary's ISBN record for "Understanding Salafism" is titled
+    "Salafism"; accepting it would replace a correct, fuller title with a
+    poorer one purely because the match was verified.
+    """
+    import re as _re
 
-    if data is None:
-        try:
-            url = f"{OPENLIBRARY_BOOKS_URL}?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
-            resp = requests.get(url, timeout=API_REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            _cache.set(cache_key, data)
-            time.sleep(API_RATE_LIMIT_DELAY)
-        except Exception as e:
-            logger.debug(f"OpenLibrary ISBN lookup failed for {isbn}: {e}")
-            _cache.set(cache_key, {})
-            return False
+    def norm(text: str) -> str:
+        return _re.sub(r"[^\w\s]", " ", (text or "").lower()).strip()
 
-    book_key = f"ISBN:{isbn}"
-    if book_key not in data:
+    cand, current = norm(candidate_title), norm(current_title)
+    if not cand or not current:
         return False
-
-    info = data[book_key]
-    _apply_openlibrary_data(record, info)
-    if "openlibrary" not in record.api_sources:
-        record.api_sources.append("openlibrary")
-    return True
+    return len(cand) < len(current) and cand in current
 
 
-def _enrich_openlibrary_search(record: BookRecord, query: str) -> bool:
-    """Enrich using OpenLibrary Search API."""
-    cache_key = f"ol_search_{_normalize_query(query)}"
-    data = _cache.get(cache_key)
+def _apply_candidate(
+    record: BookRecord,
+    cand: Candidate,
+    source: str,
+    confidence: float,
+    identity: bool,
+):
+    """Merge a candidate into the record, field by field, with provenance."""
+    if identity:
+        if cand.title and not _is_truncation_of(cand.title, record.title):
+            record.set_field("title", cand.title.strip(), source, confidence)
+        if cand.subtitle:
+            record.set_field("subtitle", cand.subtitle.strip(), source, confidence)
+        authors = clean_authors(cand.authors)
+        if authors:
+            record.set_field("authors", authors, source, confidence)
+        if cand.publisher:
+            record.set_field("publisher", cand.publisher.strip(), source, confidence)
+        if cand.year:
+            record.set_field("publication_year", cand.year, source, confidence)
+        # Identifiers only ever come from a verified match.
+        if cand.isbn_13:
+            record.set_field("isbn_13", cand.isbn_13, source, confidence)
+        if cand.isbn_10:
+            record.set_field("isbn_10", cand.isbn_10, source, confidence)
 
-    if data is None:
-        try:
-            params = {"q": query, "limit": 3, "fields": "key,title,author_name,first_publish_year,publisher,isbn,subject,cover_i,number_of_pages_median,language"}
-            resp = requests.get(OPENLIBRARY_SEARCH_URL, params=params, timeout=API_REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            _cache.set(cache_key, data)
-            time.sleep(API_RATE_LIMIT_DELAY)
-        except Exception as e:
-            logger.debug(f"OpenLibrary search failed for '{query}': {e}")
-            _cache.set(cache_key, {"docs": []})
-            return False
+    if cand.page_count:
+        record.set_field("page_count", cand.page_count, source, confidence * 0.9)
+    if cand.language:
+        record.set_field("language", cand.language[:2], source, confidence * 0.9)
 
-    docs = data.get("docs", [])
-    if not docs:
-        return False
+    description = cand.description
+    subjects = list(cand.subjects or [])
+    if cand.provider == "openlibrary" and cand.work_key and (not description or not subjects):
+        details = openlibrary_work_details(cand.work_key)
+        description = description or details.get("description", "")
+        subjects = subjects or details.get("subjects", [])
+        if cand.work_key and f"ol:{cand.work_key}" not in record.source_ids:
+            record.source_ids.append(f"ol:{cand.work_key}")
 
-    # Take the best match (first result)
-    doc = docs[0]
-    _apply_openlibrary_search_data(record, doc)
+    if description:
+        record.set_field("description", description[:2000], source, confidence * 0.95)
 
-    # Try to get detailed work info for description
-    work_key = doc.get("key", "")
-    if work_key:
-        _fetch_openlibrary_work_details(record, work_key)
+    if subjects:
+        # External subjects are kept raw and searchable; they never become
+        # facet categories directly (§A6 — that is the analyzer's job).
+        merged = list(dict.fromkeys([*record.subjects_raw, *[s.strip() for s in subjects if s]]))
+        record.subjects_raw = merged[:25]
 
-    if "openlibrary" not in record.api_sources:
-        record.api_sources.append("openlibrary")
-    return True
+    # A cover is the most visible field in the UI, so a borderline match never
+    # gets to supply one — a children's book jacket on a da'wah pamphlet reads
+    # as fact long before anyone opens the review queue.
+    if identity and cand.cover_url and not record.cover_path:
+        _download_cover(record, cand.cover_url, source, confidence)
 
 
-def _fetch_openlibrary_work_details(record: BookRecord, work_key: str):
-    """Fetch detailed work info from OpenLibrary for description/subjects."""
-    cache_key = f"ol_work_{work_key}"
-    data = _cache.get(cache_key)
-
-    if data is None:
-        try:
-            url = f"https://openlibrary.org{work_key}.json"
-            resp = requests.get(url, timeout=API_REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            _cache.set(cache_key, data)
-            time.sleep(API_RATE_LIMIT_DELAY)
-        except Exception as e:
-            logger.debug(f"OpenLibrary work details failed for {work_key}: {e}")
-            _cache.set(cache_key, {})
+def _download_cover(record: BookRecord, url: str, source: str, confidence: float):
+    """Download a cover image."""
+    if record.cover_path:
+        return
+    try:
+        from .providers import _get_session  # pooled session, retries, UA
+        resp = _get_session().get(url, timeout=API_REQUEST_TIMEOUT, stream=True)
+        resp.raise_for_status()
+        content = resp.content
+        content_type = resp.headers.get("content-type", "")
+        if "image" not in content_type or len(content) < 1000:
             return
 
-    if not data:
-        return
-
-    # Description
-    desc = data.get("description", "")
-    if isinstance(desc, dict):
-        desc = desc.get("value", "")
-    if desc and not record.description:
-        record.description = desc[:2000]
-
-    # Subjects
-    subjects = data.get("subjects", [])
-    if subjects and not record.categories:
-        record.categories = subjects[:10]
-
-
-def _apply_openlibrary_data(record: BookRecord, info: dict):
-    """Apply data from OpenLibrary Books API response."""
-    if not record.title or record.title == record.file_name:
-        record.title = info.get("title", record.title)
-
-    if not record.original_title_meta:
-        record.original_title_meta = info.get("title", "")
-
-    authors = info.get("authors", [])
-    if authors and not record.authors:
-        record.authors = [a.get("name", "") for a in authors if a.get("name")]
-
-    publishers = info.get("publishers", [])
-    if publishers and not record.publisher:
-        record.publisher = publishers[0].get("name", "")
-
-    if not record.publication_year:
-        publish_date = info.get("publish_date", "")
-        year = _extract_year_from_string(publish_date)
-        if year:
-            record.publication_year = year
-
-    if not record.page_count:
-        record.page_count = info.get("number_of_pages")
-
-    subjects = info.get("subjects", [])
-    if subjects and not record.categories:
-        record.categories = [s.get("name", "") for s in subjects[:10] if s.get("name")]
-
-    # Cover
-    cover = info.get("cover", {})
-    if cover and not record.cover_path:
-        cover_url = cover.get("large") or cover.get("medium") or cover.get("small")
-        if cover_url:
-            _download_cover(record, cover_url)
-
-
-def _apply_openlibrary_search_data(record: BookRecord, doc: dict):
-    """Apply data from OpenLibrary Search API response."""
-    if not record.original_title_meta:
-        record.original_title_meta = doc.get("title", "")
-
-    if doc.get("author_name") and not record.authors:
-        record.authors = doc["author_name"][:5]
-
-    if doc.get("publisher") and not record.publisher:
-        record.publisher = doc["publisher"][0] if doc["publisher"] else ""
-
-    if doc.get("first_publish_year") and not record.publication_year:
-        record.publication_year = doc["first_publish_year"]
-
-    if doc.get("number_of_pages_median") and not record.page_count:
-        record.page_count = doc["number_of_pages_median"]
-
-    if doc.get("subject") and not record.categories:
-        record.categories = doc["subject"][:10]
-
-    if doc.get("language") and not record.language:
-        langs = doc["language"]
-        record.language = langs[0] if langs else ""
-
-    # ISBN
-    if doc.get("isbn"):
-        isbns = doc["isbn"]
-        for isbn in isbns:
-            clean = re.sub(r"[^0-9Xx]", "", isbn)
-            if len(clean) == 13 and not record.isbn_13:
-                record.isbn_13 = clean
-            elif len(clean) == 10 and not record.isbn_10:
-                record.isbn_10 = clean
-
-    # Cover from cover_i
-    cover_i = doc.get("cover_i")
-    if cover_i and not record.cover_path:
-        cover_url = f"{OPENLIBRARY_COVERS_URL}/id/{cover_i}-L.jpg"
-        _download_cover(record, cover_url)
-
-
-# ─── Google Books ───────────────────────────────────────────────────────────────
-
-def _enrich_google_books_isbn(record: BookRecord, isbn: str) -> bool:
-    """Enrich using Google Books API by ISBN."""
-    return _enrich_google_books_search(record, f"isbn:{isbn}")
-
-
-def _enrich_google_books_search(record: BookRecord, query: str) -> bool:
-    """Enrich using Google Books API search."""
-    cache_key = f"gb_search_{_normalize_query(query)}"
-    data = _cache.get(cache_key)
-
-    if data is None:
-        try:
-            params = {"q": query, "maxResults": 3}
-            if GOOGLE_BOOKS_API_KEY:
-                params["key"] = GOOGLE_BOOKS_API_KEY
-            resp = requests.get(GOOGLE_BOOKS_API_URL, params=params, timeout=API_REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            _cache.set(cache_key, data)
-            time.sleep(API_RATE_LIMIT_DELAY)
-        except Exception as e:
-            logger.debug(f"Google Books search failed for '{query}': {e}")
-            _cache.set(cache_key, {"totalItems": 0})
-            return False
-
-    items = data.get("items", [])
-    if not items:
-        return False
-
-    # Best match
-    vol = items[0].get("volumeInfo", {})
-    _apply_google_books_data(record, vol)
-
-    if "google_books" not in record.api_sources:
-        record.api_sources.append("google_books")
-    return True
-
-
-def _apply_google_books_data(record: BookRecord, vol: dict):
-    """Apply data from Google Books API response."""
-    if not record.original_title_meta:
-        title = vol.get("title", "")
-        subtitle = vol.get("subtitle", "")
-        if subtitle:
-            title = f"{title}: {subtitle}"
-        record.original_title_meta = title
-
-    if vol.get("authors") and not record.authors:
-        record.authors = vol["authors"][:5]
-
-    if vol.get("publisher") and not record.publisher:
-        record.publisher = vol["publisher"]
-
-    if vol.get("publishedDate") and not record.publication_year:
-        year = _extract_year_from_string(vol["publishedDate"])
-        if year:
-            record.publication_year = year
-
-    if vol.get("pageCount") and not record.page_count:
-        record.page_count = vol["pageCount"]
-
-    if vol.get("description") and not record.description:
-        record.description = vol["description"][:2000]
-
-    if vol.get("categories") and not record.categories:
-        record.categories = vol["categories"][:10]
-
-    if vol.get("language") and not record.language:
-        record.language = vol["language"]
-
-    # ISBNs
-    identifiers = vol.get("industryIdentifiers", [])
-    for ident in identifiers:
-        id_type = ident.get("type", "")
-        id_val = ident.get("identifier", "")
-        if id_type == "ISBN_13" and not record.isbn_13:
-            record.isbn_13 = id_val
-        elif id_type == "ISBN_10" and not record.isbn_10:
-            record.isbn_10 = id_val
-
-    # Cover
-    images = vol.get("imageLinks", {})
-    if images and not record.cover_path:
-        cover_url = (
-                images.get("thumbnail")
-                or images.get("smallThumbnail")
-                or images.get("small")
-                or images.get("medium")
-        )
-        if cover_url:
-            # Google Books uses http, upgrade to https
-            cover_url = cover_url.replace("http://", "https://")
-            _download_cover(record, cover_url)
-
-
-# ─── Utilities ──────────────────────────────────────────────────────────────────
-
-def _download_cover(record: BookRecord, url: str):
-    """Download a cover image from URL."""
-    if record.cover_path:  # Already have a cover
-        return
-
-    try:
-        resp = requests.get(url, timeout=API_REQUEST_TIMEOUT, stream=True)
-        resp.raise_for_status()
-
-        content_type = resp.headers.get("content-type", "")
-        if "image" not in content_type and len(resp.content) < 1000:
-            return  # Not a valid image
-
-        # Determine extension
-        ext = "jpg"
-        if "png" in content_type:
-            ext = "png"
-
-        cover_name = f"{Path(record.file_name).stem}_cover.{ext}"
-        cover_path = COVERS_DIR / cover_name
-
+        ext = "png" if "png" in content_type else "jpg"
+        # Keyed on the record id: `pdfs/x.pdf` and `epubs/x.epub` share a stem
+        # and used to overwrite each other's cover.
+        cover_path = COVERS_DIR / f"{record.id or Path(record.file_name).stem}_cover.{ext}"
         with open(cover_path, "wb") as f:
-            f.write(resp.content)
+            f.write(content)
 
-        # Try to optimize with PIL
         try:
             from PIL import Image
             img = Image.open(cover_path)
@@ -408,7 +264,6 @@ def _download_cover(record: BookRecord, url: str):
                 img = img.convert("RGB")
             if img.width > 800 or img.height > 1200:
                 img.thumbnail((800, 1200), Image.LANCZOS)
-            # Save as JPEG
             jpg_path = cover_path.with_suffix(".jpg")
             img.save(str(jpg_path), "JPEG", quality=85)
             if jpg_path != cover_path:
@@ -417,28 +272,20 @@ def _download_cover(record: BookRecord, url: str):
         except Exception:
             pass
 
-        record.cover_path = str(cover_path.relative_to(COVERS_DIR.parent.parent))
-        logger.debug(f"Downloaded cover for {record.file_name}")
-
-    except Exception as e:
+        record.set_field(
+            "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
+            source, confidence,
+        )
+    except requests.RequestException as e:
         logger.debug(f"Failed to download cover from {url}: {e}")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"Cover handling failed for {record.file_name}: {e}")
 
 
-def _normalize_query(query: str) -> str:
-    """Normalize a search query for cache key."""
-    return re.sub(r"\s+", "_", query.lower().strip())[:100]
-
-
-def _extract_year_from_string(s: str) -> Optional[int]:
-    """Extract a year from a string."""
-    m = re.search(r"(\d{4})", s)
-    if m:
-        year = int(m.group(1))
-        if 1800 <= year <= 2030:
-            return year
-    return None
-
-
-def save_cache():
-    """Explicitly save the API cache."""
-    _cache.save()
+__all__ = [
+    "enrich_from_apis",
+    "gather_candidates",
+    "get_metrics",
+    "probe_sources",
+    "save_cache",
+]

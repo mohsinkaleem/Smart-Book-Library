@@ -189,7 +189,7 @@ def _download_cover_image(record: BookRecord, url: str):
         if "image" not in content_type and len(resp.content) < 1000:
             return
 
-        cover_name = f"{Path(record.file_name).stem}_cover.jpg"
+        cover_name = f"{record.id or Path(record.file_name).stem}_cover.jpg"
         cover_path = COVERS_DIR / cover_name
 
         img = Image.open(io.BytesIO(resp.content))

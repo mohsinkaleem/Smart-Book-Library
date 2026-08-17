@@ -2,14 +2,18 @@
 Embedding generation for semantic search and similarity.
 
 Uses sentence-transformers to generate embeddings for:
-1. text_excerpt (content embedding) - for similar book discovery
+1. content_sample (content embedding) - for similar book discovery
 2. title + themes + description (metadata embedding) - for metadata search
+
+Encoding is batched: `model.encode` on a list amortises the forward pass and is
+an order of magnitude faster than one call per record.
 """
 import logging
-from typing import Optional
+from typing import Iterable
 
-from .config import EMBEDDING_MODEL, EMBEDDING_DIMENSION
+from .config import EMBEDDING_BATCH_SIZE, EMBEDDING_MAX_INPUT_CHARS, EMBEDDING_MODEL
 from .models import BookRecord
+from .text_utils import is_mostly_boilerplate
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +32,7 @@ def _get_model():
         except ImportError:
             logger.warning(
                 "sentence-transformers not installed. "
-                "Run: pip install sentence-transformers\n"
+                "Run: pip install 'books[embed]'\n"
                 "Embeddings will be skipped."
             )
             return None
@@ -38,45 +42,59 @@ def _get_model():
     return _model
 
 
-def generate_embeddings(record: BookRecord, force: bool = False) -> BookRecord:
+def _content_text(record: BookRecord) -> str:
     """
-    Generate embeddings for a BookRecord.
-
-    Creates two embeddings:
-    1. Content embedding from text_excerpt
-    2. Metadata embedding from title + themes + description + categories
-
-    Args:
-        record: BookRecord to generate embeddings for
-        force: If True, regenerate even if embeddings exist
+    Prose past the TOC, never front matter. Embedding copyright pages made
+    unrelated books look similar to each other, which is exactly wrong for
+    "find books like this".
     """
+    body = record.content_sample or ""
+    if not body or is_mostly_boilerplate(body):
+        return ""
+    return body[:EMBEDDING_MAX_INPUT_CHARS]
+
+
+def embed_records(records: Iterable[BookRecord], force: bool = False) -> list[BookRecord]:
+    """Generate content and metadata embeddings for a batch of records."""
+    records = list(records)
     model = _get_model()
-    if model is None:
-        return record
+    if model is None or not records:
+        return records
 
-    # Content embedding
-    if (not record.embedding or force) and record.text_excerpt:
-        try:
-            text = record.text_excerpt[:2000]  # Limit input size
-            embedding = model.encode(text, normalize_embeddings=True)
-            record.embedding = embedding.tolist()
-            logger.debug(f"Generated content embedding for {record.file_name}")
-        except Exception as e:
-            logger.error(f"Content embedding failed for {record.file_name}: {e}")
-            record.processing_errors.append(f"Content embedding failed: {e}")
+    jobs: list[tuple[BookRecord, str, str]] = []
+    for record in records:
+        if force or not record.embedding:
+            text = _content_text(record)
+            if text:
+                jobs.append((record, "embedding", text))
+        if force or not record.metadata_embedding:
+            meta = _build_metadata_text(record)
+            if meta:
+                jobs.append((record, "metadata_embedding", meta))
+    if not jobs:
+        return records
 
-    # Metadata embedding
-    if not record.metadata_embedding or force:
-        meta_text = _build_metadata_text(record)
-        if meta_text:
-            try:
-                embedding = model.encode(meta_text, normalize_embeddings=True)
-                record.metadata_embedding = embedding.tolist()
-                logger.debug(f"Generated metadata embedding for {record.file_name}")
-            except Exception as e:
-                logger.error(f"Metadata embedding failed for {record.file_name}: {e}")
-                record.processing_errors.append(f"Metadata embedding failed: {e}")
+    try:
+        vectors = model.encode(
+            [text for _, _, text in jobs],
+            batch_size=EMBEDDING_BATCH_SIZE,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+    except Exception as e:
+        logger.error(f"Embedding batch of {len(jobs)} failed: {e}")
+        for record, _, _ in jobs:
+            record.processing_errors.append(f"Embedding failed: {e}")
+        return records
 
+    for (record, attr, _), vector in zip(jobs, vectors):
+        setattr(record, attr, vector.tolist())
+    return records
+
+
+def generate_embeddings(record: BookRecord, force: bool = False) -> BookRecord:
+    """Single-record convenience wrapper around `embed_records`."""
+    embed_records([record], force=force)
     return record
 
 
@@ -88,6 +106,8 @@ def _build_metadata_text(record: BookRecord) -> str:
         parts.append(f"Title: {record.title}")
     if record.authors:
         parts.append(f"Authors: {', '.join(record.authors)}")
+    if record.subtitle:
+        parts.append(f"Subtitle: {record.subtitle}")
     if record.description:
         parts.append(f"Description: {record.description[:500]}")
     if record.themes:
@@ -100,59 +120,3 @@ def _build_metadata_text(record: BookRecord) -> str:
         parts.append(f"Summary: {record.summary[:300]}")
 
     return ". ".join(parts)
-
-
-def compute_similarity(embedding1: list, embedding2: list) -> float:
-    """Compute cosine similarity between two embeddings."""
-    if not embedding1 or not embedding2:
-        return 0.0
-
-    try:
-        import numpy as np
-        a = np.array(embedding1)
-        b = np.array(embedding2)
-        # Embeddings are already normalized, so dot product = cosine similarity
-        return float(np.dot(a, b))
-    except ImportError:
-        # Fallback without numpy
-        dot = sum(a * b for a, b in zip(embedding1, embedding2))
-        norm_a = sum(a * a for a in embedding1) ** 0.5
-        norm_b = sum(b * b for b in embedding2) ** 0.5
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
-
-def find_similar_books(
-    target: BookRecord,
-    all_records: list[BookRecord],
-    top_k: int = 5,
-    use_content: bool = True,
-) -> list[tuple[BookRecord, float]]:
-    """
-    Find the most similar books to a target book.
-
-    Args:
-        target: The book to find similar ones for
-        all_records: All books in the catalog
-        top_k: Number of similar books to return
-        use_content: If True, use content embedding; else metadata embedding
-
-    Returns:
-        List of (BookRecord, similarity_score) tuples, sorted by score desc
-    """
-    target_emb = target.embedding if use_content else target.metadata_embedding
-    if not target_emb:
-        return []
-
-    similarities = []
-    for record in all_records:
-        if record.id == target.id:
-            continue
-        other_emb = record.embedding if use_content else record.metadata_embedding
-        if other_emb:
-            score = compute_similarity(target_emb, other_emb)
-            similarities.append((record, score))
-
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    return similarities[:top_k]

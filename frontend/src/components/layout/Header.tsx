@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { BookOpen, BarChart3, Settings, LayoutGrid, List, PanelLeftClose, PanelLeft, Moon, Sun, Keyboard } from 'lucide-react';
+import { BookOpen, BarChart3, Settings, LayoutGrid, List, PanelLeftClose, PanelLeft, Moon, Sun, Keyboard, ClipboardCheck } from 'lucide-react';
 import clsx from 'clsx';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
 
@@ -56,6 +56,12 @@ export function Header({ view, onViewChange, sidebarOpen, onToggleSidebar, child
             </button>
           </div>
         )}
+        <Link to="/review" title="Review queue" className={clsx(
+          'rounded-lg p-2 transition-colors',
+          location.pathname === '/review' ? 'bg-primary-50 text-primary-600 dark:bg-primary-900/30' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700',
+        )}>
+          <ClipboardCheck size={18} />
+        </Link>
         <Link to="/stats" className={clsx(
           'rounded-lg p-2 transition-colors',
           location.pathname === '/stats' ? 'bg-primary-50 text-primary-600 dark:bg-primary-900/30' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700',

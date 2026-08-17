@@ -15,7 +15,7 @@ from .db import BookDatabase
 from .similarity import SimilarityEngine
 from .search import SearchEngine
 
-from .routes import books, search, filters, stats, reading, pipeline, user
+from .routes import books, search, filters, stats, reading, pipeline, user, review
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(reading.router)
     app.include_router(pipeline.router)
     app.include_router(user.router)
+    app.include_router(review.router)
 
     # Static files: covers
     if COVERS_DIR.exists():

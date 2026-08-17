@@ -1,287 +1,239 @@
 """
-Theme analyzer - extracts themes, categories, and keywords from book text content.
+Local content analysis: categories, themes, keywords, fallback summary.
 
-Uses heuristic and keyword-based analysis to identify:
-- Broad categories (Computer Science, Religion, etc.)
-- Higher-level themes 
-- Keywords for search
+Two defects are fixed here:
+
+* scoring summed **raw occurrence counts** over corpora whose length varies by
+  two orders of magnitude, so a long excerpt that merely mentions "statistics"
+  outranked a short one that is actually about it — and a file with an empty
+  title and no metadata was still confidently assigned two categories. Matches
+  are now density-normalised, title/subject matches weigh far more than body
+  text, and a minimum score is required before any category is assigned;
+* keywords were collected by iterating a `set`, so the same input produced a
+  different 15 keywords on every run and FTS results changed between builds.
+  Iteration is now over a sorted list, ranked before truncation.
 """
 import logging
 import re
 from collections import Counter
-from typing import Optional
 
 from .models import BookRecord
+from .taxonomy import (
+    CATEGORY_KEYWORDS,
+    THEME_PATTERNS,
+    categories_from_subjects,
+    clean_subjects,
+    constrain_categories,
+)
+from .text_utils import is_mostly_boilerplate
 
 logger = logging.getLogger(__name__)
 
-# ─── Category Taxonomy ──────────────────────────────────────────────────────────
-# Maps keyword patterns to broad categories
-CATEGORY_KEYWORDS = {
-    "Computer Science": [
-        "programming", "algorithm", "software", "computer", "code", "coding",
-        "python", "java", "javascript", "c++", "database", "web development",
-        "machine learning", "deep learning", "artificial intelligence", "data structure",
-        "api", "framework", "linux", "terminal", "command line", "git",
-        "neural network", "tensorflow", "pytorch", "docker", "cloud",
-        "compiler", "operating system", "networking", "cybersecurity",
-    ],
-    "Data Science & ML": [
-        "data science", "machine learning", "deep learning", "neural network",
-        "statistics", "regression", "classification", "clustering",
-        "natural language processing", "nlp", "computer vision",
-        "recommendation system", "time series", "feature engineering",
-        "model training", "gradient", "optimization", "kaggle",
-        "data analysis", "data mining", "big data", "pandas", "numpy",
-        "scikit-learn", "tensorflow", "pytorch", "causal inference",
-        "bayesian", "reinforcement learning", "embedding",
-    ],
-    "Mathematics & Physics": [
-        "mathematics", "algebra", "calculus", "geometry", "topology",
-        "probability", "statistics", "linear algebra", "matrix",
-        "physics", "quantum", "relativity", "cosmology", "spacetime",
-        "theorem", "proof", "equation", "differential", "integral",
-    ],
-    "Islam & Islamic Studies": [
-        "quran", "hadith", "sunnah", "prophet muhammad", "islamic",
-        "muslim", "mosque", "salat", "prayer", "fiqh", "shariah",
-        "tawheed", "aqeedah", "dawah", "ummah", "khalifah", "caliphate",
-        "imam", "sheikh", "deen", "haram", "halal", "ramadan", "hajj",
-        "zakat", "din", "allah", "hijab", "fatwa", "ibn", "tafsir",
-        "sahih", "bukhari", "tajweed", "nikah", "salafi", "sufi",
-    ],
-    "Religion & Philosophy": [
-        "religion", "theology", "philosophy", "metaphysics", "ethics",
-        "morality", "atheism", "theism", "god", "divine", "spiritual",
-        "secular", "belief", "faith", "soul", "consciousness",
-        "existential", "phenomenology", "epistemology", "ontology",
-    ],
-    "History": [
-        "history", "historical", "ancient", "medieval", "modern",
-        "empire", "dynasty", "war", "revolution", "civilization",
-        "colonial", "independence", "century", "era", "chronicle",
-        "ottoman", "mughal", "british", "roman", "persian",
-    ],
-    "Politics & Geopolitics": [
-        "politics", "political", "democracy", "government", "state",
-        "nationalism", "imperialism", "colonialism", "capitalism",
-        "socialism", "communism", "liberalism", "geopolitics",
-        "foreign policy", "diplomacy", "lobby", "zionism", "palestine",
-        "israel", "congress", "parliament", "ideology",
-    ],
-    "Economics & Finance": [
-        "economics", "economy", "finance", "financial", "banking",
-        "investment", "stock", "market", "trading", "corporate",
-        "inflation", "gdp", "monetary", "fiscal", "startup",
-        "business", "entrepreneur", "wealth", "profit", "debt",
-    ],
-    "Psychology & Self-Help": [
-        "psychology", "psychological", "mental", "brain", "cognitive",
-        "behavior", "emotion", "anxiety", "depression", "therapy",
-        "self-help", "motivation", "habit", "mindset", "productivity",
-        "happiness", "well-being", "confidence", "relationship",
-    ],
-    "Literature & Fiction": [
-        "novel", "fiction", "story", "narrative", "character",
-        "protagonist", "literary", "prose", "poetry", "poem",
-        "chapter one", "once upon", "he said", "she said",
-    ],
-    "Gender & Society": [
-        "gender", "feminism", "feminist", "masculinity", "sexuality",
-        "transgender", "lgbtq", "patriarchy", "women's rights",
-        "social justice", "discrimination", "equality", "modesty",
-    ],
-    "Security & Hacking": [
-        "hacking", "hack", "security", "vulnerability", "exploit",
-        "penetration testing", "cybersecurity", "malware", "virus",
-        "ethical hacking", "reverse engineering", "encryption",
-        "forensic", "password", "authentication",
-    ],
-    "Science & Nature": [
-        "science", "scientific", "biology", "chemistry", "evolution",
-        "darwin", "genetics", "dna", "ecology", "environment",
-        "climate", "universe", "astronomy", "cosmos", "species",
-    ],
-    "Health & Wellness": [
-        "health", "medical", "medicine", "nutrition", "diet",
-        "exercise", "fitness", "healing", "herbal", "natural remedy",
-        "anatomy", "disease", "wellness", "organic",
-    ],
-    "Language & Communication": [
-        "language", "grammar", "vocabulary", "english", "arabic",
-        "writing", "communication", "speech", "linguistics",
-        "pronunciation", "fluency", "conversation",
-    ],
-}
+MIN_CATEGORY_SCORE = 3.0
+MIN_THEME_SCORE = 2.0
+MIN_BODY_ONLY_KEYWORDS = 3   # distinct keywords required when body text is all we have
+MAX_CATEGORIES = 4
+MAX_THEMES = 5
+MAX_KEYWORDS = 15
 
-# Theme extraction patterns - broader conceptual themes
-THEME_PATTERNS = {
-    "Critique of Modernity": [
-        "modernity", "modern world", "crisis", "secular", "postmodern",
-        "disenchantment", "materialism", "nihilism",
-    ],
-    "East-West Relations": [
-        "east and west", "orient", "occidental", "clash of civilizations",
-        "cultural exchange", "colonialism", "post-colonial",
-    ],
-    "Social Reform": [
-        "reform", "social change", "revolution", "awakening",
-        "activism", "social movement", "justice",
-    ],
-    "Technology & Society": [
-        "technology", "digital", "internet", "social media",
-        "automation", "disruption", "innovation",
-    ],
-    "Ethical Living": [
-        "ethics", "moral", "virtue", "character", "integrity",
-        "manners", "etiquette", "righteousness",
-    ],
-    "Knowledge & Education": [
-        "knowledge", "education", "learning", "teaching", "scholarship",
-        "intellectual", "academic", "wisdom", "curriculum",
-    ],
-    "Identity & Belonging": [
-        "identity", "belonging", "community", "culture", "tradition",
-        "heritage", "diaspora", "migration",
-    ],
-    "Power & Resistance": [
-        "power", "resistance", "oppression", "liberation", "hegemony",
-        "propaganda", "control", "freedom", "struggle",
-    ],
-    "Practical Skills & Career": [
-        "career", "interview", "job", "skill", "practice", "professional",
-        "craft", "mastery", "certification", "portfolio",
-    ],
-    "Personal Development": [
-        "self-improvement", "growth", "productivity", "habits",
-        "goal setting", "discipline", "mindfulness", "success",
-    ],
+# Weight per evidence field. Short, high-signal fields dominate body text.
+_FIELD_WEIGHTS = {
+    "title": 6.0,
+    "subtitle": 4.0,
+    "subjects": 4.0,
+    "description": 2.5,
+    "publisher": 0.5,
 }
+_BODY_WEIGHT = 3.0
+_BODY_NORMALISER = 2000      # characters per "page" of density
+_MAX_BODY_HITS = 5           # cap so one repeated word cannot dominate
+
+_LATIN_SCRIPTS = {"", "latin"}
+
+
+def _specificity(keyword: str) -> float:
+    """Multi-word keywords are far more discriminating than single words."""
+    return 1.0 + 0.75 * (len(keyword.split()) - 1)
+
+
+def _count(keyword: str, text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"\b" + re.escape(keyword) + r"\b", text))
+
+
+def _fields(record: BookRecord) -> dict[str, str]:
+    return {
+        "title": (record.title or "").lower(),
+        "subtitle": (record.subtitle or "").lower(),
+        "subjects": " ".join(record.subjects_raw or []).lower(),
+        "description": (record.description or "").lower(),
+        "publisher": (record.publisher or "").lower(),
+    }
+
+
+def _body(record: BookRecord) -> str:
+    body = record.content_sample or record.text_excerpt or ""
+    return body.lower()
+
+
+def _score_group(record: BookRecord, groups: dict[str, list[str]]) -> dict[str, dict]:
+    """
+    Score each label. Returns {label: {score, field_hits, distinct}}.
+
+    `field_hits` and `distinct` are what stop a body-only coincidence from
+    becoming a category: one repeated word in the text is not a subject.
+    """
+    fields = _fields(record)
+    body = _body(record)
+    body_pages = max(len(body) / _BODY_NORMALISER, 1.0)
+
+    scores: dict[str, dict] = {}
+    for label, keywords in groups.items():
+        score = 0.0
+        field_hits = 0
+        distinct = 0
+        for keyword in keywords:
+            specificity = _specificity(keyword)
+            matched = False
+            for field_name, text in fields.items():
+                if text and _count(keyword, text):
+                    score += _FIELD_WEIGHTS[field_name] * specificity
+                    field_hits += 1
+                    matched = True
+            hits = min(_count(keyword, body), _MAX_BODY_HITS)
+            if hits:
+                score += _BODY_WEIGHT * specificity * hits / body_pages
+                matched = True
+            if matched:
+                distinct += 1
+        if score > 0:
+            scores[label] = {
+                "score": round(score, 3),
+                "field_hits": field_hits,
+                "distinct": distinct,
+            }
+    return scores
+
+
+def detect_categories(record: BookRecord) -> list[str]:
+    """Canonical categories, or an empty list when the evidence is too thin."""
+    scores = _score_group(record, CATEGORY_KEYWORDS)
+
+    # An external subject that maps into the vocabulary is strong evidence.
+    for canonical in categories_from_subjects(record.subjects_raw):
+        entry = scores.setdefault(canonical, {"score": 0.0, "field_hits": 0, "distinct": 0})
+        entry["score"] += 5.0
+        entry["field_hits"] += 1
+
+    qualified = []
+    for label, entry in scores.items():
+        if entry["score"] < MIN_CATEGORY_SCORE:
+            continue
+        # Body text alone must show several distinct concepts, not one word
+        # repeated — that is how a file with no metadata at all was confidently
+        # assigned both "Computer Science" and "Islam & Islamic Studies".
+        if entry["field_hits"] == 0 and entry["distinct"] < MIN_BODY_ONLY_KEYWORDS:
+            continue
+        qualified.append((label, entry["score"]))
+
+    qualified.sort(key=lambda kv: (-kv[1], kv[0]))
+    return [label for label, _ in qualified[:MAX_CATEGORIES]]
+
+
+def detect_themes(record: BookRecord) -> list[str]:
+    scores = _score_group(record, THEME_PATTERNS)
+    qualified = [
+        (label, entry["score"])
+        for label, entry in scores.items()
+        if entry["score"] >= MIN_THEME_SCORE
+        and (entry["field_hits"] > 0 or entry["distinct"] >= MIN_BODY_ONLY_KEYWORDS)
+    ]
+    qualified.sort(key=lambda kv: (-kv[1], kv[0]))
+    return [label for label, _ in qualified[:MAX_THEMES]]
+
+
+def extract_keywords(record: BookRecord) -> list[str]:
+    """Deterministic keyword extraction — same input, same output, every run."""
+    if (record.script or "latin") not in _LATIN_SCRIPTS:
+        return []          # English keyword matching on Arabic text is noise (§M5)
+
+    corpus = " ".join([
+        (record.title or ""),
+        (record.subtitle or ""),
+        (record.description or ""),
+        " ".join(record.subjects_raw or []),
+        record.content_sample or record.text_excerpt or "",
+    ])
+    corpus_lower = corpus.lower()
+
+    vocabulary = sorted({kw for kws in CATEGORY_KEYWORDS.values() for kw in kws})
+    scored: list[tuple[float, str]] = []
+    for keyword in vocabulary:
+        hits = _count(keyword, corpus_lower)
+        if hits:
+            scored.append((hits * _specificity(keyword), keyword))
+
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    keywords = [kw for _, kw in scored[:MAX_KEYWORDS]]
+
+    if len(keywords) < MAX_KEYWORDS:
+        proper = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b", corpus[:4000])
+        counts = Counter(proper)
+        extra = sorted(
+            ((c, term) for term, c in counts.items() if c > 1),
+            key=lambda pair: (-pair[0], pair[1]),
+        )
+        existing = {kw.lower() for kw in keywords}
+        for _, term in extra:
+            if term.lower() not in existing:
+                keywords.append(term)
+                existing.add(term.lower())
+            if len(keywords) >= MAX_KEYWORDS:
+                break
+
+    return keywords[:MAX_KEYWORDS]
+
+
+def generate_simple_summary(record: BookRecord) -> str:
+    """Fallback summary — from prose, never from the copyright page (§A8)."""
+    if record.description:
+        sentences = re.split(r"(?<=[.!?])\s+", record.description.strip())
+        return " ".join(sentences[:3])[:500]
+
+    body = record.content_sample or ""
+    if not body or is_mostly_boilerplate(body):
+        return ""
+    for paragraph in body.split("\n\n"):
+        paragraph = paragraph.strip()
+        if len(paragraph) > 120 and not is_mostly_boilerplate(paragraph):
+            sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+            return " ".join(sentences[:3])[:500]
+    return ""
 
 
 def analyze_themes(record: BookRecord) -> BookRecord:
-    """
-    Analyze a book's text excerpt, title, and metadata to determine
-    categories, themes, and keywords.
-    """
-    # Build a text corpus from all available data
-    corpus = _build_corpus(record)
-    corpus_lower = corpus.lower()
+    """Populate categories, themes, keywords and a fallback summary."""
+    record.subjects_raw = clean_subjects(record.subjects_raw)
 
-    # ── Categories ───────────────────────────────────────────────────────
-    if not record.categories:
-        categories = _detect_categories(corpus_lower)
-        record.categories = categories[:5]
+    categories = detect_categories(record)
+    if categories:
+        record.set_field("categories", constrain_categories(categories), "analyzer", 0.5)
+    elif record.categories:
+        # Anything left over from an older run must still obey the vocabulary.
+        record.categories = constrain_categories(record.categories)
 
-    # ── Themes ───────────────────────────────────────────────────────────
-    if not record.themes:
-        themes = _detect_themes(corpus_lower)
-        record.themes = themes[:5]
+    themes = detect_themes(record)
+    if themes:
+        record.set_field("themes", themes, "analyzer", 0.5)
 
-    # ── Keywords ─────────────────────────────────────────────────────────
-    if not record.keywords:
-        keywords = _extract_keywords(corpus_lower, record.categories)
-        record.keywords = keywords[:15]
+    keywords = extract_keywords(record)
+    if keywords:
+        record.set_field("keywords", keywords, "analyzer", 0.5)
 
-    # ── Summary (if we have text but no summary) ────────────────────────
-    if not record.summary and record.text_excerpt:
-        record.summary = _generate_simple_summary(record)
+    if not record.summary:
+        summary = generate_simple_summary(record)
+        if summary:
+            record.set_field("summary", summary, "analyzer", 0.4)
 
     return record
-
-
-def _build_corpus(record: BookRecord) -> str:
-    """Build a text corpus from all available record data."""
-    parts = [
-        record.title or "",
-        record.original_title_meta or "",
-        record.description or "",
-        record.text_excerpt or "",
-        " ".join(record.authors),
-        record.publisher or "",
-        " ".join(record.categories),
-        " ".join(record.keywords),
-    ]
-    return " ".join(p for p in parts if p)
-
-
-def _detect_categories(corpus: str) -> list[str]:
-    """Detect broad categories based on keyword matching."""
-    scores = {}
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        score = 0
-        for kw in keywords:
-            # Count occurrences (weighted by specificity)
-            count = len(re.findall(r"\b" + re.escape(kw) + r"\b", corpus))
-            if count > 0:
-                # More specific (longer) keywords get higher weight
-                weight = 1 + (len(kw.split()) - 1) * 0.5
-                score += count * weight
-        if score > 0:
-            scores[category] = score
-
-    # Sort by score and return top categories
-    sorted_cats = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [cat for cat, _ in sorted_cats]
-
-
-def _detect_themes(corpus: str) -> list[str]:
-    """Detect higher-level themes based on pattern matching."""
-    scores = {}
-    for theme, keywords in THEME_PATTERNS.items():
-        score = 0
-        for kw in keywords:
-            count = len(re.findall(r"\b" + re.escape(kw) + r"\b", corpus))
-            if count > 0:
-                weight = 1 + (len(kw.split()) - 1) * 0.5
-                score += count * weight
-        if score > 0:
-            scores[theme] = score
-
-    sorted_themes = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [theme for theme, _ in sorted_themes]
-
-
-def _extract_keywords(corpus: str, categories: list[str]) -> list[str]:
-    """Extract specific searchable keywords from the corpus."""
-    # Combine all category keywords for reference
-    all_kw_patterns = set()
-    for cat_keywords in CATEGORY_KEYWORDS.values():
-        all_kw_patterns.update(cat_keywords)
-
-    found_keywords = []
-    for kw in all_kw_patterns:
-        if re.search(r"\b" + re.escape(kw) + r"\b", corpus):
-            found_keywords.append(kw)
-
-    # Also extract capitalized multi-word terms (likely proper nouns / concepts)
-    proper_terms = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", corpus[:3000])
-    term_counts = Counter(proper_terms)
-    for term, count in term_counts.most_common(10):
-        if count > 1 and term.lower() not in {kw.lower() for kw in found_keywords}:
-            found_keywords.append(term)
-
-    return found_keywords[:15]
-
-
-def _generate_simple_summary(record: BookRecord) -> str:
-    """Generate a simple summary from available data."""
-    parts = []
-
-    if record.description:
-        # Use first two sentences of description
-        sentences = re.split(r"(?<=[.!?])\s+", record.description)
-        parts.append(" ".join(sentences[:2]))
-    elif record.text_excerpt:
-        # Use first meaningful paragraph
-        paragraphs = record.text_excerpt.split("\n\n")
-        for para in paragraphs:
-            para = para.strip()
-            if len(para) > 50:
-                # Truncate to ~2 sentences
-                sentences = re.split(r"(?<=[.!?])\s+", para)
-                parts.append(" ".join(sentences[:3]))
-                break
-
-    summary = " ".join(parts)
-    return summary[:500] if summary else ""

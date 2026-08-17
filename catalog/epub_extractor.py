@@ -1,26 +1,27 @@
 """
-EPUB metadata and text extraction using ebooklib and BeautifulSoup.
+EPUB metadata and text extraction using ebooklib + BeautifulSoup.
+
+EPUBs carry the richest metadata of any format here: `dc:identifier`,
+`calibre:isbn`, `dc:source` and `dc:subject` are all worth harvesting
+for the verification gate.
 """
 import io
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
-from .config import (
-    MAX_TEXT_EXCERPT_CHARS,
-    MIN_TEXT_CHARS_FOR_HAS_TEXT,
-    COVERS_DIR,
-)
+from .config import COVERS_DIR
+from .isbn_extractor import normalize_isbn, validate_isbn10, validate_isbn13
 from .models import BookRecord
+from .names import clean_authors
+from .text_utils import detect_language, detect_script, partition_pages
 
 logger = logging.getLogger(__name__)
 
 
 def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
-    """
-    Extract metadata from an EPUB file.
-    Updates the BookRecord in-place and returns it.
-    """
+    """Extract metadata and text from an EPUB. Mutates and returns the record."""
     try:
         import ebooklib
         from ebooklib import epub
@@ -32,93 +33,85 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
     try:
         book = epub.read_epub(str(file_path), options={"ignore_ncx": True})
 
-        # ── Title ────────────────────────────────────────────────────────
-        title = book.get_metadata("DC", "title")
-        if title:
-            record.original_title_meta = title[0][0] if title[0] else ""
+        titles = book.get_metadata("DC", "title")
+        if titles and titles[0] and titles[0][0]:
+            title = re.sub(r"\s+", " ", titles[0][0]).strip()
+            record.original_title_meta = title
+            record.set_field("title", title, "file_meta", 0.7)
 
-        # ── Authors ──────────────────────────────────────────────────────
         creators = book.get_metadata("DC", "creator")
-        if creators and not record.authors:
-            record.authors = [c[0] for c in creators if c[0]]
+        authors = clean_authors([c[0] for c in creators if c and c[0]]) if creators else []
+        if authors:
+            record.set_field("authors", authors, "file_meta", 0.7)
 
-        # ── Publisher ────────────────────────────────────────────────────
         publishers = book.get_metadata("DC", "publisher")
-        if publishers and not record.publisher:
-            record.publisher = publishers[0][0] if publishers[0] else ""
+        if publishers and publishers[0] and publishers[0][0]:
+            record.set_field("publisher", publishers[0][0].strip(), "file_meta", 0.7)
 
-        # ── Language ─────────────────────────────────────────────────────
         languages = book.get_metadata("DC", "language")
-        if languages and not record.language:
-            lang = languages[0][0] if languages[0] else ""
-            record.language = lang[:2] if lang else ""  # Normalize to 2-char
+        if languages and languages[0] and languages[0][0]:
+            record.set_field("language", languages[0][0][:2].lower(), "file_meta", 0.75)
 
-        # ── Date ─────────────────────────────────────────────────────────
         dates = book.get_metadata("DC", "date")
-        if dates and not record.publication_year:
-            date_str = dates[0][0] if dates[0] else ""
-            year = _extract_year(date_str)
+        if dates and dates[0] and dates[0][0]:
+            year = _extract_year(dates[0][0])
             if year:
-                record.publication_year = year
+                record.set_field("publication_year", year, "file_meta", 0.7)
 
-        # ── Description ──────────────────────────────────────────────────
         descriptions = book.get_metadata("DC", "description")
-        if descriptions:
-            desc = descriptions[0][0] if descriptions[0] else ""
+        if descriptions and descriptions[0] and descriptions[0][0]:
+            desc = _strip_html(descriptions[0][0])
             if desc:
-                # Clean HTML from description
-                record.description = _strip_html(desc)
+                record.set_field("description", desc[:2000], "file_meta", 0.7)
 
-        # ── Subject/Keywords ─────────────────────────────────────────────
         subjects = book.get_metadata("DC", "subject")
         if subjects:
-            record.keywords = [s[0] for s in subjects if s[0]][:10]
+            raw = [s[0].strip() for s in subjects if s and s[0] and len(s[0].strip()) > 2]
+            if raw:
+                record.subjects_raw = list(dict.fromkeys(record.subjects_raw + raw))[:20]
 
-        # ── ISBN ─────────────────────────────────────────────────────────
-        identifiers = book.get_metadata("DC", "identifier")
-        for ident in identifiers:
-            val = ident[0] if ident else ""
-            attrs = ident[1] if len(ident) > 1 else {}
-            if val:
-                _extract_isbn(val, attrs, record)
+        _harvest_identifiers(book, record)
 
-        # ── Text Extraction ──────────────────────────────────────────────
-        text_parts = []
+        # ── Text ─────────────────────────────────────────────────────────────
+        pages: list[str] = []
         total_chars = 0
         items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
-
         for item in items:
-            if total_chars >= MAX_TEXT_EXCERPT_CHARS:
+            if total_chars >= 20000:
                 break
             try:
                 content = item.get_content()
-                if content:
-                    text = _extract_text_from_html(content)
-                    if text and len(text.strip()) > 20:
-                        text_parts.append(text.strip())
-                        total_chars += len(text)
+                if not content:
+                    continue
+                text = _extract_text_from_html(content).strip()
+                if len(text) > 20:
+                    pages.append(text)
+                    total_chars += len(text)
             except Exception as e:
                 logger.debug(f"Failed to extract text from EPUB chapter: {e}")
 
-        full_text = "\n\n".join(text_parts)
-        record.text_excerpt = full_text[:MAX_TEXT_EXCERPT_CHARS]
+        parts = partition_pages(pages)
+        record.text_excerpt = parts["text_excerpt"]
+        record.front_matter = parts["front_matter"]
+        record.content_sample = parts["content_sample"]
 
-        # Determine text availability
-        if total_chars < MIN_TEXT_CHARS_FOR_HAS_TEXT:
-            record.has_text = False
-            record.ocr_required = True
-        else:
-            record.has_text = True
-            record.ocr_required = False
+        record.has_text = total_chars >= 100
+        record.ocr_required = not record.has_text
 
-        # ── Cover Extraction ─────────────────────────────────────────────
+        sample = record.content_sample or record.text_excerpt
+        script = detect_script(sample)
+        if script:
+            record.set_field("script", script, "file_meta", 0.7)
+        if not record.language:
+            language = detect_language(sample, script)
+            if language:
+                record.set_field("language", language, "file_meta", 0.6)
+
         _extract_epub_cover(book, file_path, record)
 
-        # ── Page Count (estimate from chapters) ─────────────────────────
-        if not record.page_count:
-            # Rough estimate: ~250 words per page, ~5 chars per word
-            estimated_total_chars = total_chars * (len(items) / max(len(text_parts), 1))
-            record.page_count = max(1, int(estimated_total_chars / 1250))
+        if not record.page_count and total_chars:
+            estimated = total_chars * (len(items) / max(len(pages), 1))
+            record.page_count = max(1, int(estimated / 1250))
 
     except Exception as e:
         logger.error(f"Failed to process EPUB {file_path}: {e}")
@@ -127,8 +120,40 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
     return record
 
 
+def _harvest_identifiers(book, record: BookRecord):
+    """Pull ISBNs and stable ids out of dc:identifier, calibre:isbn, dc:source."""
+    candidates: list[str] = []
+    for ident in book.get_metadata("DC", "identifier") or []:
+        if ident and ident[0]:
+            candidates.append(str(ident[0]))
+    for source in book.get_metadata("DC", "source") or []:
+        if source and source[0]:
+            candidates.append(str(source[0]))
+    for meta in book.get_metadata("OPF", "meta") or []:
+        attrs = meta[1] if len(meta) > 1 else {}
+        name = (attrs.get("name") or "").lower()
+        if "isbn" in name or "calibre" in name:
+            value = attrs.get("content") or (meta[0] or "")
+            if value:
+                candidates.append(str(value))
+
+    for raw in candidates:
+        clean = normalize_isbn(raw)
+        if len(clean) == 13 and validate_isbn13(clean):
+            record.set_field("isbn_13", clean, "file_meta", 0.85)
+        elif len(clean) == 10 and validate_isbn10(clean):
+            record.set_field("isbn_10", clean, "file_meta", 0.85)
+        elif raw.lower().startswith(("urn:uuid", "uuid:")):
+            continue
+        elif ":" in raw and len(raw) < 80:
+            tag = raw.strip()
+            if tag not in record.source_ids:
+                record.source_ids.append(tag)
+
+
 def _extract_epub_cover(book, file_path: Path, record: BookRecord):
-    """Extract cover image from EPUB."""
+    if record.cover_path:
+        return
     try:
         from PIL import Image
         import ebooklib
@@ -136,111 +161,68 @@ def _extract_epub_cover(book, file_path: Path, record: BookRecord):
         return
 
     try:
-        # Method 1: Look for cover in metadata
         cover_items = []
-
-        # Check meta cover tag
         cover_meta = book.get_metadata("OPF", "cover")
-        if cover_meta:
-            cover_id = cover_meta[0][1].get("content", "") if cover_meta[0] else ""
+        if cover_meta and cover_meta[0]:
+            cover_id = cover_meta[0][1].get("content", "")
             if cover_id:
                 for item in book.get_items():
                     if item.get_id() == cover_id:
                         cover_items.append(item)
                         break
-
-        # Method 2: Look for items with 'cover' in name
         if not cover_items:
             for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                name = (item.get_name() or "").lower()
-                if "cover" in name:
+                if "cover" in (item.get_name() or "").lower():
                     cover_items.append(item)
                     break
-
-        # Method 3: First image
         if not cover_items:
             images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
             if images:
                 cover_items.append(images[0])
 
-        if cover_items:
-            cover_data = cover_items[0].get_content()
-            if cover_data and len(cover_data) > 1000:
-                cover_name = f"{file_path.stem}_cover.jpg"
-                cover_path = COVERS_DIR / cover_name
-                try:
-                    image = Image.open(io.BytesIO(cover_data))
-                    if image.mode in ("RGBA", "P", "LA"):
-                        image = image.convert("RGB")
-                    if image.width > 800 or image.height > 1200:
-                        image.thumbnail((800, 1200), Image.LANCZOS)
-                    image.save(str(cover_path), "JPEG", quality=85)
-                    record.cover_path = str(cover_path.relative_to(COVERS_DIR.parent.parent))
-                except Exception as e:
-                    logger.debug(f"Failed to save EPUB cover for {file_path.name}: {e}")
+        if not cover_items:
+            return
+        data = cover_items[0].get_content()
+        if not data or len(data) <= 1000:
+            return
 
+        cover_path = COVERS_DIR / f"{file_path.stem}_cover.jpg"
+        image = Image.open(io.BytesIO(data))
+        if image.mode in ("RGBA", "P", "LA"):
+            image = image.convert("RGB")
+        if image.width > 800 or image.height > 1200:
+            image.thumbnail((800, 1200), Image.LANCZOS)
+        image.save(str(cover_path), "JPEG", quality=85)
+        record.set_field(
+            "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
+            "file_meta", 0.7,
+        )
     except Exception as e:
         logger.debug(f"EPUB cover extraction failed for {file_path.name}: {e}")
 
 
 def _extract_text_from_html(content: bytes) -> str:
-    """Extract plain text from HTML content."""
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(content, "html.parser")
-        # Remove script and style elements
         for tag in soup(["script", "style", "head", "meta", "link"]):
             tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        return text
+        return soup.get_text(separator="\n", strip=True)
     except Exception:
-        # Fallback: crude tag stripping
-        import re
         text = content.decode("utf-8", errors="ignore")
         text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        return re.sub(r"\s+", " ", text).strip()
 
 
 def _strip_html(text: str) -> str:
-    """Remove HTML tags from a string."""
-    import re
-    clean = re.sub(r"<[^>]+>", "", text)
-    clean = re.sub(r"\s+", " ", clean)
-    return clean.strip()
+    clean = re.sub(r"<[^>]+>", "", text or "")
+    return re.sub(r"\s+", " ", clean).strip()
 
 
 def _extract_year(date_str: str) -> Optional[int]:
-    """Extract a year from a date string."""
-    import re
-    m = re.search(r"(\d{4})", date_str)
+    m = re.search(r"(\d{4})", date_str or "")
     if m:
         year = int(m.group(1))
         if 1800 <= year <= 2030:
             return year
     return None
-
-
-def _extract_isbn(value: str, attrs: dict, record: BookRecord):
-    """Extract ISBN from identifier value and attributes."""
-    import re
-
-    # Check attributes for scheme
-    scheme = ""
-    for key, val in attrs.items():
-        if "scheme" in key.lower() or "type" in key.lower():
-            scheme = val.lower()
-            break
-
-    # Clean the value
-    clean_val = re.sub(r"[^0-9Xx]", "", value)
-
-    if "isbn" in scheme or "isbn" in value.lower():
-        if len(clean_val) == 13:
-            record.isbn_13 = clean_val
-        elif len(clean_val) == 10:
-            record.isbn_10 = clean_val
-    elif len(clean_val) == 13 and clean_val.startswith("978"):
-        record.isbn_13 = clean_val
-    elif len(clean_val) == 10:
-        record.isbn_10 = clean_val

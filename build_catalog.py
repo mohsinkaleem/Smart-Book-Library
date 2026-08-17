@@ -1,97 +1,58 @@
 #!/usr/bin/env python3
 """
-Book Catalog Builder - Main entry point.
+Book Catalog Builder — main entry point.
 
 Usage:
-    # Full pipeline (all books, with API enrichment)
-    python build_catalog.py
-
-    # Quick test with 5 books, no API calls
-    python build_catalog.py --test
-
-    # Process only EPUBs
-    python build_catalog.py --type epub
-
-    # Force reprocess everything
-    python build_catalog.py --force
-
-    # With embeddings (requires sentence-transformers)
-    python build_catalog.py --embed
-
-    # Process specific number of books
-    python build_catalog.py --max 50
-
-    # Skip API enrichment (file metadata only)
-    python build_catalog.py --no-api
-
-    # Run OCR on image-based PDFs
-    python build_catalog.py --ocr
-
-    # LLM-powered summaries (requires running Ollama)
-    python build_catalog.py --llm
-
-    # Scrape missing covers with Playwright
-    python build_catalog.py --covers
-
-    # Watch for new books (incremental)
-    python build_catalog.py --watch
-
-    # Check for filesystem changes (one-shot)
-    python build_catalog.py --changes
-
-    # Show catalog stats
-    python build_catalog.py --stats
-
-    # Show reading progress
-    python build_catalog.py --reading
-
-    # Search catalog
-    python build_catalog.py --search "machine learning"
+    python build_catalog.py                       # full pipeline
+    python build_catalog.py --test                # 5 books, no API calls
+    python build_catalog.py --only "Aisha.pdf"    # run one file (or a substring)
+    python build_catalog.py --max 20              # first 20 books
+    python build_catalog.py --type epub           # EPUBs only
+    python build_catalog.py --no-api              # skip API enrichment
+    python build_catalog.py --llm                 # Ollama summaries + adjudication
+    python build_catalog.py --embed               # vector embeddings
+    python build_catalog.py --no-ocr              # skip OCR on image-based PDFs
+    python build_catalog.py --force               # ignore stage versions, redo everything
+    python build_catalog.py --plan                # show what a run would do, write nothing
+    python build_catalog.py --verify-sources      # probe providers, then run
+    python build_catalog.py --report              # catalog quality report
+    python build_catalog.py --review              # list records needing review
+    python build_catalog.py --stats               # catalog statistics
+    python build_catalog.py --export-json         # write data/catalog.json export
 """
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from catalog.config import LOG_LEVEL, LOG_FORMAT, CATALOG_FILE
-from catalog.pipeline import run_pipeline, PipelineConfig, Pipeline
-from catalog.database import CatalogDatabase
+from catalog.config import CATALOG_DB_FILE, CATALOG_FILE, LOG_FORMAT, LOG_LEVEL, MAX_WORKERS
+from catalog.pipeline import Pipeline, PipelineConfig
+from catalog.reporting import build_report, print_report, save_report
+from catalog.store import CatalogStore
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging."""
     level = logging.DEBUG if verbose else getattr(logging, LOG_LEVEL)
-    logging.basicConfig(
-        level=level,
-        format=LOG_FORMAT,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-    # Suppress noisy libraries
+    logging.basicConfig(level=level, format=LOG_FORMAT, handlers=[logging.StreamHandler(sys.stdout)])
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("PIL").setLevel(logging.WARNING)
     logging.getLogger("ebooklib").setLevel(logging.WARNING)
 
 
 def show_stats():
-    """Display catalog statistics."""
-    db = CatalogDatabase()
-    records = db.all_records()
-
-    if not records:
+    store = CatalogStore()
+    stats = store.compute_stats()
+    if not stats:
         print("No catalog found. Run the pipeline first: python build_catalog.py")
         return
 
-    stats = db._compute_stats()
+    total = stats["total_books"]
     print("\n" + "=" * 60)
     print("📚 BOOK CATALOG STATISTICS")
     print("=" * 60)
-    print(f"  Total books:        {stats['total_books']}")
+    print(f"  Total books:        {total}")
     print(f"  PDFs:               {stats['by_type'].get('pdf', 0)}")
     print(f"  EPUBs:              {stats['by_type'].get('epub', 0)}")
     print(f"  With text:          {stats['with_text']}")
@@ -101,200 +62,153 @@ def show_stats():
     print(f"  With ISBN:          {stats['with_isbn']}")
     print(f"  With embeddings:    {stats['with_embeddings']}")
     print(f"  API enriched:       {stats['api_enriched']}")
+    print(f"  Verified titles:    {stats['verified_titles']}")
+    print(f"  Needs review:       {stats['needs_review']}")
     print(f"  Duplicates:         {stats['duplicates']}")
     print(f"  Total size:         {stats['total_size_mb']} MB")
-    print()
-
-    # Quality metrics
-    total = stats['total_books']
-    if total > 0:
-        print("📊 Data Quality:")
-        print(f"    Description coverage: {stats['with_description']}/{total} ({stats['with_description']*100//total}%)")
-        print(f"    ISBN coverage:        {stats['with_isbn']}/{total} ({stats['with_isbn']*100//total}%)")
-        print(f"    Cover coverage:       {stats['with_cover']}/{total} ({stats['with_cover']*100//total}%)")
-        print(f"    Text extraction:      {stats['with_text']}/{total} ({stats['with_text']*100//total}%)")
-        print(f"    Still needs OCR:      {stats['ocr_required']}")
-        print()
-
     if stats.get("categories"):
-        print("📂 Top Categories:")
-        for cat, count in list(stats["categories"].items())[:15]:
+        print("\n📂 Categories:")
+        for cat, count in list(stats["categories"].items())[:20]:
             print(f"    {cat}: {count}")
-
     print("=" * 60)
 
 
+def show_review_queue(limit: int = 40):
+    store = CatalogStore()
+    records = store.needs_review()
+    if not records:
+        print("✅ Nothing in the review queue.")
+        return
+    print(f"\n🔎 {len(records)} records need review\n")
+    for record in records[:limit]:
+        score = "—" if record.match_score is None else f"{record.match_score:.2f}"
+        print(f"  [{score:>4}] {record.file_name[:60]}")
+        print(f"         title: {record.title[:70] or '(none)'} "
+              f"(source: {record.field_source('title') or 'none'})")
+        for reason in record.review_reasons[:2]:
+            print(f"         ↳ {reason[:96]}")
+        print()
+
+
 def show_reading_progress():
-    """Display reading progress statistics."""
     from catalog.reading_tracker import get_reading_stats
 
-    db = CatalogDatabase()
-    records = db.all_records()
-
+    store = CatalogStore()
+    records = store.all_records()
     if not records:
         print("No catalog found.")
         return
-
     stats = get_reading_stats(records)
     print("\n" + "=" * 60)
     print("📖 READING PROGRESS")
     print("=" * 60)
-    print(f"  Total books:    {stats['total_books']}")
-    print(f"  Not started:    {stats['not_started']}")
-    print(f"  In progress:    {stats['in_progress']}")
-    print(f"  Finished:       {stats['finished']}")
-    print(f"  Abandoned:      {stats['abandoned']}")
-    print(f"  Percent read:   {stats['percent_read']}%")
-    print()
-
-    recently = stats.get("recently_opened", [])
-    if recently:
-        print("🕐 Recently Opened:")
-        for item in recently[:10]:
-            dt = item["last_opened"][:16].replace("T", " ") if item["last_opened"] else "N/A"
-            print(f"    {dt}  {item['title'][:60]}")
-
+    for key in ("total_books", "not_started", "in_progress", "finished", "abandoned"):
+        print(f"  {key.replace('_', ' ').title():<16} {stats[key]}")
+    print(f"  Percent read:    {stats['percent_read']}%")
     print("=" * 60)
 
 
 def search_catalog(query: str):
-    """Search the catalog and display results."""
-    db = CatalogDatabase()
-    results = db.search(query)
-
+    store = CatalogStore()
+    results = store.search(query)
     if not results:
         print(f"No results found for: '{query}'")
         return
-
     print(f"\n🔍 Found {len(results)} results for '{query}':\n")
     for i, record in enumerate(results[:20], 1):
         authors = ", ".join(record.authors) if record.authors else "Unknown"
-        year = record.publication_year or "N/A"
-        cats = ", ".join(record.categories[:3]) if record.categories else "N/A"
         dup = " [DUPLICATE]" if record.duplicate_of else ""
-        print(f"  {i}. {record.title}{dup}")
-        print(f"     Authors: {authors} | Year: {year}")
-        print(f"     Categories: {cats}")
-        print(f"     File: {record.file_name}")
-        if record.description:
-            print(f"     Description: {record.description[:120]}...")
+        review = " [NEEDS REVIEW]" if record.needs_review else ""
+        print(f"  {i}. {record.title}{dup}{review}")
+        print(f"     {authors} | {record.publication_year or 'n.d.'} | "
+              f"{', '.join(record.categories[:3]) or 'uncategorised'}")
+        print(f"     {record.file_name}")
         print()
 
 
 def export_csv():
-    """Export catalog to CSV."""
     import csv
 
-    db = CatalogDatabase()
-    records = db.all_records()
+    store = CatalogStore()
+    records = store.all_records()
     if not records:
         print("No catalog found.")
         return
-
     csv_path = CATALOG_FILE.with_suffix(".csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "Title", "Authors", "Publisher", "Year", "ISBN",
-            "Categories", "Themes", "Language", "Pages",
-            "Has Text", "File Type", "File Name", "Description",
+            "Title", "Subtitle", "Authors", "Publisher", "Year", "ISBN",
+            "Categories", "Themes", "Language", "Pages", "Title source",
+            "Match score", "Needs review", "File",
         ])
         for r in records:
             writer.writerow([
-                r.title,
-                "; ".join(r.authors),
-                r.publisher,
-                r.publication_year or "",
-                r.isbn_13 or r.isbn_10 or "",
-                "; ".join(r.categories[:5]),
-                "; ".join(r.themes[:5]),
-                r.language,
-                r.page_count or "",
-                r.has_text,
-                r.file_type,
-                r.file_name,
-                r.description[:200] if r.description else "",
+                r.title, r.subtitle, "; ".join(r.authors), r.publisher,
+                r.publication_year or "", r.isbn_13 or r.isbn_10 or "",
+                "; ".join(r.categories), "; ".join(r.themes), r.language,
+                r.page_count or "", r.field_source("title"),
+                r.match_score if r.match_score is not None else "",
+                "yes" if r.needs_review else "", r.file_name,
             ])
-
     print(f"Exported {len(records)} books to {csv_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="📚 Book Catalog Builder - Enrich your local book library",
+        description="📚 Book Catalog Builder — enrich your local book library",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python build_catalog.py                    # Full pipeline
-  python build_catalog.py --test             # Quick test (5 books, no API)
-  python build_catalog.py --max 20           # Process first 20 books
-  python build_catalog.py --type epub        # EPUBs only
-  python build_catalog.py --no-api           # Skip API enrichment
-  python build_catalog.py --embed            # Include embeddings
-  python build_catalog.py --ocr              # OCR image-based PDFs
-  python build_catalog.py --llm              # LLM summaries (requires Ollama)
-  python build_catalog.py --covers           # Scrape missing covers
-  python build_catalog.py --force            # Reprocess everything
-  python build_catalog.py --watch            # Watch folders for new books
-  python build_catalog.py --changes          # Check for filesystem changes
-  python build_catalog.py --stats            # Show catalog stats
-  python build_catalog.py --reading          # Show reading progress
-  python build_catalog.py --search "python"  # Search catalog
-  python build_catalog.py --export-csv       # Export to CSV
-        """,
+        epilog=__doc__,
     )
-    parser.add_argument("--test", action="store_true",
-                        help="Quick test run (5 books, no API calls)")
-    parser.add_argument("--max", type=int, default=None,
-                        help="Maximum number of books to process")
-    parser.add_argument("--type", choices=["pdf", "epub"],
-                        help="Process only this file type")
-    parser.add_argument("--no-api", action="store_true",
-                        help="Skip API enrichment")
-    parser.add_argument("--embed", action="store_true",
-                        help="Generate vector embeddings (requires sentence-transformers)")
-    parser.add_argument("--ocr", action="store_true",
-                        help="Enable OCR for image-based PDFs (requires tesseract + poppler)")
+    parser.add_argument("--test", action="store_true", help="Quick test run (5 books, no API calls)")
+    parser.add_argument("--max", type=int, default=None, help="Maximum number of books to process")
+    parser.add_argument("--only", type=str, action="append", default=None,
+                        help="Only process files whose path contains this substring "
+                             "(repeatable: --only Aisha.pdf --only 757.pdf)")
+    parser.add_argument("--type", choices=["pdf", "epub"], help="Process only this file type")
+    parser.add_argument("--no-api", action="store_true", help="Skip API enrichment")
+    parser.add_argument("--embed", action="store_true", help="Generate vector embeddings")
+    parser.add_argument("--no-ocr", action="store_true", help="Disable OCR for image-based PDFs")
     parser.add_argument("--llm", action="store_true",
-                        help="Enable LLM-powered summaries/themes (requires running Ollama)")
-    parser.add_argument("--covers", action="store_true",
-                        help="Scrape missing covers via Playwright")
-    parser.add_argument("--force", action="store_true",
-                        help="Force reprocess all books")
-    parser.add_argument("--watch", action="store_true",
-                        help="Watch book folders for changes (requires watchdog)")
-    parser.add_argument("--changes", action="store_true",
-                        help="Check for filesystem changes vs catalog (one-shot)")
-    parser.add_argument("--stats", action="store_true",
-                        help="Show catalog statistics")
-    parser.add_argument("--reading", action="store_true",
-                        help="Show reading progress")
-    parser.add_argument("--search", type=str,
-                        help="Search the catalog")
-    parser.add_argument("--export-csv", action="store_true",
-                        help="Export catalog to CSV")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Verbose logging")
+                        help="LLM summaries + borderline-match adjudication (requires Ollama)")
+    parser.add_argument("--covers", action="store_true", help="Scrape missing covers via Playwright")
+    parser.add_argument("--reading-progress", action="store_true",
+                        help="Refresh last-opened times from Spotlight (one subprocess per book)")
+    parser.add_argument("--force", action="store_true", help="Reprocess everything, ignoring stage versions")
+    parser.add_argument("--plan", action="store_true",
+                        help="Show which stages would run for how many books, then exit")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Parallel workers")
+    parser.add_argument("--verify-sources", action="store_true", help="Probe each provider before running")
+    parser.add_argument("--export-json", action="store_true", help="Also write the JSON export")
+    parser.add_argument("--watch", action="store_true", help="Watch book folders for changes")
+    parser.add_argument("--changes", action="store_true", help="Check for filesystem changes (one-shot)")
+    parser.add_argument("--stats", action="store_true", help="Show catalog statistics")
+    parser.add_argument("--report", action="store_true", help="Show the catalog quality report")
+    parser.add_argument("--review", action="store_true", help="List records needing review")
+    parser.add_argument("--reading", action="store_true", help="Show reading progress")
+    parser.add_argument("--search", type=str, help="Search the catalog")
+    parser.add_argument("--export-csv", action="store_true", help="Export catalog to CSV")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
 
-    # Info-only commands
     if args.stats:
-        show_stats()
+        return show_stats()
+    if args.report:
+        store = CatalogStore()
+        report = build_report(store)
+        print_report(report)
+        print(f"\nSaved: {save_report(report)}")
         return
-
+    if args.review:
+        return show_review_queue()
     if args.search:
-        search_catalog(args.search)
-        return
-
+        return search_catalog(args.search)
     if args.export_csv:
-        export_csv()
-        return
-
+        return export_csv()
     if args.reading:
-        show_reading_progress()
-        return
+        return show_reading_progress()
 
     if args.changes:
         from catalog.watcher import scan_for_changes
@@ -302,60 +216,80 @@ Examples:
         print(f"\nNew:      {changes['new_count']}")
         print(f"Modified: {changes['modified_count']}")
         print(f"Deleted:  {changes['deleted_count']}")
-        if changes['new']:
-            print("\nNew files:")
-            for f in changes['new'][:20]:
-                print(f"  + {Path(f).name}")
-        if changes['deleted']:
-            print("\nDeleted from catalog:")
-            for f in changes['deleted'][:20]:
-                print(f"  - {Path(f).name}")
+        for f in changes["new"][:20]:
+            print(f"  + {Path(f).name}")
+        for f in changes["deleted"][:20]:
+            print(f"  - {Path(f).name}")
         return
 
     if args.watch:
-        from catalog.watcher import watch_directories, is_available as watch_available
+        from catalog.watcher import is_available as watch_available, watch_directories
         if not watch_available():
             print("❌ watchdog not installed. Run: pip install watchdog")
             return
         print("👁️  Starting file watcher... Press Ctrl+C to stop.")
 
         def _process_new_book(file_path):
-            """Process a single new book through the pipeline."""
             config = PipelineConfig(
-                enrich_api=not args.no_api,
-                embed=args.embed,
-                ocr=args.ocr,
-                llm_enrich=args.llm,
+                enrich_api=not args.no_api, embed=args.embed,
+                ocr=not args.no_ocr, llm_enrich=args.llm, workers=1,
             )
             p = Pipeline(config)
             record = p._process_single_book(file_path)
             if record:
-                p.db.upsert(record)
-                p.db.save()
+                p.store.upsert(record)
                 print(f"  ✅ Cataloged: {record.title}")
 
         watch_directories(process_callback=_process_new_book)
         return
 
-    # Pipeline commands
     if args.test:
         print("🧪 Running in TEST mode (5 books, no API calls)")
-        stats = run_pipeline(max_books=5, enrich_api=False, embed=False)
+        config = PipelineConfig(max_books=5, enrich_api=False, embed=False, workers=args.workers)
     else:
-        file_types = {args.type} if args.type else None
-        stats = run_pipeline(
+        config = PipelineConfig(
             max_books=args.max,
+            only=args.only,
+            file_types={args.type} if args.type else None,
             enrich_api=not args.no_api,
             embed=args.embed,
-            force=args.force,
-            file_types=file_types,
-            ocr=args.ocr,
-            llm=args.llm,
+            ocr=not args.no_ocr,
+            llm_enrich=args.llm,
             cover_scrape=args.covers,
+            reading_progress=args.reading_progress,
+            force_reprocess=args.force,
+            workers=args.workers,
+            verify_sources=args.verify_sources,
+            export_json=args.export_json,
         )
 
-    print(f"\n✅ Catalog saved to: {CATALOG_FILE}")
-    print(f"   Run 'python build_catalog.py --stats' to see statistics")
+    pipeline = Pipeline(config)
+
+    if args.plan:
+        plan = pipeline.plan()
+        print("\n" + "=" * 60)
+        print("PLAN — nothing will be written")
+        print("=" * 60)
+        print(f"  Files found:    {plan['files_found']}")
+        print(f"  New:            {plan['new_files']}")
+        print(f"  Stale:          {plan['stale_records']}")
+        print(f"  Up to date:     {plan['up_to_date']}")
+        if plan["per_stage"]:
+            print("\n  Stages that would run:")
+            for stage, count in plan["per_stage"].items():
+                print(f"    {stage:<10} {count} books")
+        print("=" * 60)
+        return
+
+    stats = pipeline.run()
+    report = build_report(CatalogStore(), stats)
+    save_report(report)
+
+    if stats.get("interrupted"):
+        print("\n⚠️  Interrupted — the catalog is consistent; re-run to finish the remaining books.")
+    print(f"\n✅ Catalog: {CATALOG_DB_FILE}")
+    print(f"   {stats['needs_review']} records need review — see 'python build_catalog.py --review'")
+    print("   Quality report:  python build_catalog.py --report")
 
 
 if __name__ == "__main__":

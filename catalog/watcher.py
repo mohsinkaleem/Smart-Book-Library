@@ -20,7 +20,7 @@ from typing import Optional
 from .config import BOOKS_DIRS, SUPPORTED_EXTENSIONS, PROJECT_ROOT
 from .models import BookRecord
 from .scanner import create_basic_record, compute_sha1
-from .database import CatalogDatabase, ProcessingLog
+from .store import CatalogStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class BookFileHandler:
     Queues changes and processes them after a debounce period.
     """
 
-    def __init__(self, db: CatalogDatabase, process_callback=None):
+    def __init__(self, db: CatalogStore, process_callback=None):
         self.db = db
         self.process_callback = process_callback
         self._pending_adds: dict[str, Path] = {}
@@ -104,8 +104,10 @@ class BookFileHandler:
                 rel_path = str(Path(path_str).relative_to(PROJECT_ROOT))
                 record = self.db.get_by_path(rel_path)
                 if record:
-                    self.db.remove(record.id)
-                    logger.info(f"   ✅ Removed from catalog: {Path(path_str).name}")
+                    # Flagged, not deleted — the record keeps its user data and
+                    # can come back if the file reappears (M7).
+                    self.db.mark_missing([rel_path])
+                    logger.info(f"   ✅ Marked as missing: {Path(path_str).name}")
                     changes += 1
             except Exception as e:
                 logger.error(f"Failed to remove {path_str}: {e}")
@@ -130,8 +132,7 @@ class BookFileHandler:
         self._pending_adds.clear()
 
         if changes > 0:
-            self.db.save()
-            logger.info(f"💾 Catalog saved ({changes} changes)")
+            logger.info(f"💾 Catalog updated ({changes} changes)")
 
         return changes
 
@@ -167,7 +168,7 @@ def watch_directories(
         return
 
     dirs = directories or BOOKS_DIRS
-    db = CatalogDatabase()
+    db = CatalogStore()
     handler = BookFileHandler(db, process_callback)
 
     class _WatchdogAdapter(FileSystemEventHandler):
@@ -215,7 +216,7 @@ def watch_directories(
     finally:
         observer.stop()
         observer.join()
-        db.save()
+        db.close()
 
 
 def scan_for_changes() -> dict:
@@ -225,7 +226,7 @@ def scan_for_changes() -> dict:
     """
     from .scanner import scan_all_directories
 
-    db = CatalogDatabase()
+    db = CatalogStore()
     current_files = scan_all_directories()
 
     # Build sets for comparison

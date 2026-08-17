@@ -1,16 +1,13 @@
 """
 Reading progress tracker.
 
-Detects last-opened timestamps and reading progress by:
-1. Checking macOS file extended attributes (kMDItemLastUsedDate)
-2. Reading macOS Spotlight metadata
-3. Checking file access time (atime)
-4. Integrating with common PDF viewer bookmarks (if available)
-
-Also provides a manual progress update interface.
+Derives a last-opened timestamp from filesystem hints (macOS Spotlight
+`kMDItemLastUsedDate`, falling back to atime). It deliberately does *not* infer
+a reading status: opening a file in Preview to check the cover is not the same
+as starting to read it, and guessing here used to overwrite what the user had
+set in the UI.
 """
 import logging
-import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -23,28 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 def update_reading_progress(record: BookRecord, file_path: Path = None) -> BookRecord:
-    """
-    Update reading progress metadata from filesystem hints.
-
-    Checks:
-    - macOS Spotlight kMDItemLastUsedDate
-    - File access time (atime)
-    - macOS "com.apple.metadata:kMDItemWhereFroms" (download source)
-    """
+    """Record when the file was last opened, if the filesystem knows."""
     if file_path is None:
         file_path = PROJECT_ROOT / record.file_path
 
     if not file_path.exists():
         return record
 
-    # ── Last opened timestamp ────────────────────────────────────────────
     last_opened = _get_last_opened_macos(file_path)
     if last_opened:
         record.last_opened = last_opened
-
-    # ── Infer reading status from access patterns ────────────────────────
-    if record.last_opened and record.reading_status == "not_started":
-        record.reading_status = "in_progress"
 
     return record
 
@@ -93,54 +78,6 @@ def _get_last_opened_macos(file_path: Path) -> Optional[str]:
         pass
 
     return None
-
-
-def _get_download_source_macos(file_path: Path) -> Optional[str]:
-    """Get the download source URL from macOS extended attributes."""
-    try:
-        result = subprocess.run(
-            ["mdls", "-name", "kMDItemWhereFroms", str(file_path)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and "(null)" not in result.stdout:
-            output = result.stdout.strip()
-            if "= (" in output:
-                # Parse the array
-                urls = output.split("= (")[1].rstrip(")").strip()
-                url_list = [u.strip().strip('"') for u in urls.split(",")]
-                return url_list[0] if url_list else None
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
-    return None
-
-
-def set_reading_status(record: BookRecord, status: str, progress: float = None):
-    """
-    Manually set reading status and progress.
-
-    Args:
-        record: BookRecord to update
-        status: One of 'not_started', 'in_progress', 'finished', 'abandoned'
-        progress: Optional progress percentage (0-100)
-    """
-    valid_statuses = {"not_started", "in_progress", "finished", "abandoned"}
-    if status not in valid_statuses:
-        raise ValueError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
-
-    record.reading_status = status
-
-    if progress is not None:
-        record.progress_percent = max(0.0, min(100.0, float(progress)))
-
-    if status == "finished":
-        record.progress_percent = 100.0
-
-    logger.info(
-        f"Updated reading status for '{record.title}': "
-        f"{status} ({record.progress_percent}%)"
-    )
 
 
 def get_reading_stats(records: list[BookRecord]) -> dict:

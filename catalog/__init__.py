@@ -19,7 +19,8 @@ Modules:
     duplicate_detector - Find duplicate books
     reading_tracker  - Track reading progress via filesystem metadata
     watcher          - Incremental folder watching with watchdog
-    database         - JSON database management
+    store            - SQLite catalog store (the store of record)
+    schema           - Canonical SQLite DDL and migrations
     pipeline         - Orchestrate the full enrichment pipeline
 """
 

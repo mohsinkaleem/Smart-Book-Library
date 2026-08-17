@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiofiles>=25.1.0",
     "beautifulsoup4>=4.12",
+    "cryptography>=3.1",
     "ebooklib>=0.18",
     "fastapi>=0.134.0",
     "numpy>=1.24",
@@ -15,17 +16,23 @@ dependencies = [
     "python-multipart>=0.0.22",
     "rapidfuzz>=3.0",
     "requests>=2.31",
-    "sentence-transformers>=2.2",
     "uvicorn[standard]>=0.41.0",
 ]
 
 [project.optional-dependencies]
+embed = ["sentence-transformers>=2.2"]
 ocr = ["pytesseract>=0.3.10", "pdf2image>=1.16"]
 covers = ["playwright>=1.40"]
 watch = ["watchdog>=4.0"]
+dev = ["pytest>=8.0"]
 all = [
+    "sentence-transformers>=2.2",
     "pytesseract>=0.3.10",
     "pdf2image>=1.16",
     "playwright>=1.40",
     "watchdog>=4.0",
+    "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

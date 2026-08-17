@@ -1,0 +1,136 @@
+"""
+Catalog quality reporting.
+
+"You cannot improve accuracy you cannot measure — the fact that OpenLibrary
+contributed zero records for months is the proof." The old summary printed ten
+counters, all of them success counts. This adds per-field provenance, fill
+rates, the confidence distribution and the worst records by confidence.
+"""
+import json
+from collections import Counter
+from datetime import datetime
+from typing import Optional
+
+from .config import REPORT_FILE
+from .store import CatalogStore
+
+_TRACKED_FIELDS = [
+    "title", "authors", "publisher", "publication_year", "isbn_13",
+    "description", "categories", "summary", "cover_path", "language",
+]
+
+
+def build_report(store: CatalogStore, stats: Optional[dict] = None) -> dict:
+    records = store.all_records(include_missing=True)
+    total = len(records)
+    if not total:
+        return {"total_books": 0}
+
+    field_sources: dict[str, Counter] = {f: Counter() for f in _TRACKED_FIELDS}
+    fill: dict[str, int] = {f: 0 for f in _TRACKED_FIELDS}
+    for record in records:
+        for name in _TRACKED_FIELDS:
+            value = getattr(record, name, None)
+            if value:
+                fill[name] += 1
+                field_sources[name][record.field_source(name) or "unsourced"] += 1
+
+    buckets = Counter()
+    for record in records:
+        score = record.match_score
+        if score is None:
+            buckets["unmatched"] += 1
+        elif score >= 0.95:
+            buckets["0.95–1.00"] += 1
+        elif score >= 0.75:
+            buckets["0.75–0.95"] += 1
+        elif score >= 0.45:
+            buckets["0.45–0.75"] += 1
+        else:
+            buckets["<0.45"] += 1
+
+    review = [r for r in records if r.needs_review]
+    worst = sorted(
+        review,
+        key=lambda r: (r.match_score if r.match_score is not None else -1.0),
+    )[:25]
+
+    categories = Counter()
+    for record in records:
+        categories.update(record.categories)
+
+    return {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "total_books": total,
+        "active": sum(1 for r in records if r.status == "active"),
+        "missing": sum(1 for r in records if r.status == "missing"),
+        "fill_rates": {
+            name: {"count": count, "pct": round(100 * count / total, 1)}
+            for name, count in fill.items()
+        },
+        "field_sources": {name: dict(counter) for name, counter in field_sources.items()},
+        "match_score_distribution": dict(buckets),
+        "needs_review": len(review),
+        "duplicates": sum(1 for r in records if r.duplicate_of),
+        "categories": dict(categories.most_common(25)),
+        "distinct_categories": len(categories),
+        "categories_used_once": sum(1 for c in categories.values() if c == 1),
+        "worst_records": [
+            {
+                "file_name": r.file_name,
+                "title": r.title,
+                "match_score": r.match_score,
+                "reasons": r.review_reasons,
+                "title_source": r.field_source("title"),
+            }
+            for r in worst
+        ],
+        "run_stats": stats or {},
+    }
+
+
+def save_report(report: dict, path=REPORT_FILE):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def print_report(report: dict):
+    if not report.get("total_books"):
+        print("No catalog found. Run the pipeline first.")
+        return
+
+    total = report["total_books"]
+    print("\n" + "=" * 68)
+    print("📊 CATALOG QUALITY REPORT")
+    print("=" * 68)
+    print(f"  Books: {total}  (active {report['active']}, missing {report['missing']})")
+    print(f"  Needs review: {report['needs_review']}   Duplicates: {report['duplicates']}")
+    print(f"  Categories: {report['distinct_categories']} distinct, "
+          f"{report['categories_used_once']} used once")
+
+    print("\n  Field coverage and where the value came from:")
+    for name, info in report["fill_rates"].items():
+        sources = report["field_sources"].get(name, {})
+        rendered = ", ".join(
+            f"{src}={count}" for src, count in sorted(sources.items(), key=lambda kv: -kv[1])
+        )
+        print(f"    {name:<18} {info['count']:>4}/{total} ({info['pct']:>5.1f}%)  {rendered}")
+
+    print("\n  Match score distribution:")
+    for bucket, count in report["match_score_distribution"].items():
+        print(f"    {bucket:<12} {count}")
+
+    if report["worst_records"]:
+        print("\n  Lowest-confidence records (review these first):")
+        for item in report["worst_records"][:15]:
+            score = "—" if item["match_score"] is None else f"{item['match_score']:.2f}"
+            reason = (item["reasons"] or [""])[0][:60]
+            print(f"    [{score:>4}] {item['file_name'][:44]:<44} {reason}")
+
+    metrics = (report.get("run_stats") or {}).get("provider_metrics") or {}
+    if metrics:
+        print("\n  Provider health (last run):")
+        for source, counts in metrics.items():
+            print(f"    {source:<14} {counts}")
+    print("=" * 68)

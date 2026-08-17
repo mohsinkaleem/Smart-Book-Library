@@ -1,104 +1,29 @@
 """
 SQLite database wrapper with FTS5 full-text search.
+
+The schema itself lives in `catalog.schema` — the pipeline and the server read
+and write the same `data/catalog.db`, so the DDL exists in one place only
+User-owned fields are written through
+`catalog.user_data`, which keeps them in their own table so a pipeline run can
+never overwrite them (R5).
 """
 import json
 import sqlite3
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import DB_PATH
+from .config import DB_PATH, PROJECT_ROOT
+
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from catalog.schema import PIPELINE_COLUMNS, ensure_schema  # noqa: E402
+from catalog.user_data import clear_review as _clear_review  # noqa: E402
+from catalog.user_data import pin_field as _pin_field  # noqa: E402
+from catalog.user_data import write_user_fields as _write_user_fields  # noqa: E402
 
 logger = logging.getLogger(__name__)
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS books (
-    id                TEXT PRIMARY KEY,
-    file_path         TEXT UNIQUE NOT NULL,
-    file_name         TEXT NOT NULL,
-    file_type         TEXT NOT NULL,
-    size              INTEGER DEFAULT 0,
-    title             TEXT DEFAULT '',
-    original_title_meta TEXT DEFAULT '',
-    authors           TEXT DEFAULT '[]',
-    publisher         TEXT DEFAULT '',
-    publication_year  INTEGER,
-    language          TEXT DEFAULT '',
-    page_count        INTEGER,
-    isbn_10           TEXT DEFAULT '',
-    isbn_13           TEXT DEFAULT '',
-    description       TEXT DEFAULT '',
-    summary           TEXT DEFAULT '',
-    themes            TEXT DEFAULT '[]',
-    categories        TEXT DEFAULT '[]',
-    keywords          TEXT DEFAULT '[]',
-    cover_path        TEXT DEFAULT '',
-    text_excerpt      TEXT DEFAULT '',
-    has_text          INTEGER DEFAULT 1,
-    ocr_required      INTEGER DEFAULT 0,
-    api_sources       TEXT DEFAULT '[]',
-    date_added        TEXT DEFAULT '',
-    last_opened       TEXT,
-    reading_status    TEXT DEFAULT 'not_started',
-    progress_percent  REAL DEFAULT 0,
-    user_rating       REAL,
-    user_tags         TEXT DEFAULT '[]',
-    favorite          INTEGER DEFAULT 0,
-    duplicate_of      TEXT,
-    processing_errors TEXT DEFAULT '[]',
-    last_processed    TEXT DEFAULT '',
-    author_primary    TEXT DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS idx_books_file_type ON books(file_type);
-CREATE INDEX IF NOT EXISTS idx_books_reading_status ON books(reading_status);
-CREATE INDEX IF NOT EXISTS idx_books_favorite ON books(favorite);
-CREATE INDEX IF NOT EXISTS idx_books_publication_year ON books(publication_year);
-CREATE INDEX IF NOT EXISTS idx_books_language ON books(language);
-CREATE INDEX IF NOT EXISTS idx_books_user_rating ON books(user_rating);
-CREATE INDEX IF NOT EXISTS idx_books_duplicate ON books(duplicate_of);
-CREATE INDEX IF NOT EXISTS idx_books_title ON books(title COLLATE NOCASE);
-CREATE INDEX IF NOT EXISTS idx_books_author_primary ON books(author_primary COLLATE NOCASE);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
-    title,
-    authors,
-    description,
-    summary,
-    themes,
-    categories,
-    keywords,
-    publisher,
-    content='books',
-    content_rowid='rowid',
-    tokenize='porter unicode61'
-);
-
--- Triggers to keep FTS in sync
-CREATE TRIGGER IF NOT EXISTS books_ai AFTER INSERT ON books BEGIN
-    INSERT INTO books_fts(rowid, title, authors, description, summary, themes, categories, keywords, publisher)
-    VALUES (new.rowid, new.title, new.authors, new.description, new.summary, new.themes, new.categories, new.keywords, new.publisher);
-END;
-
-CREATE TRIGGER IF NOT EXISTS books_ad AFTER DELETE ON books BEGIN
-    INSERT INTO books_fts(books_fts, rowid, title, authors, description, summary, themes, categories, keywords, publisher)
-    VALUES ('delete', old.rowid, old.title, old.authors, old.description, old.summary, old.themes, old.categories, old.keywords, old.publisher);
-END;
-
-CREATE TRIGGER IF NOT EXISTS books_au AFTER UPDATE ON books BEGIN
-    INSERT INTO books_fts(books_fts, rowid, title, authors, description, summary, themes, categories, keywords, publisher)
-    VALUES ('delete', old.rowid, old.title, old.authors, old.description, old.summary, old.themes, old.categories, old.keywords, old.publisher);
-    INSERT INTO books_fts(rowid, title, authors, description, summary, themes, categories, keywords, publisher)
-    VALUES (new.rowid, new.title, new.authors, new.description, new.summary, new.themes, new.categories, new.keywords, new.publisher);
-END;
-
-CREATE TABLE IF NOT EXISTS embeddings (
-    book_id            TEXT PRIMARY KEY REFERENCES books(id),
-    content_embedding  BLOB,
-    metadata_embedding BLOB
-);
-"""
-
 
 def _json_field(val: Any) -> str:
     """Convert a list/dict to JSON string for storage."""
@@ -133,9 +58,8 @@ class BookDatabase:
         self._create_schema()
 
     def _create_schema(self):
-        """Create tables and indexes."""
-        self.conn.executescript(SCHEMA_SQL)
-        self.conn.commit()
+        """Create or migrate the shared catalog schema."""
+        ensure_schema(self.conn)
 
     def close(self):
         self.conn.close()
@@ -143,71 +67,45 @@ class BookDatabase:
     # ── Book CRUD ────────────────────────────────────────────────────────
 
     def upsert_book(self, book: dict):
-        """Insert or replace a book record."""
+        """
+        Insert or update a book from a pipeline record.
+
+        Only pipeline-owned columns are written. The old `INSERT OR REPLACE`
+        listed `reading_status`, `progress_percent`, `user_rating`, `user_tags`
+        and `favorite` too, so every sync overwrote the user's edits with stale
+        defaults from catalog.json (R5).
+        """
         authors = book.get("authors", [])
         author_primary = authors[0] if isinstance(authors, list) and authors else ""
 
-        self.conn.execute("""
-            INSERT OR REPLACE INTO books (
-                id, file_path, file_name, file_type, size,
-                title, original_title_meta, authors, publisher, publication_year,
-                language, page_count, isbn_10, isbn_13,
-                description, summary, themes, categories, keywords,
-                cover_path, text_excerpt,
-                has_text, ocr_required, api_sources,
-                date_added, last_opened, reading_status, progress_percent,
-                user_rating, user_tags, favorite,
-                duplicate_of, processing_errors, last_processed,
-                author_primary
-            ) VALUES (
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?
-            )
-        """, (
-            book.get("id", ""),
-            book.get("file_path", ""),
-            book.get("file_name", ""),
-            book.get("file_type", ""),
-            book.get("size", 0),
-            book.get("title", ""),
-            book.get("original_title_meta", ""),
-            _json_field(book.get("authors", [])),
-            book.get("publisher", ""),
-            book.get("publication_year"),
-            book.get("language", ""),
-            book.get("page_count"),
-            book.get("isbn_10", ""),
-            book.get("isbn_13", ""),
-            book.get("description", ""),
-            book.get("summary", ""),
-            _json_field(book.get("themes", [])),
-            _json_field(book.get("categories", [])),
-            _json_field(book.get("keywords", [])),
-            book.get("cover_path", ""),
-            book.get("text_excerpt", ""),
-            1 if book.get("has_text", True) else 0,
-            1 if book.get("ocr_required", False) else 0,
-            _json_field(book.get("api_sources", [])),
-            book.get("date_added", ""),
-            book.get("last_opened"),
-            book.get("reading_status", "not_started"),
-            book.get("progress_percent", 0),
-            book.get("user_rating"),
-            _json_field(book.get("user_tags", [])),
-            1 if book.get("favorite", False) else 0,
-            book.get("duplicate_of"),
-            _json_field(book.get("processing_errors", [])),
-            book.get("last_processed", ""),
-            author_primary,
-        ))
+        values: dict[str, Any] = {}
+        for column in PIPELINE_COLUMNS:
+            if column == "author_primary":
+                values[column] = author_primary
+                continue
+            raw = book.get(column)
+            if column in ("authors", "themes", "categories", "keywords", "api_sources",
+                          "processing_errors", "subjects_raw", "source_ids",
+                          "review_reasons", "rejected_candidates"):
+                values[column] = _json_field(raw if raw is not None else [])
+            elif column in ("field_sources", "stage_versions"):
+                values[column] = json.dumps(raw or {}, ensure_ascii=False)
+            elif column in ("has_text",):
+                values[column] = 1 if book.get(column, True) else 0
+            elif column in ("ocr_required", "needs_review"):
+                values[column] = 1 if book.get(column, False) else 0
+            else:
+                values[column] = raw
+
+        columns = list(values.keys())
+        placeholders = ", ".join("?" for _ in columns)
+        update_clause = ", ".join(f"{c} = excluded.{c}" for c in columns if c != "id")
+        self.conn.execute(
+            f"""INSERT INTO books ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT(id) DO UPDATE SET {update_clause}""",
+            [values[c] for c in columns],
+        )
         self.conn.commit()
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
@@ -215,15 +113,27 @@ class BookDatabase:
         d = dict(row)
         # Parse JSON array fields
         for field in ("authors", "themes", "categories", "keywords",
-                      "api_sources", "user_tags", "processing_errors"):
-            d[field] = _parse_json_field(d.get(field))
+                      "api_sources", "user_tags", "processing_errors",
+                      "subjects_raw", "source_ids", "review_reasons",
+                      "rejected_candidates"):
+            if field in d:
+                d[field] = _parse_json_field(d.get(field))
+        # Provenance is an object, not an array.
+        if "field_sources" in d:
+            try:
+                d["field_sources"] = json.loads(d.get("field_sources") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["field_sources"] = {}
         # Convert int booleans
         d["has_text"] = bool(d.get("has_text", 1))
         d["ocr_required"] = bool(d.get("ocr_required", 0))
         d["favorite"] = bool(d.get("favorite", 0))
+        d["needs_review"] = bool(d.get("needs_review", 0))
         # Add computed fields
         d["has_cover"] = bool(d.get("cover_path"))
         d["has_description"] = bool(d.get("description"))
+        d["title_source"] = (d.get("field_sources") or {}).get("title", {}).get("source", "")
+        d["title_verified"] = d["title_source"] in ("user", "isbn_match", "api_verified")
         # Cover URL
         if d.get("cover_path"):
             cover_name = Path(d["cover_path"]).name
@@ -259,7 +169,8 @@ class BookDatabase:
         search: Optional[str] = None,
     ) -> dict:
         """Get paginated, sorted, filtered book list."""
-        where_clauses = []
+        # Records whose file has been deleted are kept but never listed (M7).
+        where_clauses = ["status != 'missing'"]
         params = []
 
         if file_type:
@@ -343,25 +254,48 @@ class BookDatabase:
         }
 
     def update_user_fields(self, book_id: str, fields: dict) -> Optional[dict]:
-        """Update user-modifiable fields (rating, tags, favorite, reading_status, progress)."""
-        allowed = {"user_rating", "user_tags", "favorite", "reading_status", "progress_percent"}
-        updates = {}
-        for key, val in fields.items():
-            if key in allowed:
-                if key == "user_tags":
-                    updates[key] = _json_field(val)
-                elif key == "favorite":
-                    updates[key] = 1 if val else 0
-                else:
-                    updates[key] = val
+        """
+        Update user-modifiable fields.
 
-        if not updates:
+        Writes go to `user_data` first and are mirrored into `books`, so they
+        survive a pipeline run or a full catalog rebuild (R5).
+        """
+        if not _write_user_fields(self.conn, book_id, fields):
             return None
+        return self.get_book(book_id)
 
-        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
-        params = list(updates.values()) + [book_id]
-        self.conn.execute(f"UPDATE books SET {set_clause} WHERE id = ?", params)
-        self.conn.commit()
+    # ── Review queue (M2) ────────────────────────────────────────────────
+
+    def get_review_queue(self, page: int = 1, per_page: int = 25) -> dict:
+        """Records the verification gate could not confirm, worst first."""
+        total = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM books WHERE needs_review = 1 AND status != 'missing'"
+        ).fetchone()["cnt"]
+        offset = (page - 1) * per_page
+        rows = self.conn.execute(
+            """SELECT * FROM books
+               WHERE needs_review = 1 AND status != 'missing'
+               ORDER BY match_score IS NULL DESC, match_score ASC, file_name
+               LIMIT ? OFFSET ?""",
+            (per_page, offset),
+        ).fetchall()
+        return {
+            "items": [self._row_to_dict(r) for r in rows],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        }
+
+    def pin_field(self, book_id: str, name: str, value) -> Optional[dict]:
+        """Record a human correction: source `user`, confidence 1.0, forever."""
+        if not _pin_field(self.conn, book_id, name, value):
+            return None
+        return self.get_book(book_id)
+
+    def resolve_review(self, book_id: str, resolution: str = "confirmed") -> Optional[dict]:
+        if not _clear_review(self.conn, book_id, resolution):
+            return None
         return self.get_book(book_id)
 
     # ── Search ───────────────────────────────────────────────────────────
@@ -521,6 +455,9 @@ class BookDatabase:
 
     def _apply_filters(self, where_clauses: list, params: list, filters: dict):
         """Apply filter clauses from kwargs."""
+        where_clauses.append("books.status != 'missing'")
+        if filters.get("needs_review"):
+            where_clauses.append("books.needs_review = 1")
         if filters.get("file_type"):
             where_clauses.append("books.file_type = ?")
             params.append(filters["file_type"])

@@ -1,9 +1,10 @@
 """Pipeline control routes."""
-from fastapi import APIRouter, Request, HTTPException
-from pydantic import BaseModel
 from typing import Optional
 
-from ..tasks import task_tracker, run_pipeline_background, run_embedding_generation
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from ..tasks import run_embedding_generation, run_pipeline_background, task_tracker
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
@@ -11,6 +12,9 @@ router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 class PipelineRunRequest(BaseModel):
     max_books: int = 0
     file_types: Optional[list[str]] = None
+    llm: bool = False
+    embed: bool = False
+    force: bool = False
 
 
 @router.get("/status")
@@ -25,9 +29,15 @@ def pipeline_status():
 def run_pipeline(body: PipelineRunRequest, request: Request):
     if task_tracker.is_running("pipeline"):
         raise HTTPException(409, "Pipeline is already running")
-    db = request.app.state.db
-    similarity = request.app.state.similarity
-    run_pipeline_background(db, similarity, max_books=body.max_books, file_types=body.file_types)
+    run_pipeline_background(
+        request.app.state.db,
+        request.app.state.similarity,
+        max_books=body.max_books,
+        file_types=body.file_types,
+        llm=body.llm,
+        embed=body.embed,
+        force=body.force,
+    )
     return {"status": "started"}
 
 
@@ -35,9 +45,7 @@ def run_pipeline(body: PipelineRunRequest, request: Request):
 def generate_embeddings(request: Request):
     if task_tracker.is_running("embeddings"):
         raise HTTPException(409, "Embedding generation is already running")
-    db = request.app.state.db
-    similarity = request.app.state.similarity
-    run_embedding_generation(db, similarity)
+    run_embedding_generation(request.app.state.db, request.app.state.similarity)
     return {"status": "started"}
 
 
@@ -51,22 +59,31 @@ def embedding_status():
 
 @router.get("/unprocessed")
 def get_unprocessed(request: Request):
-    """Count files not yet in catalog."""
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    """Count files on disk that are not in the catalog yet."""
     try:
+        from catalog.config import PROJECT_ROOT
         from catalog.scanner import scan_all_directories
-        from catalog.config import SUPPORTED_EXTENSIONS
+
         db = request.app.state.db
-
+        existing = {
+            row["file_path"]
+            for row in db.conn.execute("SELECT file_path FROM books").fetchall()
+        }
+        # `scan_all_directories` returns Paths; the old code called `.get()` on
+        # them, raised AttributeError, and always reported zero.
         all_files = scan_all_directories()
-        existing = set()
-        rows = db.conn.execute("SELECT file_path FROM books").fetchall()
-        for r in rows:
-            existing.add(r["file_path"])
-
-        new_count = sum(1 for f in all_files if f.get("file_path", "") not in existing)
-        return {"unprocessed": new_count, "total_files": len(all_files)}
+        unprocessed = sum(
+            1 for f in all_files if str(f.relative_to(PROJECT_ROOT)) not in existing
+        )
+        return {"unprocessed": unprocessed, "total_files": len(all_files)}
     except Exception as e:
         return {"unprocessed": 0, "total_files": 0, "error": str(e)}
+
+
+@router.get("/report")
+def quality_report(request: Request):
+    """Catalog quality report: fill rates, provenance, confidence (M6)."""
+    from catalog.reporting import build_report
+    from catalog.store import CatalogStore
+
+    return build_report(CatalogStore())

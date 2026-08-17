@@ -1,159 +1,260 @@
 # 📚 Book Catalog Enrichment Pipeline
 
-A comprehensive Python pipeline for building an enriched metadata catalog from local PDF/EPUB book collections.
+Builds an enriched metadata catalog from a local PDF/EPUB collection.
 
-## Features
+The pipeline's organising principle is that **a field may only be written
+together with its source and confidence**, and **an external match must be
+verified before it is applied** — not merely returned.
 
-- **File Scanning** - Discovers all PDF/EPUB files, computes SHA1 checksums
-- **Smart Title Parsing** - Cleans book titles from messy filenames (libgen, z-lib, dokumen.pub patterns)
-- **PDF/EPUB Extraction** - Extracts metadata, text content, and cover images from files
-- **API Enrichment** - Fetches rich metadata from OpenLibrary and Google Books APIs
-- **Theme Analysis** - Detects broad categories, themes, and keywords from content
-- **Duplicate Detection** - Finds duplicates by SHA1, ISBN, and fuzzy title matching
-- **Vector Embeddings** - Optional embedding generation for semantic search
-- **JSON Catalog** - Persistent catalog database with search and export
+## How it works
 
-## Quick Start
+```
+┌─ COLLECT EVIDENCE ────────────────────────────────────────────┐
+│  filename        → title guess, author guess, year, ISBN      │
+│  embedded meta   → title, authors, publisher, language, ISBN  │
+│  front matter    → title-page lines (positional), ISBN, pub   │
+│  content sample  → prose past the TOC                         │
+└───────────────────────────────┬───────────────────────────────┘
+                                ▼
+┌─ GENERATE CANDIDATES ─────────────────────────────────────────┐
+│  ISBN lookups first, then field-scoped title/author queries    │
+│  (`intitle:` / `title=`). BOTH providers are always queried.  │
+└───────────────────────────────┬───────────────────────────────┘
+                                ▼
+┌─ VERIFY ──────────────────────────────────────────────────────┐
+│  ISBN hit = 1.0, else weighted title/author/year similarity,  │
+│  renormalised over the dimensions we have evidence for.       │
+│    ≥ 0.75 → accept   0.45–0.75 → descriptive fields + review  │
+│    < 0.45 → reject, and the rejection is recorded             │
+│  Title-only evidence needs ≥ 0.85. Too little evidence to     │
+│  score → no title search at all.                              │
+└───────────────────────────────┬───────────────────────────────┘
+                                ▼
+┌─ MERGE ───────────────────────────────────────────────────────┐
+│  Per field: highest (source rank × confidence) wins. Never    │
+│  overwrite source == "user". Write field_sources alongside.   │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Source ranks (`catalog/models.py`): `user` 100 › `isbn_match` 90 ›
+`api_verified` 80 › `file_meta` 60 › `front_matter` 50 › `filename` 40 ›
+`api_partial` 30 › `analyzer` 20 › `llm` 15 › `derived` 10.
+
+A borderline match may never write an identity field (title, authors, ISBNs,
+year, publisher) or a cover — only description, page count and language.
+
+## Quick start
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Quick test (5 books, no API calls)
-python build_catalog.py --test
-
-# Full pipeline with API enrichment
-python build_catalog.py
-
-# View statistics
-python build_catalog.py --stats
-
-# Search catalog
-python build_catalog.py --search "machine learning"
+python build_catalog.py --test              # 5 books, no API calls
+python build_catalog.py                     # full run
+python build_catalog.py --report            # quality report
+python build_catalog.py --review            # what needs human confirmation
 ```
 
 ## Usage
 
 ```bash
-# Process only EPUBs
-python build_catalog.py --type epub
+# Scope
+python build_catalog.py --only "Aisha.pdf" --only 757.pdf   # specific files (repeatable)
+python build_catalog.py --max 20                            # first 20 books
+python build_catalog.py --type epub                         # EPUBs only
 
-# Process first 20 books
-python build_catalog.py --max 20
+# Stages
+python build_catalog.py --no-api          # local extraction only
+python build_catalog.py --no-ocr          # skip OCR of image-based PDFs
+python build_catalog.py --llm             # Ollama summaries + borderline adjudication
+python build_catalog.py --embed           # vector embeddings
+python build_catalog.py --covers          # Playwright cover scraping
 
-# Skip API calls (file metadata only)
-python build_catalog.py --no-api
-
-# Force reprocess everything
-python build_catalog.py --force
-
-# Include vector embeddings
-python build_catalog.py --embed
-
-# Export to CSV
+# Operations
+python build_catalog.py --force           # ignore stage versions, redo everything
+python build_catalog.py --workers 4       # parallel workers
+python build_catalog.py --verify-sources  # probe each provider before running
+python build_catalog.py --export-json     # write data/catalog.json (an export)
 python build_catalog.py --export-csv
-
-# Verbose logging
-python build_catalog.py -v
+python build_catalog.py --changes         # filesystem vs catalog diff
+python build_catalog.py --watch           # incremental folder watcher
+python build_catalog.py --stats
+python build_catalog.py --search "machine learning"
+python build_catalog.py -v                # verbose
 ```
 
-## Pipeline Stages
+## Pipeline stages
+
+Per book, in order. Each stage carries a version in `STAGE_VERSIONS`
+(`config.py`); it re-runs only when that version is newer than the version
+stored on the record, when the file's content hash changed, or under `--force`.
 
 | Stage | Description |
-|-------|-------------|
-| 1. **SCAN** | Discover files, compute SHA1, capture file metadata |
-| 2. **PARSE** | Clean/parse titles, authors, publishers from filenames |
-| 3. **EXTRACT** | Extract metadata & text from PDF/EPUB content |
-| 4. **ENRICH** | Fetch metadata from OpenLibrary & Google Books APIs |
-| 5. **ANALYZE** | Detect themes, categories, keywords from content |
-| 6. **EMBED** | Generate vector embeddings (optional) |
-| 7. **DEDUPE** | Detect and mark duplicate books |
-| 8. **SAVE** | Persist catalog to JSON database |
+|---|---|
+| `scan` | Discover files, compute SHA1, capture size/mtime |
+| `parse` | Filename → title, authors, publisher, year, ISBN, source ids |
+| `extract` | PDF/EPUB metadata, cover, and text split into front matter / content sample / excerpt |
+| `ocr` | OCR image-based PDFs (language chosen per book from the detected script) |
+| `identify` | Harvest and validate ISBNs; read the title page positionally |
+| `enrich` | Candidates from both providers → verification gate → provenance-aware merge |
+| `analyze` | Categories (controlled vocabulary), themes, deterministic keywords, fallback summary |
+| `llm` | Ollama summary, description, adjudication of borderline matches (optional) |
+| `embed` | Vector embeddings of the content sample (optional) |
 
-## Project Structure
+Closing stages run in a `finally` block, so an interrupted run still leaves a
+consistent catalog: batched embedding → cover scraping → reading progress →
+dedupe (over the whole catalog) → deletion reconciliation → save. A narrowed
+run (`--only`, `--max`, `--type`) scopes the per-record closing stages to the
+files it touched.
+
+## Module map
 
 ```
-books/
-├── catalog/                    # Pipeline package
-│   ├── __init__.py
-│   ├── config.py              # Configuration & paths
-│   ├── models.py              # BookRecord data model
-│   ├── scanner.py             # File discovery & SHA1
-│   ├── title_parser.py        # Filename → clean title
-│   ├── pdf_extractor.py       # PDF metadata & text extraction
-│   ├── epub_extractor.py      # EPUB metadata & text extraction
-│   ├── api_enricher.py        # OpenLibrary & Google Books APIs
-│   ├── theme_analyzer.py      # Theme/category detection
-│   ├── embeddings.py          # Vector embedding generation
-│   ├── duplicate_detector.py  # Duplicate detection
-│   ├── database.py            # JSON catalog management
-│   └── pipeline.py            # Pipeline orchestrator
-├── data/
-│   ├── catalog.json           # Generated catalog (output)
-│   ├── catalog.csv            # CSV export (optional)
-│   ├── api_cache.json         # API response cache
-│   ├── covers/                # Extracted/downloaded cover images
-│   └── text_excerpts/         # (future) extracted text files
-├── epubs/                     # Your EPUB files
-├── pdfs/                      # Your PDF files
-├── build_catalog.py           # Main entry point
-├── requirements.txt           # Python dependencies
-└── README.md
+catalog/
+├── config.py              # every setting, env-overridable, loads .env
+├── models.py              # BookRecord + set_field (provenance-aware writes)
+├── schema.py              # canonical SQLite DDL, shared with the server
+├── store.py               # CatalogStore — SQLite is the store of record
+├── user_data.py           # ratings/tags/progress + pinned corrections
+│
+├── scanner.py             # file discovery, SHA1, basic record
+├── title_parser.py        # filename → title/authors/publisher/year/ISBN
+├── names.py               # is_person_name — one rejection predicate for all sources
+├── isbn_extractor.py      # ISBN harvesting + check-digit validation, DOI/arXiv/IA ids
+├── text_utils.py          # front matter vs content sample, title-page parsing, script/lang
+├── pdf_extractor.py       # pypdf metadata, text, cover
+├── epub_extractor.py      # ebooklib metadata, text, cover, calibre:isbn/dc:source
+├── ocr_extractor.py       # pytesseract + pdf2image
+│
+├── evidence.py            # Evidence, Candidate, scoring, the verification gate
+├── providers.py           # OpenLibrary + Google Books: session, retries, cache, rate limits
+├── api_enricher.py        # orchestration: evidence → candidates → verify → merge
+│
+├── taxonomy.py            # canonical categories, alias map, subject filtering
+├── theme_analyzer.py      # density-normalised categories/themes, deterministic keywords
+├── llm_enricher.py        # Ollama: summaries, descriptions, match adjudication
+├── embeddings.py          # sentence-transformers, batched
+│
+├── duplicate_detector.py  # content hash → trusted ISBN → corroborated fuzzy title
+├── reading_tracker.py     # macOS Spotlight last-opened hints
+├── cover_scraper.py       # Playwright cover fallback
+├── watcher.py             # incremental folder watching
+├── reporting.py           # quality report: fill rates, provenance, worst records
+└── pipeline.py            # orchestrator: stage versions, workers, metrics
 ```
 
-## Catalog Schema
+## Storage
 
-Each book record contains:
+`data/catalog.db` is the store of record — the pipeline writes it directly and
+the web server reads it. `data/catalog.json` is produced only by
+`--export-json`.
 
-- **File Identity**: SHA1 ID, file path, name, type, size
-- **Bibliographic**: Title, authors, publisher, year, language, page count, ISBN
-- **Content & Discovery**: Description, summary, themes, categories, keywords
-- **Assets**: Cover image path, text excerpt (~2 pages)
-- **Embeddings**: Content and metadata vector embeddings
-- **Processing Flags**: has_text, ocr_required, api_sources
-- **User Fields**: reading_status, progress, rating, tags, favorite
-- **Housekeeping**: duplicate_of, processing_errors, timestamps
+| Table | Contents |
+|---|---|
+| `books` | Everything the pipeline produces, including `field_sources`, `match_score`, `needs_review`, `review_reasons`, `rejected_candidates`, `stage_versions` |
+| `user_data` | Ratings, tags, favourites, reading progress, pinned field corrections. **The pipeline never writes these** |
+| `embeddings` | Content and metadata vectors |
 
-## Handling Challenges
+Also on disk: `data/api_cache.json` (provider answers with an explicit status),
+`data/covers/`, `data/processing_log.json`, `data/enrichment_report.json`.
 
-### Messy Filenames
-The title parser handles patterns from libgen, z-lib, dokumen.pub, PDFDrive, etc. It strips source prefixes, extracts authors/publishers/years, and cleans titles.
+## Record schema
 
-### Missing Metadata
-Multiple enrichment layers: filename parsing → file metadata → API enrichment (OpenLibrary → Google Books fallback)
+- **File identity** — `id`, `content_sha1`, path, name, type, size, mtime, `status`
+- **Bibliographic** — title, subtitle, authors, publisher, year, language, script, pages, ISBN-10/13, `source_ids`
+- **Content** — description, summary, themes, `categories` (controlled), `subjects_raw` (external, searchable), keywords
+- **Text** — `front_matter` (evidence, never embedded), `content_sample` (embedded and summarised), `text_excerpt` (reader preview)
+- **Provenance** — `field_sources`, `match_score`, `needs_review`, `review_reasons`, `rejected_candidates`
+- **Processing** — `has_text`, `ocr_required`, `api_sources`, `stage_versions`, `processing_errors`
+- **User** *(in `user_data`)* — reading status, progress, rating, tags, favourite
 
-### Image-based/Scanned PDFs
-Detected automatically by checking if text extraction yields less than 100 characters. Marked with `has_text=false` and `ocr_required=true` for future OCR processing.
+## How it handles the hard cases
 
-### Duplicates
-Detected by three methods:
-1. Identical SHA1 hash (exact file copies)
-2. Matching ISBN
-3. Fuzzy title matching (>85% similarity)
+**Messy filenames.** Identifiers are extracted before the title is cleaned, so
+an ISBN in the name is used rather than deleted. An `Author - Title` split needs
+real whitespace around the dash, and which side is the author is decided by
+`is_person_name`, not by position — so both orders work and
+`Abu-Dhar-Al-Gifari-Struggle-for-Equality.pdf` is not read as author "Abu".
 
-The canonical copy is chosen based on metadata completeness, text availability, and file size.
+**Tool strings.** `/Producer` is never consulted for authorship, and every
+author candidate from every source passes one rejection predicate, so
+"Adobe InDesign CS5.5 (7.5)" cannot become an author and then poison a query.
+
+**Thin evidence.** `Aisha.pdf`, `757.pdf` and `1658134075976.pdf` carry almost
+nothing. Rather than accept whatever a search returns for a one-word query, the
+pipeline requires an ISBN or a usable title before searching at all, and flags
+the record otherwise.
+
+**Front matter that lies.** Title pages carry journal headers, glyph junk and
+adverts for the publisher's *other* books. Implausible lines are rejected; a
+line echoing the filename wins ties; and an ISBN match that contradicts a strong
+title page is downgraded to a review flag rather than silently trusted.
+
+**Image-based PDFs.** Detected when extraction yields under 100 characters, then
+OCR'd with a language pack chosen from the detected script.
+
+**Duplicates.** Grouped by content hash, then by *trusted* ISBN (a low-confidence
+identifier may not establish identity), then by fuzzy title corroborated by
+author, year or page count. The canonical copy wins on metadata completeness,
+text availability and size.
 
 ## Configuration
 
-Edit `catalog/config.py` to customize:
-- Book directories
-- API rate limits
-- Text extraction limits
-- Duplicate detection thresholds
-- Embedding model
+Everything lives in `catalog/config.py` and every setting accepts an environment
+override:
 
-## Optional: Google Books API Key
-
-For higher API rate limits, set:
 ```bash
-export GOOGLE_BOOKS_API_KEY="your-key-here"
+OCR_LANGUAGE=eng+ara python build_catalog.py
+MATCH_ACCEPT_THRESHOLD=0.8 python build_catalog.py
 ```
 
-## Web Application
+A `.env` file at the project root is loaded automatically (and is gitignored) —
+the place for `GOOGLE_BOOKS_API_KEY`:
 
-The catalog powers a full web application (see the root `README.md`) with:
-- **Smart search** — Multi-mode search (text, semantic, hybrid) with prefix matching, phrase queries, and OR operators
-- **Reactive filter sidebar** — Filter counts update dynamically based on active search and other selected filters
-- **Individual book pages** with AI-powered similar book recommendations
-- **Reading view** with LLM-powered text analysis (summarize, explain, critique, compare)
-- **Dashboard** — Visual statistics with charts for library composition
+```
+GOOGLE_BOOKS_API_KEY=your-key-here
+```
+
+Google Books' anonymous quota is small and per-IP, so bulk runs earn `429`s; the
+pipeline throttles that host, backs off after a 429, and keeps going on
+OpenLibrary alone. A key removes the problem.
+
+Notable knobs: `MATCH_ACCEPT_THRESHOLD` (0.75), `MATCH_PARTIAL_THRESHOLD`
+(0.45), `MAX_WORKERS` (4), `API_RATE_LIMIT_PER_SECOND`,
+`API_NEGATIVE_CACHE_TTL_DAYS` (30), `DUPLICATE_TITLE_THRESHOLD` (90),
+`OLLAMA_MODEL` (`qwen3.5:4b`), `EMBEDDING_MODEL`.
+
+## Observability
+
+The run summary reports per-source `attempted / ok / not_found / error /
+throttled / cached` and shouts when a source's error rate crosses 20% — the
+original catalog had OpenLibrary contributing **zero** records for months
+without a single log line.
+
+```bash
+python build_catalog.py --verify-sources    # probe providers up front
+python build_catalog.py --report            # fill rates, per-field provenance, worst records
+python build_catalog.py --review            # the review queue on the command line
+```
+
+## Review queue
+
+Records the gate could not confirm surface at `/review` in the web app and
+through `/api/review`. A correction made there is pinned as `source: "user"`,
+`confidence: 1.0`, stored in `user_data.field_overrides`, and re-applied after
+every future run — including a full rebuild.
+
+## Tests
+
+```bash
+./.venv/bin/python -m unittest discover -s tests
+```
+
+Covers the pathological filenames, the junk-author strings, the gate's
+accept/partial/reject bands, ISBN harvesting and the controlled vocabulary.
+
+## Web application
+
+This catalog powers the web app described in the root
+[`README.md`](../README.md): multi-mode search (text, semantic, hybrid), a
+reactive filter sidebar, book pages with similar-book recommendations, an
+LLM-assisted reading view, a statistics dashboard, and the review queue.

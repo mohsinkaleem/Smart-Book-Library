@@ -1,16 +1,26 @@
 """
-Title parser - cleans and normalizes book titles extracted from filenames.
+Filename parser — turns a book filename into title / authors / publisher / year
+/ identifiers.
 
-Handles common patterns from library genesis, dokumen.pub, z-lib, etc.
+The important rules:
+
+* identifiers are *extracted* before the title is cleaned, never deleted;
+* an "Author - Title" split requires real whitespace around the dash, so
+  `Abu-Dhar-Al-Gifari-Struggle-for-Equality` is no longer read as author "Abu";
+* which side is the author is decided by `is_person_name`, not by position, so
+  both `Author - Title` and `Title - Author` work;
+* a hyphen-joined name with no spaces at all is a spaced title.
 """
-import re
 import logging
+import re
+
+from .isbn_extractor import find_source_ids, isbns_from_filename, normalize_isbn
+from .names import is_person_name, normalize_author
 
 logger = logging.getLogger(__name__)
 
-# Patterns to strip from filenames (order matters)
+# Source-site and download-artefact markers.
 STRIP_PATTERNS = [
-    # Source site prefixes
     r"^dokumen\.pub_",
     r"^ebin\.pub_",
     r"^vdoc\.pub_",
@@ -18,194 +28,231 @@ STRIP_PATTERNS = [
     r"^pdfcoffee\.com_",
     r"^toaz\.info-",
     r"^noor-book\.com\s+",
-    r"^\[\]\s*",
-    # Libgen suffix
-    r"\s*-\s*libgen\.li$",
-    # Z-lib suffix
-    r"\s*\(z-lib\.org\)$",
-    r"\s*\(z-lib\.org\)\s*$",
-    # PDFDrive suffix
-    r"\s*\(\s*PDFDrive(?:\.com)?\s*\)$",
-    # book-drive.com suffix
-    r"\s*\(book-drive\.com\)$",
-    # Internet Archive identifiers
-    r"_[a-z0-9]+goog$",       # e.g. indianmusalmans02huntgoog
-    # ISBN patterns in filename
-    r"\b\d{10,13}\b",
-    # Trailing copy/duplicate markers
-    r"\s*\(\d+\)$",           # e.g. (1) at end
-    r"\s+copy$",
-    r"\s+copy\s+\d*$",
-    # Random hash-like prefixes
-    r"^[0-9a-f]{20,}_",
-    # Numeric prefixes like "10. "
-    r"^\d+\.\s+",
-    # Underscores to spaces
+    r"^annas-archive\S*_",
+    r"^\[\s*\]\s*",
+    r"\s*[-_]\s*libgen(?:\.li|\.rs|\.is)?\s*$",
+    r"\s*\(\s*z-lib\.org\s*\)\s*$",
+    r"\s*\(\s*PDFDrive(?:\.com)?\s*\)\s*$",
+    r"\s*\(\s*book-drive\.com\s*\)\s*$",
+    r"\s*\(\s*www\.[^)]+\)\s*$",
+    r"_[a-z0-9]{6,}goog$",             # Internet Archive google-scan suffix
+    r"_djvu$",
+    r"\s*\(\d+\)\s*$",                 # "(1)" duplicate marker
+    r"\s+copy(?:\s+\d+)?$",
+    r"^[0-9a-f]{20,}[_-]",             # hash-like prefix
+    r"^\d{8,}[_-]",                    # download-site numeric id prefix
+    r"^\d{1,3}\.\s+",                  # "10. " list prefix (never a bare "80-")
+    r"[-_\s]+(?:pdf|epub|mobi|ebook|e-book|book)$",
+    r"^(?:en|ar|ur|fr|de|es)[-_](?=[a-z])",   # locale prefix
+    r"[-_](?:en|eng|ar|ara|urd|ur)$",         # locale suffix
+    r"[-_\s]+(?:final|draft|v\d+|rev\d*|ocr|scan(?:ned)?|compressed|merged)$",
 ]
 
-# Publisher patterns commonly in filenames
 PUBLISHER_PATTERNS = [
-    r"-\s*O'Reilly\s+Media(?:,\s*Inc\.?)?\s*\(\d{4}\)",
-    r"-\s*Packt\s+Publishing(?:\s+Ltd)?\s*\(\d{4}\)",
-    r"-\s*Manning(?:\s+Publications?)?\s*\(\d{4}\)",
-    r"-\s*Springer(?:\s+International)?\s*\(\d{4}\)",
-    r"-\s*(?:Prentice\s+Hall|Wiley|McGraw.Hill|Cambridge|Oxford|Harvard)\s*\(\d{4}\)",
-    r"-\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Press|Publishing|Publications|Books)\s*\(\d{4}\)",
+    r"[-–]\s*O'Reilly\s+Media(?:,\s*Inc\.?)?\s*(?:\(\d{4}\))?",
+    r"[-–]\s*Packt\s+Publishing(?:\s+Ltd)?\s*(?:\(\d{4}\))?",
+    r"[-–]\s*Manning(?:\s+Publications?)?\s*(?:\(\d{4}\))?",
+    r"[-–]\s*Springer(?:\s+International)?\s*(?:\(\d{4}\))?",
+    r"[-–]\s*(?:Prentice\s+Hall|Wiley|McGraw.Hill|Cambridge|Oxford|Harvard)\s*(?:\(\d{4}\))?",
+    r"[-–]\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Press|Publishing|Publications|Books)\s*(?:\(\d{4}\))?",
 ]
 
-# Year extraction pattern
-YEAR_PATTERN = re.compile(r"\((\d{4})(?:[,_/]\s*[^)]+)?\)")
-# Author - Title pattern (common in libgen downloads)
-AUTHOR_TITLE_PATTERN = re.compile(
-    r"^([A-Z][a-zA-Z\s.,]+?)\s*-\s*(.+)$"
+PUBLISHER_NAMES = re.compile(
+    r"(O'Reilly Media|Packt Publishing|Manning Publications?|Manning|"
+    r"Springer|Prentice Hall|Wiley|McGraw.Hill|Cambridge University Press|"
+    r"Oxford University Press|Harvard University Press|Grove Press|"
+    r"Penguin Books?|Random House|Free Press|Columbia University Press|"
+    r"Oneworld (?:Publications?|Academic)|FT Publishing|Independently Published|"
+    r"Equilibra Press|The Book Foundation|Bayt Al-Hikma Press|"
+    r"Turath Publishing|Rigel Publishing|University of Chicago Press|"
+    r"Farrar,?\s*Straus.*?Giroux|Citadel Press|American Trust Publications|"
+    r"No Starch Press|Apress|Addison.Wesley|MIT Press|Routledge|"
+    r"Hurst|Brill|For Dummies)",
+    re.IGNORECASE,
 )
-# Author, First - Title pattern
-AUTHOR_COMMA_PATTERN = re.compile(
-    r"^([A-Z][a-zA-Z]+),\s*([A-Z][a-zA-Z\s.]+?)\s*-\s*(.+)$"
-)
+
+YEAR_PATTERN = re.compile(r"\((\d{4})(?:[,_/]\s*[^)]*)?\)")
+YEAR_BARE = re.compile(r"(?<!\d)(1[89]\d{2}|20[0-3]\d)(?!\d)")
+
+# A split candidate must have real whitespace around the dash.
+_SPACED_DASH = re.compile(r"\s+[-–—]\s+")
+
+_SMALL_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of",
+    "with", "by", "from", "vs", "vs.", "as", "is", "its",
+}
 
 
 def extract_year_from_filename(filename: str) -> int | None:
-    """Extract publication year from filename."""
-    matches = YEAR_PATTERN.findall(filename)
-    for year_str in matches:
-        year = int(year_str) if isinstance(year_str, str) else int(year_str)
+    """Extract a publication year, preferring one inside parentheses."""
+    for year_str in YEAR_PATTERN.findall(filename):
+        year = int(year_str)
         if 1800 <= year <= 2030:
+            return year
+    for year_str in YEAR_BARE.findall(filename):
+        year = int(year_str)
+        if 1900 <= year <= 2030:
             return year
     return None
 
 
-def extract_author_from_filename(filename: str) -> list[str]:
-    """Try to extract author names from filename."""
-    # Pattern: "Last, First - Title"
-    m = AUTHOR_COMMA_PATTERN.match(filename)
-    if m:
-        last, first, _ = m.groups()
-        return [f"{first.strip()} {last.strip()}"]
-
-    # Pattern: "Author Name - Title"
-    m = AUTHOR_TITLE_PATTERN.match(filename)
-    if m:
-        author_part = m.group(1).strip()
-        # Validate: author names shouldn't be too long or contain certain words
-        if len(author_part.split()) <= 5 and not any(
-            w in author_part.lower()
-            for w in ["the", "how", "what", "why", "introduction", "guide",
-                       "handbook", "learning", "programming", "building"]
-        ):
-            return [author_part]
-    return []
-
-
 def extract_publisher_from_filename(filename: str) -> str:
-    """Try to extract publisher from filename."""
-    # Common publisher patterns in parentheses
-    pub_pattern = re.compile(
-        r"[-_]\s*(O'Reilly Media|Packt Publishing|Manning Publications?|"
-        r"Springer|Prentice Hall|Wiley|McGraw.Hill|Cambridge University Press|"
-        r"Oxford University Press|Harvard University Press|Grove Press|"
-        r"Penguin Books?|Random House|Free Press|Columbia University Press|"
-        r"Oneworld Publications?|FT Publishing|Independently Published|"
-        r"Equilibra Press|The Book Foundation|Bayt Al-Hikma Press|"
-        r"Turath Publishing|Rigel Publishing|University of Chicago Press|"
-        r"Farrar,?\s*Straus.*?Giroux|Citadel Press|American Trust Publications|"
-        r"Hurst|Brill|For Dummies)",
-        re.IGNORECASE,
-    )
-    m = pub_pattern.search(filename)
+    m = PUBLISHER_NAMES.search(filename)
     return m.group(1).strip() if m else ""
 
 
-def clean_title(filename: str) -> str:
+def _strip_identifiers(name: str) -> str:
+    """Remove ISBNs and archive identifiers already captured elsewhere."""
+    isbn13, isbn10 = isbns_from_filename(name)
+    for isbn in (isbn13, isbn10):
+        if not isbn:
+            continue
+        # Remove both the plain and the hyphenated rendering.
+        name = re.sub(r"(?<!\d)" + r"[\-–\s]?".join(isbn) + r"(?!\d)", " ", name)
+    for sid in find_source_ids(name):
+        value = sid.split(":", 1)[1]
+        name = name.replace(value, " ")
+    return name
+
+
+def _normalise_separators(name: str) -> str:
     """
-    Clean a book filename into a human-readable title.
+    Underscores become spaces (`_ ` is libgen's colon), and hyphens become
+    spaces when they are clearly acting as word separators.
 
-    Steps:
-    1. Remove file extension
-    2. Strip source-site prefixes/suffixes
-    3. Remove publisher and year info (captured separately)
-    4. Separate author from title if present
-    5. Clean up whitespace and special chars
+    The test is positional, not global: a filename with a spaced dash uses the
+    dash as an author/title separator and its remaining hyphens are real
+    (`Al-Ghazali`), so those are left alone.
     """
-    # Remove extension
-    name = re.sub(r"\.\w{2,5}$", "", filename)
-
-    # Apply strip patterns
-    for pattern in STRIP_PATTERNS:
-        name = re.sub(pattern, "", name, flags=re.IGNORECASE)
-
-    # Remove publisher patterns
-    for pattern in PUBLISHER_PATTERNS:
-        name = re.sub(pattern, "", name, flags=re.IGNORECASE)
-
-    # Remove year+publisher combos like "(2019, Equilibra Press)"
-    name = re.sub(r"\(\d{4},?\s*[^)]*\)", "", name)
-    # Remove standalone years in parens like "(2022)"
-    name = re.sub(r"\(\d{4}\)", "", name)
-
-    # Try to separate author from title
-    m = AUTHOR_COMMA_PATTERN.match(name)
-    if m:
-        _, _, title = m.groups()
-        name = title
-    else:
-        m = AUTHOR_TITLE_PATTERN.match(name)
-        if m:
-            author_part = m.group(1).strip()
-            title_part = m.group(2).strip()
-            # Only treat as author-title if author looks like a name
-            if len(author_part.split()) <= 5 and not any(
-                w in author_part.lower()
-                for w in ["the", "how", "what", "why", "introduction", "guide",
-                           "handbook", "learning", "building", "data", "machine"]
-            ):
-                name = title_part
-
-    # Clean up underscores, hyphens used as spaces
+    name = re.sub(r"_\s+", ": ", name)
     name = name.replace("_", " ")
-    # Replace multiple hyphens with single
-    name = re.sub(r"\s*-\s*-\s*", " - ", name)
+    name = re.sub(r"\s{2,}", " ", name).strip()
 
-    # Remove leading/trailing hyphens and whitespace
-    name = name.strip(" -_.,;:")
+    if _SPACED_DASH.search(name):
+        return name
+    hyphens = name.count("-")
+    spaces = name.count(" ")
+    if (hyphens >= 2 and hyphens >= spaces) or (hyphens >= 1 and spaces == 0):
+        name = name.replace("-", " ")
+    return re.sub(r"\s{2,}", " ", name).strip()
 
-    # Collapse multiple spaces
+
+def _clean_markers(name: str) -> str:
+    previous = None
+    while previous != name:
+        previous = name
+        for pattern in STRIP_PATTERNS:
+            name = re.sub(pattern, " ", name, flags=re.IGNORECASE).strip()
+    return name
+
+
+def _remove_metadata_parens(name: str) -> str:
+    # Anything parenthesised that opens with a year: "(2019, Equilibra Press)",
+    # "(2014_2012, Columbia University Press)", "(2022)".
+    name = re.sub(r"\(\s*\d{4}[^)]*\)", " ", name)
+    # Trailing publisher parentheticals: "(Oneworld Academic)", "(Manning)".
+    name = re.sub(
+        r"\([^)]*\b(?:Press|Publishing|Publications?|Publishers?|Books?|Media|"
+        r"Academic|University|Ltd|Inc|GmbH)\b[^)]*\)",
+        " ", name, flags=re.IGNORECASE,
+    )
+    name = re.sub(r"\(\s*\)", " ", name)
+    for pattern in PUBLISHER_PATTERNS:
+        name = re.sub(pattern, " ", name, flags=re.IGNORECASE)
+    return name
+
+
+def split_author_title(name: str) -> tuple[str, list[str]]:
+    """
+    Split "Author - Title" or "Title - Author" using the person predicate.
+
+    Returns (title, authors). When neither side looks like a person the whole
+    string is the title — the old code guessed, and guessed wrong often.
+    """
+    parts = [p.strip() for p in _SPACED_DASH.split(name) if p.strip()]
+    if len(parts) < 2:
+        return name.strip(), []
+
+    left, right = parts[0], _SPACED_DASH.split(name, maxsplit=1)[1].strip()
+    left_is_person = is_person_name(left)
+    right_is_person = is_person_name(right)
+
+    if left_is_person and not right_is_person:
+        return right, [normalize_author(left)]
+    if right_is_person and not left_is_person:
+        return left, [normalize_author(right)]
+    if left_is_person and right_is_person:
+        # Ambiguous: the shorter side is the author, the longer the title.
+        if len(left) <= len(right):
+            return right, [normalize_author(left)]
+        return left, [normalize_author(right)]
+    return name.strip(), []
+
+
+def tidy_title(name: str) -> str:
+    name = re.sub(r"\s*[-–—]\s*[-–—]\s*", " - ", name)
+    name = name.strip(" -–—_.,;:")
     name = re.sub(r"\s+", " ", name)
-
-    # Remove trailing " - " fragments
-    name = re.sub(r"\s*-\s*$", "", name)
-
-    # Title case if all lowercase or all uppercase
+    name = re.sub(r"\s+([:,;])", r"\1", name)
+    if not name:
+        return ""
     if name == name.lower() or name == name.upper():
-        # Smart title case - keep small words lowercase except at start
         words = name.split()
-        small_words = {"a", "an", "the", "and", "or", "but", "in", "on", "at",
-                        "to", "for", "of", "with", "by", "from", "vs", "vs."}
-        result = []
+        out = []
         for i, word in enumerate(words):
-            if i == 0 or word.lower() not in small_words:
-                result.append(word.capitalize())
+            if i == 0 or word.lower() not in _SMALL_WORDS:
+                out.append(word[:1].upper() + word[1:].lower() if word.isupper() else word.capitalize())
             else:
-                result.append(word.lower())
-        name = " ".join(result)
-
+                out.append(word.lower())
+        name = " ".join(out)
     return name.strip()
+
+
+def clean_title(filename: str) -> str:
+    """Clean a book filename into a human-readable title."""
+    return parse_filename(filename)["title"]
 
 
 def parse_filename(filename: str) -> dict:
     """
-    Parse a book filename and extract all available metadata.
+    Parse a book filename into every piece of metadata it carries.
 
-    Returns dict with: title, authors, publisher, publication_year
+    Returns: title, authors, publisher, publication_year, isbn_13, isbn_10,
+    source_ids.
     """
-    result = {
-        "title": clean_title(filename),
-        "authors": extract_author_from_filename(
-            re.sub(r"\.\w{2,5}$", "", filename)
-        ),
-        "publisher": extract_publisher_from_filename(filename),
-        "publication_year": extract_year_from_filename(filename),
-    }
+    stem = re.sub(r"\.\w{2,5}$", "", filename or "")
 
+    isbn13, isbn10 = isbns_from_filename(stem)
+    source_ids = find_source_ids(stem)
+    year = extract_year_from_filename(stem)
+    publisher = extract_publisher_from_filename(stem)
+
+    name = _strip_identifiers(stem)
+    name = _clean_markers(name)
+    name = _remove_metadata_parens(name)
+    name = _normalise_separators(name)
+    name = _clean_markers(name)
+
+    title, authors = split_author_title(name)
+    title = tidy_title(title)
+
+    # A title with no letters at all (bare digits, punctuation) says nothing.
+    if title and not re.search(r"[^\W\d_]", title, re.UNICODE):
+        title = ""
+
+    result = {
+        "title": title,
+        "authors": [a for a in authors if a],
+        "publisher": publisher,
+        "publication_year": year,
+        "isbn_13": normalize_isbn(isbn13) if isbn13 else "",
+        "isbn_10": normalize_isbn(isbn10) if isbn10 else "",
+        "source_ids": source_ids,
+    }
     logger.debug(f"Parsed '{filename}' -> {result}")
     return result
+
+
+def extract_author_from_filename(filename: str) -> list[str]:
+    """Legacy helper retained for callers outside the pipeline."""
+    return parse_filename(filename)["authors"]

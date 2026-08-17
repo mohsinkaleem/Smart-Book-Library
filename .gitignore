@@ -54,3 +54,5 @@ Thumbs.db
 *.swp
 /data
 *.png
+# Local secrets
+.env

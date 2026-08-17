@@ -9,6 +9,7 @@ import { BookPage } from './pages/BookPage';
 import { ReadingPage } from './pages/ReadingPage';
 import { StatsPage } from './pages/StatsPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { ReviewPage } from './pages/ReviewPage';
 import { KeyboardShortcutsDialog } from './components/common/KeyboardShortcutsDialog';
 import { EpubReader, PdfReader } from './components/reading/BookReader';
 import { useLocalStorage } from './hooks/useLocalStorage';
@@ -125,6 +126,7 @@ function AppShell() {
           <Route path="/reader/epub/:id" element={<main className="flex-1 overflow-hidden"><EpubReader /></main>} />
           <Route path="/reader/pdf/:id" element={<main className="flex-1 overflow-hidden"><PdfReader /></main>} />
           <Route path="/stats" element={<main className="flex-1 overflow-y-auto"><StatsPage /></main>} />
+          <Route path="/review" element={<main className="flex-1 overflow-y-auto"><ReviewPage /></main>} />
           <Route path="/settings" element={<main className="flex-1 overflow-y-auto"><SettingsPage /></main>} />
         </Routes>
       </div>
