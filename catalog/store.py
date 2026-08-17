@@ -12,7 +12,6 @@ pipeline run — or a full rebuild — cannot destroy them.
 """
 import json
 import logging
-import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .config import CATALOG_DB_FILE, CATALOG_FILE, PROCESSING_LOG_FILE, SCHEMA_VERSION
+from .fts import fts_query as _fts_query
 from .models import BookRecord
 from .schema import BOOK_COLUMNS, PIPELINE_COLUMNS, USER_COLUMNS, ensure_schema
 
@@ -48,18 +48,6 @@ def _load(value, default):
     except (json.JSONDecodeError, TypeError):
         return default
     return parsed if isinstance(parsed, type(default)) else default
-
-
-def _fts_query(query: str) -> str:
-    """
-    Turn user input into a safe FTS5 MATCH expression.
-
-    Every token is quoted, so `AND`, `*`, `"` and column filters like `title:`
-    are treated as literal text rather than as operators the user did not mean
-    to type (and cannot use to probe the index).
-    """
-    tokens = re.findall(r"\w+", (query or ""), re.UNICODE)
-    return " ".join(f'"{t}"' for t in tokens)
 
 
 class CatalogStore:
@@ -145,6 +133,7 @@ class CatalogStore:
         return {
             "reading_status": row["reading_status"] or "not_started",
             "progress_percent": row["progress_percent"] or 0.0,
+            "reader_position": row["reader_position"] or "",
             "user_rating": row["user_rating"],
             "user_tags": row["user_tags"] or "[]",
             "favorite": 1 if row["favorite"] else 0,

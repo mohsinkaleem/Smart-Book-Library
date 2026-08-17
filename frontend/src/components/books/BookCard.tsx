@@ -5,6 +5,8 @@ import type { Book } from '../../api/types';
 import { BookCover } from './BookCover';
 import { Rating } from '../common/Rating';
 import { Badge } from '../common/Badge';
+import { ProgressBar } from '../common/ProgressBar';
+import { SnippetText } from '../search/SnippetText';
 
 interface BookCardProps {
   book: Book;
@@ -19,11 +21,12 @@ const statusDot: Record<string, string> = {
 };
 
 export function BookCard({ book, onFavorite }: BookCardProps) {
+  // The favourite button used to be nested inside the `<Link>`, kept working
+  // by `preventDefault`. That is invalid HTML and confusing for keyboard and
+  // screen-reader users, so the link now covers the card via an overlay and
+  // the button is a real sibling above it.
   return (
-    <Link
-      to={`/books/${book.id}`}
-      className="group relative flex flex-col overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200/60 transition-all duration-200 hover:shadow-lg hover:ring-slate-300 dark:bg-slate-800 dark:ring-slate-700 dark:hover:ring-slate-600"
-    >
+    <article className="group relative flex flex-col overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200/60 transition-all duration-200 hover:shadow-lg hover:ring-slate-300 dark:bg-slate-800 dark:ring-slate-700 dark:hover:ring-slate-600">
       {/* Cover */}
       <div className="relative aspect-[3/4] w-full">
         <BookCover coverUrl={book.cover_url} title={book.title} fileType={book.file_type} className="h-full w-full" />
@@ -33,30 +36,43 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
         </span>
         {/* Status dot */}
         <span className={clsx('absolute left-1.5 top-1.5 h-2.5 w-2.5 rounded-full ring-2 ring-white dark:ring-slate-800', statusDot[book.reading_status])} />
-        {/* Favorite */}
-        <button
-          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onFavorite?.(book.id, !book.favorite); }}
-          className={clsx(
-            'absolute right-1.5 bottom-1.5 rounded-full p-1 opacity-0 transition-all group-hover:opacity-100',
-            book.favorite ? 'bg-red-500 text-white opacity-100' : 'bg-black/40 text-white hover:bg-red-500',
-          )}
-        >
-          <Heart size={14} className={book.favorite ? 'fill-current' : ''} />
-        </button>
+        {/* How far in. Nothing wrote `progress_percent` before the readers did. */}
+        {book.progress_percent > 0 && book.reading_status !== 'finished' && (
+          <ProgressBar percent={book.progress_percent} className="absolute inset-x-0 bottom-0 rounded-none" />
+        )}
       </div>
       {/* Info */}
       <div className="flex flex-1 flex-col gap-1 p-3">
         <h3 className="line-clamp-2 text-sm font-semibold leading-tight text-slate-900 dark:text-white">
-          {book.title || 'Untitled'}
+          <Link to={`/books/${book.id}`} className="after:absolute after:inset-0 after:content-['']">
+            {book.title || 'Untitled'}
+          </Link>
         </h3>
         <p className="line-clamp-1 text-xs text-slate-500 dark:text-slate-400">
           {book.author_primary || book.authors?.[0] || 'Unknown'}
         </p>
+        {book.snippet && <SnippetText snippet={book.snippet} />}
         <div className="mt-auto flex items-center justify-between pt-1">
           {book.categories?.[0] && <Badge label={book.categories[0]} className="text-[10px]" />}
           <Rating value={book.user_rating} size={12} readonly />
         </div>
       </div>
-    </Link>
+
+      {/* Favourite — above the link overlay, so it stays clickable */}
+      <button
+        onClick={() => onFavorite?.(book.id, !book.favorite)}
+        aria-label={book.favorite ? `Remove ${book.title} from favourites` : `Add ${book.title} to favourites`}
+        aria-pressed={book.favorite}
+        className={clsx(
+          'absolute right-1.5 z-10 rounded-full p-1 transition-all',
+          'top-[calc(75%-2rem)]',
+          book.favorite
+            ? 'bg-red-500 text-white opacity-100'
+            : 'bg-black/40 text-white opacity-0 hover:bg-red-500 focus-visible:opacity-100 group-hover:opacity-100',
+        )}
+      >
+        <Heart size={14} className={book.favorite ? 'fill-current' : ''} />
+      </button>
+    </article>
   );
 }

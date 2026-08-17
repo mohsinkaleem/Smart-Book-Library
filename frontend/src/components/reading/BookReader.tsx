@@ -18,13 +18,21 @@ import {
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
+import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { useBook } from '../../api/books';
 import { useReaderKeyboard } from '../../hooks/useReaderKeyboard';
+import { useReadingProgress } from '../../hooks/useReadingProgress';
 import { Spinner } from '../common/Spinner';
+import { ErrorState } from '../common/ErrorBoundary';
 import { ReaderSidebar } from './ReaderSidebar';
 
-// Configure PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+// Configure PDF.js worker.
+//
+// This used to point at `//unpkg.com/pdfjs-dist@…`, so a "local-first" app
+// silently failed to open a PDF offline or on a locked-down network — and the
+// protocol-relative URL broke under `file://` as well. Vite bundles the worker
+// from the installed package instead.
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
 /* ==========================================================================
    PDF READER
@@ -33,7 +41,7 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/b
 export function PdfReader() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { data: book, isLoading } = useBook(id || '');
+  const { data: book, isLoading, isError, error, refetch } = useBook(id || '');
 
   const [numPages, setNumPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState(1);
@@ -49,13 +57,34 @@ export function PdfReader() {
   const containerRef = useRef<HTMLDivElement>(null);
   const pageSlotRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const observerRef = useRef<IntersectionObserver | null>(null);
+  const restored = useRef(false);
 
   const pdfUrl = `/api/books/${id}/file`;
+  const recordProgress = useReadingProgress(book);
 
   // Sync page input when currentPage changes
   useEffect(() => {
     setPageInputValue(String(currentPage));
   }, [currentPage]);
+
+  // Report position on every page change. `numPages` guards the very first
+  // renders, where the ratio would be 1/0.
+  useEffect(() => {
+    if (!numPages || !restored.current) return;
+    recordProgress((currentPage / numPages) * 100, String(currentPage));
+  }, [currentPage, numPages, recordProgress]);
+
+  // Resume where the book was left. Runs once, after the document reports its
+  // length — the page used to reset to 1 on every open.
+  useEffect(() => {
+    if (restored.current || !numPages || !book) return;
+    restored.current = true;
+    const saved = parseInt(book.reader_position || '', 10);
+    if (Number.isFinite(saved) && saved > 1 && saved <= numPages) {
+      setCurrentPage(saved);
+      setRenderedRange([Math.max(1, saved - 2), Math.min(numPages, saved + 5)]);
+    }
+  }, [numPages, book]);
 
   // Register / unregister a page slot with the IntersectionObserver
   const registerSlot = useCallback((el: HTMLDivElement | null, pageNum: number) => {
@@ -168,9 +197,9 @@ export function PdfReader() {
     const sel = window.getSelection()?.toString().trim();
     if (sel && sel.length > 10) {
       setSelectedText(sel);
-      if (!sidebarOpen) setSidebarOpen(true);
+      setSidebarOpen(true);
     }
-  }, [sidebarOpen]);
+  }, []);
 
   const handlePageInput = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -205,6 +234,17 @@ export function PdfReader() {
       <div className="flex h-full items-center justify-center">
         <Spinner size={32} />
       </div>
+    );
+  }
+
+  // "Book not found" used to cover a failed request too.
+  if (isError) {
+    return (
+      <ErrorState
+        title="Couldn't load this book"
+        message={(error as Error)?.message}
+        onRetry={() => refetch()}
+      />
     );
   }
 
@@ -414,6 +454,11 @@ export function PdfReader() {
         <div className="flex items-center justify-between border-t border-slate-200 bg-white px-4 py-1.5 text-xs text-slate-400 dark:border-slate-700 dark:bg-slate-800">
           <span>
             Page {currentPage} of {numPages}{continuous ? ' · scroll' : ''}
+            {numPages > 0 && (
+              <span className="ml-2 tabular-nums">
+                · {Math.round((currentPage / numPages) * 100)}%
+              </span>
+            )}
           </span>
           <span className="hidden text-[10px] sm:inline">
             {continuous
@@ -445,7 +490,7 @@ export function PdfReader() {
 export function EpubReader() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { data: book, isLoading } = useBook(id || '');
+  const { data: book, isLoading, isError, error, refetch } = useBook(id || '');
 
   const [location, setLocation] = useState<string | number>(0);
   const [fullscreen, setFullscreen] = useState(false);
@@ -454,23 +499,50 @@ export function EpubReader() {
   const [showToc, setShowToc] = useState(false);
   const [fontSize, setFontSize] = useState(100);
   const [continuous, setContinuous] = useState(false);
+  const [percent, setPercent] = useState(0);
+
+  const recordProgress = useReadingProgress(book);
+  const recordRef = useRef(recordProgress);
+  recordRef.current = recordProgress;
+  // The reader reports its opening position immediately, which would
+  // overwrite the saved CFI with the cover before we ever restore it.
+  const restored = useRef(false);
+
+  // Resume where the book was left. The EPUB location was component state and
+  // nothing persisted it, so every open started at the cover.
+  useEffect(() => {
+    if (restored.current || !book) return;
+    restored.current = true;
+    if (book.reader_position) setLocation(book.reader_position);
+  }, [book]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [ReaderComponent, setReaderComponent] = useState<React.ComponentType<any> | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const renditionRef = useRef<any>(null);
+  // `getRendition` is handed to the reader once and captures whatever the
+  // render it was created in saw. Read the live values through a ref instead,
+  // or the rendition applies a frozen 100% font size and tests a frozen
+  // `sidebarOpen`.
+  const fontSizeRef = useRef(fontSize);
+  fontSizeRef.current = fontSize;
 
-  // Dynamically import react-reader
-  useState(() => {
+  // Dynamically import react-reader.
+  //
+  // This was a `useState(() => …)` initialiser, which StrictMode runs twice —
+  // so the module was imported twice on every mount.
+  useEffect(() => {
+    let cancelled = false;
     import('react-reader')
       .then((mod) => {
-        setReaderComponent(() => mod.ReactReader);
+        if (!cancelled) setReaderComponent(() => mod.ReactReader);
       })
       .catch(() => {
-        setLoadError('Failed to load EPUB reader library');
+        if (!cancelled) setLoadError('Failed to load EPUB reader library');
       });
-  });
+    return () => { cancelled = true; };
+  }, []);
 
   const flipNext = useCallback(() => {
     renditionRef.current?.next();
@@ -506,9 +578,86 @@ export function EpubReader() {
     const sel = window.getSelection()?.toString().trim();
     if (sel && sel.length > 10) {
       setSelectedText(sel);
-      if (!sidebarOpen) setSidebarOpen(true);
+      setSidebarOpen(true);
     }
-  }, [sidebarOpen]);
+  }, []);
+
+  interface EpubContents {
+    window?: Window;
+  }
+
+  /** The shape of epub.js's `relocated` payload that we actually read. */
+  interface EpubLocation {
+    start?: { cfi?: string; index?: number; percentage?: number };
+  }
+
+  interface Rendition {
+    themes: {
+      default: (styles: Record<string, Record<string, string>>) => void;
+      fontSize: (size: string) => void;
+    };
+    on: (event: string, cb: (...args: unknown[]) => void) => void;
+    book?: { spine?: { length?: number } };
+  }
+
+  const handleRendition = useCallback((rendition: Rendition) => {
+    renditionRef.current = rendition;
+    rendition.themes.default({
+      body: {
+        'font-family': 'Georgia, serif !important',
+        'line-height': '1.8 !important',
+      },
+      p: {
+        'margin-bottom': '0.8em !important',
+      },
+      '::selection': {
+        'background-color': '#c7d2fe !important',
+      },
+    });
+    // Whatever the user had set before this rendition was created — not the
+    // initial 100% this callback used to close over.
+    rendition.themes.fontSize(`${fontSizeRef.current}%`);
+
+    // Listen for text selection inside the epub iframe.
+    //
+    // The selection lives in the iframe's own window, so the parent
+    // `window.getSelection()` this used to call was always empty — which is
+    // why selecting text in an EPUB never opened the analysis sidebar. epub.js
+    // hands us the `contents` for the section the selection happened in.
+    rendition.on('selected', (...args: unknown[]) => {
+      const contents = args[1] as EpubContents | undefined;
+      const sel = (contents?.window ?? window).getSelection()?.toString().trim();
+      if (sel && sel.length > 10) {
+        setSelectedText(sel);
+        setSidebarOpen(true);
+      }
+    });
+
+    // Position and progress on every relocation.
+    //
+    // `start.percentage` is only meaningful once epub.js has generated its
+    // locations index, which is a full pass over the book and too slow to do
+    // on open. The spine ratio — which chapter of how many — is available
+    // immediately and close enough for a progress bar; the exact percentage
+    // takes over if and when epub.js fills it in.
+    rendition.on('relocated', (...args: unknown[]) => {
+      const loc = args[0] as EpubLocation | undefined;
+      const cfi = loc?.start?.cfi;
+      if (!cfi) return;
+
+      const exact = loc?.start?.percentage ?? 0;
+      const spineLength = rendition.book?.spine?.length ?? 0;
+      const index = loc?.start?.index ?? 0;
+      const pct = exact > 0
+        ? exact * 100
+        : spineLength > 0
+          ? ((index + 1) / spineLength) * 100
+          : 0;
+
+      setPercent(pct);
+      recordRef.current(pct, cfi);
+    });
+  }, []);
 
   // 'C' key — toggle continuous scroll mode for EPUB
   useEffect(() => {
@@ -541,24 +690,51 @@ export function EpubReader() {
     disabled: false,
   });
 
-  // Listen for text selection inside epub iframe
+  // Belt-and-braces selection listener on the rendered iframe.
+  //
+  // This used to poll for `.ReactReader iframe` — a selector react-reader
+  // never renders (the iframe sits inside `.epub-view`), so the interval span
+  // the lifetime of the component without ever matching, and the listener was
+  // never attached.
   useEffect(() => {
+    let detach: (() => void) | undefined;
     const interval = setInterval(() => {
-      const iframe = document.querySelector('.ReactReader iframe') as HTMLIFrameElement | null;
-      if (iframe?.contentDocument) {
-        iframe.contentDocument.removeEventListener('mouseup', handleTextSelection);
-        iframe.contentDocument.addEventListener('mouseup', handleTextSelection);
-        clearInterval(interval);
-      }
+      const iframe = document.querySelector('.epub-view iframe') as HTMLIFrameElement | null;
+      const doc = iframe?.contentDocument;
+      if (!doc) return;
+      const onMouseUp = () => {
+        const sel = (iframe.contentWindow ?? window).getSelection()?.toString().trim();
+        if (sel && sel.length > 10) {
+          setSelectedText(sel);
+          setSidebarOpen(true);
+        }
+      };
+      doc.addEventListener('mouseup', onMouseUp);
+      detach = () => doc.removeEventListener('mouseup', onMouseUp);
+      clearInterval(interval);
     }, 500);
-    return () => clearInterval(interval);
-  }, [handleTextSelection]);
+    return () => {
+      clearInterval(interval);
+      detach?.();
+    };
+  }, [continuous, ReaderComponent]);
 
   if (isLoading) {
     return (
       <div className="flex h-full items-center justify-center">
         <Spinner size={32} />
       </div>
+    );
+  }
+
+  // "Book not found" used to cover a failed request too.
+  if (isError) {
+    return (
+      <ErrorState
+        title="Couldn't load this book"
+        message={(error as Error)?.message}
+        onRetry={() => refetch()}
+      />
     );
   }
 
@@ -586,7 +762,9 @@ export function EpubReader() {
     );
   }
 
-  const epubUrl = `/api/books/${id}/file`;
+  // The `.epub` extension is load-bearing: epub.js reads it to decide between
+  // opening an archive and crawling an unpacked directory.
+  const epubUrl = `/api/books/${id}/file.epub`;
 
   return (
     <div
@@ -710,38 +888,7 @@ export function EpubReader() {
                 flow: continuous ? 'scrolled-doc' : 'paginated',
                 manager: continuous ? 'continuous' : 'default',
               }}
-              getRendition={(rendition: {
-                themes: {
-                  default: (styles: Record<string, Record<string, string>>) => void;
-                  fontSize: (size: string) => void;
-                };
-                on: (event: string, cb: (...args: unknown[]) => void) => void;
-              }) => {
-                renditionRef.current = rendition;
-                rendition.themes.default({
-                  body: {
-                    'font-family': 'Georgia, serif !important',
-                    'line-height': '1.8 !important',
-                  },
-                  p: {
-                    'margin-bottom': '0.8em !important',
-                  },
-                  '::selection': {
-                    'background-color': '#c7d2fe !important',
-                  },
-                });
-                rendition.themes.fontSize(`${fontSize}%`);
-
-                // Listen for text selection inside the epub iframe
-                rendition.on('selected', (cfiRange: unknown, _contents: unknown) => {
-                  void cfiRange;
-                  const sel = window.getSelection()?.toString().trim();
-                  if (sel && sel.length > 10) {
-                    setSelectedText(sel);
-                    if (!sidebarOpen) setSidebarOpen(true);
-                  }
-                });
-              }}
+              getRendition={handleRendition}
             />
           ) : (
             <div className="flex h-full items-center justify-center">
@@ -753,7 +900,10 @@ export function EpubReader() {
 
         {/* Bottom bar */}
         <div className="flex items-center justify-between border-t border-slate-200 bg-white px-4 py-1.5 text-xs text-slate-400 dark:border-slate-700 dark:bg-slate-800">
-          <span>EPUB{continuous ? ' · scroll' : ''}</span>
+          <span>
+            EPUB{continuous ? ' · scroll' : ''}
+            {percent > 0 && <span className="ml-2 tabular-nums">· {Math.round(percent)}%</span>}
+          </span>
           <span className="hidden text-[10px] sm:inline">
             {continuous
               ? '+/- Font &nbsp;·&nbsp; C toggle mode'

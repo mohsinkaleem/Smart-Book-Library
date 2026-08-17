@@ -1,20 +1,23 @@
-import { useState, useCallback, useEffect } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Header } from './components/layout/Header';
 import { Sidebar } from './components/layout/Sidebar';
 import { SearchBar } from './components/search/SearchBar';
 import { HomePage } from './pages/HomePage';
 import { BookPage } from './pages/BookPage';
-import { ReadingPage } from './pages/ReadingPage';
-import { StatsPage } from './pages/StatsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { ReviewPage } from './pages/ReviewPage';
+import { Dashboard } from './components/stats/Dashboard';
+import { ReadingView } from './components/reading/ReadingView';
 import { KeyboardShortcutsDialog } from './components/common/KeyboardShortcutsDialog';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { EpubReader, PdfReader } from './components/reading/BookReader';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useScrollToTop } from './hooks/useScrollToTop';
+import { cycleTheme } from './hooks/useTheme';
+import { useLibraryParams } from './hooks/useLibraryParams';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -35,40 +38,45 @@ export default function App() {
   );
 }
 
+/** Each route body gets its own boundary, so one bad page is not a blank app. */
+function Page({ className, children }: { className: string; children: React.ReactNode }) {
+  return (
+    <main className={className}>
+      <ErrorBoundary>{children}</ErrorBoundary>
+    </main>
+  );
+}
+
 function AppShell() {
   const [view, setView] = useLocalStorage<'grid' | 'list'>('bookView', 'grid');
   const [sidebarOpen, setSidebarOpen] = useLocalStorage('sidebarOpen', true);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchMode, setSearchMode] = useState('text');
-  const [filters, setFilters] = useState<Record<string, string>>({});
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [pageCount, setPageCount] = useState(1);
+  const location = useLocation();
 
-  const handleFilterChange = useCallback((key: string, value: string) => {
-    setFilters((prev) => {
-      const next = { ...prev };
-      if (value) {
-        next[key] = value;
-      } else {
-        delete next[key];
-      }
-      return next;
-    });
-  }, []);
+  const {
+    searchQuery, searchMode, page, sort, order, filters,
+    setSearchQuery, setSearchMode, setFilter, clearFilters, setPage, setSort,
+  } = useLibraryParams();
 
-  const handleClearFilters = useCallback(() => setFilters({}), []);
-
-  const toggleDark = useCallback(() => {
-    const isDark = document.documentElement.classList.contains('dark');
-    document.documentElement.classList.toggle('dark', !isDark);
-    localStorage.setItem('darkMode', JSON.stringify(!isDark));
-  }, []);
+  // The reader routes run `useReaderKeyboard` on the same window; leaving the
+  // global handler live meant Escape fired twice (history went somewhere
+  // unpredictable), `t` toggled both the library sidebar and the EPUB TOC,
+  // and `d`/`1`/`2` fired inside a reader where they mean nothing.
+  const inReader = location.pathname.startsWith('/reader/');
 
   useKeyboardShortcuts({
     onToggleView: setView,
     onToggleSidebar: () => setSidebarOpen(!sidebarOpen),
-    onToggleDark: toggleDark,
+    // `d` used to flip a boolean; it steps through the four themes now.
+    onCycleTheme: cycleTheme,
     onShowHelp: () => setShortcutsOpen(true),
+    // j/k were documented and rendered in the shortcuts dialog while calling
+    // `undefined?.()`.
+    onNextPage: () => setPage(Math.min(page + 1, pageCount)),
+    onPrevPage: () => setPage(Math.max(1, page - 1)),
     currentView: view,
+    enabled: !inReader,
   });
 
   useScrollToTop();
@@ -104,30 +112,36 @@ function AppShell() {
               <>
                 <Sidebar
                   filters={filters}
-                  onFilterChange={handleFilterChange}
-                  onClearFilters={handleClearFilters}
+                  onFilterChange={setFilter}
+                  onClearFilters={clearFilters}
                   collapsed={!sidebarOpen}
                   searchQuery={searchQuery}
                 />
-                <main className="flex-1 overflow-y-auto">
+                <Page className="flex-1 overflow-y-auto">
                   <HomePage
                     view={view}
                     searchQuery={searchQuery}
                     searchMode={searchMode}
                     filters={filters}
-                    onFilterChange={handleFilterChange}
+                    page={page}
+                    sort={sort}
+                    order={order}
+                    onFilterChange={setFilter}
+                    onPageChange={setPage}
+                    onSortChange={setSort}
+                    onPageCountChange={setPageCount}
                   />
-                </main>
+                </Page>
               </>
             }
           />
-          <Route path="/books/:id" element={<main className="flex-1 overflow-y-auto"><BookPage /></main>} />
-          <Route path="/reading/:id" element={<main className="flex-1 overflow-hidden"><ReadingPage /></main>} />
-          <Route path="/reader/epub/:id" element={<main className="flex-1 overflow-hidden"><EpubReader /></main>} />
-          <Route path="/reader/pdf/:id" element={<main className="flex-1 overflow-hidden"><PdfReader /></main>} />
-          <Route path="/stats" element={<main className="flex-1 overflow-y-auto"><StatsPage /></main>} />
-          <Route path="/review" element={<main className="flex-1 overflow-y-auto"><ReviewPage /></main>} />
-          <Route path="/settings" element={<main className="flex-1 overflow-y-auto"><SettingsPage /></main>} />
+          <Route path="/books/:id" element={<Page className="flex-1 overflow-y-auto"><BookPage /></Page>} />
+          <Route path="/reading/:id" element={<Page className="flex-1 overflow-hidden"><ReadingView /></Page>} />
+          <Route path="/reader/epub/:id" element={<Page className="flex-1 overflow-hidden"><EpubReader /></Page>} />
+          <Route path="/reader/pdf/:id" element={<Page className="flex-1 overflow-hidden"><PdfReader /></Page>} />
+          <Route path="/stats" element={<Page className="flex-1 overflow-y-auto"><Dashboard /></Page>} />
+          <Route path="/review" element={<Page className="flex-1 overflow-y-auto"><ReviewPage /></Page>} />
+          <Route path="/settings" element={<Page className="flex-1 overflow-y-auto"><SettingsPage /></Page>} />
         </Routes>
       </div>
 

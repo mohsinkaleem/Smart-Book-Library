@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from ..llm_service import analyze_text, analyze_text_stream, check_llm_available
+from ..llm_service import analyze_text_stream, llm_status
 
 router = APIRouter(prefix="/api/reading", tags=["reading"])
 
@@ -23,8 +23,15 @@ class AnalyzeRequest(BaseModel):
 
 
 @router.get("/llm-status")
-def llm_status():
-    return {"available": check_llm_available()}
+def get_llm_status():
+    """
+    Whether the Analysis buttons will work, and why not when they won't.
+
+    This endpoint existed and nothing called it: the LLM panel offered its
+    five buttons unconditionally and only failed on click, with a string in
+    the response pane. The panel gates on this now.
+    """
+    return llm_status()
 
 
 @router.get("/{book_id}/text")
@@ -42,6 +49,14 @@ def get_reading_text(book_id: str, request: Request):
 
 @router.post("/compare")
 def compare_text(body: CompareRequest, request: Request):
+    """
+    Find passages in other books that resemble the selected text.
+
+    Scored against the *content* embeddings. This used to call
+    `semantic_search`, which compares against the metadata embeddings —
+    "Title: … Authors: … Themes: …" — so a selected paragraph of prose was
+    matched on topic labels rather than on the prose itself.
+    """
     similarity = request.app.state.similarity
     if not similarity.has_embeddings:
         return {"matches": [], "message": "No embeddings available"}
@@ -50,7 +65,7 @@ def compare_text(body: CompareRequest, request: Request):
     if query_emb is None:
         return {"matches": [], "message": "Failed to encode query"}
 
-    matches = similarity.semantic_search(query_emb, limit=body.limit + 1)
+    matches = similarity.passage_search(query_emb, limit=body.limit + 1)
     db = request.app.state.db
     results = []
     for book_id, score in matches:

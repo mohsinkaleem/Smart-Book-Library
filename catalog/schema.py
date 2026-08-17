@@ -67,6 +67,9 @@ BOOK_COLUMNS: list[tuple[str, str]] = [
     ("last_opened", "TEXT"),
     ("reading_status", "TEXT DEFAULT 'not_started'"),
     ("progress_percent", "REAL DEFAULT 0"),
+    # Where the reader was left: an EPUB CFI, or a PDF page number as a string.
+    # Opaque to the server — only the reader that wrote it interprets it.
+    ("reader_position", "TEXT DEFAULT ''"),
     ("user_rating", "REAL"),
     ("user_tags", "TEXT DEFAULT '[]'"),
     ("favorite", "INTEGER DEFAULT 0"),
@@ -76,6 +79,7 @@ USER_COLUMNS = [
     "last_opened",
     "reading_status",
     "progress_percent",
+    "reader_position",
     "user_rating",
     "user_tags",
     "favorite",
@@ -93,6 +97,20 @@ FTS_COLUMNS = [
     "keywords",
     "publisher",
     "subjects_raw",
+]
+
+# The book's own prose, indexed separately from its metadata.
+#
+# "Full-Text Search" used to mean full-text over *metadata* — the extracted
+# text was stored and never indexed. It lives in its own fts5 table rather
+# than being appended to `books_fts` because a 5 000-character excerpt next to
+# a 40-character title wrecks bm25: every long document would outrank an exact
+# title match on term frequency alone. Two tables, two rankings, blended by
+# the caller with the metadata side weighted higher.
+TEXT_FTS_COLUMNS = [
+    "text_excerpt",
+    "front_matter",
+    "content_sample",
 ]
 
 _INDEXES = [
@@ -116,6 +134,7 @@ CREATE TABLE IF NOT EXISTS user_data (
     file_path        TEXT,
     reading_status   TEXT DEFAULT 'not_started',
     progress_percent REAL DEFAULT 0,
+    reader_position  TEXT DEFAULT '',
     user_rating      REAL,
     user_tags        TEXT DEFAULT '[]',
     favorite         INTEGER DEFAULT 0,
@@ -126,6 +145,13 @@ CREATE TABLE IF NOT EXISTS user_data (
 CREATE INDEX IF NOT EXISTS idx_user_data_path ON user_data(file_path);
 """
 
+# Columns added to `user_data` after it first shipped. `CREATE TABLE IF NOT
+# EXISTS` is a no-op on an existing table, so a new column in the DDL above
+# reaches an existing database only through this list.
+USER_DATA_ADDED_COLUMNS = [
+    ("reader_position", "TEXT DEFAULT ''"),
+]
+
 EMBEDDINGS_SQL = """
 CREATE TABLE IF NOT EXISTS embeddings (
     book_id            TEXT PRIMARY KEY,
@@ -135,36 +161,43 @@ CREATE TABLE IF NOT EXISTS embeddings (
 """
 
 
-def _fts_ddl() -> str:
-    cols = ",\n    ".join(FTS_COLUMNS)
-    insert_cols = ", ".join(FTS_COLUMNS)
-    new_vals = ", ".join(f"new.{c}" for c in FTS_COLUMNS)
-    old_vals = ", ".join(f"old.{c}" for c in FTS_COLUMNS)
+def _fts_ddl(table: str, columns: list[str], trigger_prefix: str) -> str:
+    """
+    DDL for one external-content fts5 index over `books`, plus its triggers.
+
+    Both indexes share `content='books'`, so neither stores a second copy of
+    the text — `book_text_fts` would otherwise duplicate ~6 MB of extracted
+    prose that already sits in the `books` row.
+    """
+    cols = ",\n    ".join(columns)
+    insert_cols = ", ".join(columns)
+    new_vals = ", ".join(f"new.{c}" for c in columns)
+    old_vals = ", ".join(f"old.{c}" for c in columns)
     return f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING fts5(
     {cols},
     content='books',
     content_rowid='rowid',
     tokenize='porter unicode61'
 );
 
-DROP TRIGGER IF EXISTS books_ai;
-DROP TRIGGER IF EXISTS books_ad;
-DROP TRIGGER IF EXISTS books_au;
+DROP TRIGGER IF EXISTS {trigger_prefix}_ai;
+DROP TRIGGER IF EXISTS {trigger_prefix}_ad;
+DROP TRIGGER IF EXISTS {trigger_prefix}_au;
 
-CREATE TRIGGER books_ai AFTER INSERT ON books BEGIN
-    INSERT INTO books_fts(rowid, {insert_cols}) VALUES (new.rowid, {new_vals});
+CREATE TRIGGER {trigger_prefix}_ai AFTER INSERT ON books BEGIN
+    INSERT INTO {table}(rowid, {insert_cols}) VALUES (new.rowid, {new_vals});
 END;
 
-CREATE TRIGGER books_ad AFTER DELETE ON books BEGIN
-    INSERT INTO books_fts(books_fts, rowid, {insert_cols})
+CREATE TRIGGER {trigger_prefix}_ad AFTER DELETE ON books BEGIN
+    INSERT INTO {table}({table}, rowid, {insert_cols})
     VALUES ('delete', old.rowid, {old_vals});
 END;
 
-CREATE TRIGGER books_au AFTER UPDATE ON books BEGIN
-    INSERT INTO books_fts(books_fts, rowid, {insert_cols})
+CREATE TRIGGER {trigger_prefix}_au AFTER UPDATE ON books BEGIN
+    INSERT INTO {table}({table}, rowid, {insert_cols})
     VALUES ('delete', old.rowid, {old_vals});
-    INSERT INTO books_fts(rowid, {insert_cols}) VALUES (new.rowid, {new_vals});
+    INSERT INTO {table}(rowid, {insert_cols}) VALUES (new.rowid, {new_vals});
 END;
 """
 
@@ -179,6 +212,21 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?", (name,)
     ).fetchone()
     return row is not None
+
+
+def _needs_rebuild(conn: sqlite3.Connection, table: str, columns: list[str]) -> bool:
+    """
+    True when `table` must be (re)built.
+
+    fts5 has no ALTER, so a change to the indexed column set means dropping
+    the index and repopulating it from `books`.
+    """
+    if not _table_exists(conn, table):
+        return True
+    if _existing_columns(conn, table) != columns:
+        conn.execute(f"DROP TABLE {table}")
+        return True
+    return False
 
 
 def ensure_schema(conn: sqlite3.Connection):
@@ -203,23 +251,25 @@ def ensure_schema(conn: sqlite3.Connection):
     for idx_name, target in _INDEXES:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {target}")
 
-    # FTS: recreate when the indexed column set changed (adding a column to an
-    # existing fts5 table is not possible).
-    rebuild_fts = False
-    if _table_exists(conn, "books_fts"):
-        if _existing_columns(conn, "books_fts") != FTS_COLUMNS:
-            conn.execute("DROP TABLE books_fts")
-            rebuild_fts = True
-    else:
-        rebuild_fts = True
+    rebuild_meta = _needs_rebuild(conn, "books_fts", FTS_COLUMNS)
+    rebuild_text = _needs_rebuild(conn, "book_text_fts", TEXT_FTS_COLUMNS)
 
-    conn.executescript(_fts_ddl())
+    conn.executescript(_fts_ddl("books_fts", FTS_COLUMNS, "books"))
+    conn.executescript(_fts_ddl("book_text_fts", TEXT_FTS_COLUMNS, "books_text"))
     conn.executescript(USER_DATA_SQL)
     conn.executescript(EMBEDDINGS_SQL)
 
-    if rebuild_fts:
+    if _table_exists(conn, "user_data"):
+        have_user = set(_existing_columns(conn, "user_data"))
+        for name, decl in USER_DATA_ADDED_COLUMNS:
+            if name not in have_user:
+                conn.execute(f"ALTER TABLE user_data ADD COLUMN {name} {decl}")
+
+    for table, needed in (("books_fts", rebuild_meta), ("book_text_fts", rebuild_text)):
+        if not needed:
+            continue
         try:
-            conn.execute("INSERT INTO books_fts(books_fts) VALUES('rebuild')")
+            conn.execute(f"INSERT INTO {table}({table}) VALUES('rebuild')")
         except sqlite3.OperationalError:
             pass
 

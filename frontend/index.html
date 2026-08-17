@@ -5,14 +5,35 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>BookShelf — Smart Book Library</title>
+    <!--
+      Commit to a theme before first paint, or the page flashes the light
+      palette on every load. Kept in sync with src/hooks/useTheme.ts, which
+      reads the result back off the DOM rather than re-deriving it.
+    -->
     <script>
-      (function() {
-        var dm = localStorage.getItem('darkMode');
-        if (dm === 'true' || dm === '"true"') {
-          document.documentElement.classList.add('dark');
-        } else if (dm === null && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-          document.documentElement.classList.add('dark');
+      (function () {
+        var DARK = { dark: 1, dim: 1 };
+        var theme = null;
+        try {
+          var stored = localStorage.getItem('theme');
+          if (stored && ['light', 'dark', 'paper', 'dim'].indexOf(stored) !== -1) {
+            theme = stored;
+          } else {
+            // Pre-multi-theme key, written by the old boolean toggle.
+            var legacy = localStorage.getItem('darkMode');
+            if (legacy === 'true' || legacy === '"true"') theme = 'dark';
+            else if (legacy !== null) theme = 'light';
+          }
+        } catch (e) { /* private mode */ }
+
+        if (!theme) {
+          theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         }
+
+        var root = document.documentElement;
+        root.dataset.theme = theme;
+        if (DARK[theme]) root.classList.add('dark');
+        root.style.colorScheme = DARK[theme] ? 'dark' : 'light';
       })();
     </script>
   </head>

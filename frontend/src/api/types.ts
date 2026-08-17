@@ -29,6 +29,8 @@ export interface Book {
   last_opened: string | null;
   reading_status: 'not_started' | 'in_progress' | 'finished' | 'abandoned';
   progress_percent: number;
+  /** EPUB CFI or PDF page number; written and read only by the readers. */
+  reader_position: string;
   user_rating: number | null;
   user_tags: string[];
   favorite: boolean;
@@ -42,6 +44,13 @@ export interface Book {
   similarity_score?: number;
   _score?: number;
   match_type?: 'fts' | 'semantic' | 'hybrid';
+  /**
+   * Why this book matched, from `/api/search`. Matched terms are wrapped in
+   * ``…``; see `SnippetText`.
+   */
+  snippet?: string;
+  /** Which index produced the snippet. */
+  match_field?: 'text' | 'metadata';
 }
 
 export interface PaginatedResponse<T> {
@@ -77,6 +86,7 @@ export interface StatsData {
   with_cover: number;
   with_description: number;
   with_embeddings: number;
+  duplicates: number;
   avg_rating: number | null;
   categories: FacetItem[];
   themes: FacetItem[];

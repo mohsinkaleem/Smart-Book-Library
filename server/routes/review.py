@@ -35,12 +35,6 @@ def review_queue(
     return request.app.state.db.get_review_queue(page=page, per_page=per_page)
 
 
-@router.get("/fields")
-def pinnable_fields():
-    """Fields a human is allowed to correct."""
-    return {"fields": sorted(PINNABLE_FIELDS)}
-
-
 @router.post("/{book_id}/pin")
 def pin_field(book_id: str, body: PinFieldRequest, request: Request):
     """Pin a corrected value so no future run can overwrite it."""

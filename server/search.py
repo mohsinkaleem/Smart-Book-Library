@@ -1,5 +1,15 @@
 """
 Unified search engine: FTS5 + semantic + hybrid.
+
+Semantic and hybrid used to take the top 200 embedding hits, filter them in
+Python, and report `len(that list)` as `total` — so `total` was really "200 or
+fewer", and paging to page 5 recomputed every similarity and re-fetched every
+book before slicing. They also filtered through a second, hand-written copy of
+the filter predicates that had already drifted from the SQL one and silently
+ignored `tag`.
+
+Now: score the whole matrix in one matmul, intersect with the ID set SQL says
+matches the filters, and paginate over the real result.
 """
 import logging
 from typing import Optional
@@ -40,127 +50,91 @@ class SearchEngine:
             item["match_type"] = "fts"
         return result
 
+    def _page(
+        self,
+        scored: list[tuple[str, float]],
+        page: int,
+        per_page: int,
+        match_type: str,
+        snippets: Optional[dict[str, str]] = None,
+    ) -> dict:
+        """
+        Hydrate one page out of a ranked (book_id, score) list.
+
+        `snippets` carries the FTS side's `snippet()` output through, so a
+        hybrid result that matched on text still shows why. Semantic-only
+        hits have nothing to highlight and get no snippet.
+        """
+        total = len(scored)
+        start = (page - 1) * per_page
+        window = scored[start:start + per_page]
+
+        books = self.db.get_books_by_ids([bid for bid, _ in window])
+        items = []
+        for book_id, score in window:
+            book = books.get(book_id)
+            if not book:
+                continue
+            book["_score"] = score
+            book["match_type"] = match_type
+            if snippets and book_id in snippets:
+                book["snippet"] = snippets[book_id]
+                book["match_field"] = "text"
+            items.append(book)
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        }
+
     def _semantic_search(self, query: str, page: int, per_page: int, **filters) -> dict:
-        """Semantic embedding search."""
+        """Semantic embedding search over the full catalog."""
         query_embedding = self.similarity.encode_query(query)
         if query_embedding is None:
             return {"items": [], "total": 0, "page": page, "per_page": per_page, "pages": 0}
 
-        # Get all matches (we'll paginate after)
-        matches = self.similarity.semantic_search(query_embedding, limit=200)
-        if not matches:
+        allowed = self.db.filtered_ids(**filters)
+        scored = self.similarity.semantic_search(query_embedding, allowed_ids=allowed)
+        if not scored:
             return {"items": [], "total": 0, "page": page, "per_page": per_page, "pages": 0}
 
-        # Fetch and filter
-        items = []
-        for book_id, score in matches:
-            book = self.db.get_book(book_id)
-            if book and self._matches_filters(book, filters):
-                book["_score"] = score
-                book["match_type"] = "semantic"
-                items.append(book)
-
-        total = len(items)
-        start = (page - 1) * per_page
-        end = start + per_page
-        pages = max(1, (total + per_page - 1) // per_page)
-
-        return {
-            "items": items[start:end],
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-            "pages": pages,
-        }
+        return self._page(scored, page, per_page, "semantic")
 
     def _hybrid_search(self, query: str, page: int, per_page: int, **filters) -> dict:
-        """Hybrid: FTS5 + semantic, merged scores."""
-        # Get FTS results (all pages)
-        fts_result = self.db.search_fts(query, page=1, per_page=200, **filters)
-        fts_scores = {}
-        for item in fts_result["items"]:
-            fts_scores[item["id"]] = abs(item.get("_score", 0))
+        """Hybrid: FTS5 + semantic, merged on normalised scores."""
+        allowed = self.db.filtered_ids(**filters)
 
-        # Get semantic results
-        sem_items = []
+        # FTS side — one pass over the whole matching set, not just page 1.
+        fts_result = self.db.search_fts(query, page=1, per_page=10_000, **filters)
+        fts_scores = {item["id"]: abs(item.get("_score", 0)) for item in fts_result["items"]}
+        snippets = {
+            item["id"]: item["snippet"]
+            for item in fts_result["items"]
+            if item.get("snippet")
+        }
+
+        # Semantic side
+        sem_scores: dict[str, float] = {}
         query_embedding = self.similarity.encode_query(query)
-        sem_scores = {}
         if query_embedding is not None:
-            matches = self.similarity.semantic_search(query_embedding, limit=200)
-            for book_id, score in matches:
-                sem_scores[book_id] = score
+            sem_scores = dict(
+                self.similarity.semantic_search(query_embedding, allowed_ids=allowed)
+            )
 
-        # Normalize and merge
-        all_ids = set(fts_scores.keys()) | set(sem_scores.keys())
-        max_fts = max(fts_scores.values()) if fts_scores else 1.0
-        max_sem = max(sem_scores.values()) if sem_scores else 1.0
+        max_fts = max(fts_scores.values(), default=0.0)
+        max_sem = max(sem_scores.values(), default=0.0)
 
-        combined = {}
-        for bid in all_ids:
+        combined: list[tuple[str, float]] = []
+        for bid in set(fts_scores) | set(sem_scores):
             fts_norm = fts_scores.get(bid, 0) / max_fts if max_fts > 0 else 0
             sem_norm = sem_scores.get(bid, 0) / max_sem if max_sem > 0 else 0
-            combined[bid] = 0.4 * fts_norm + 0.6 * sem_norm
+            combined.append((bid, 0.4 * fts_norm + 0.6 * sem_norm))
+        combined.sort(key=lambda pair: pair[1], reverse=True)
 
-        # Sort
-        sorted_ids = sorted(combined.keys(), key=lambda x: combined[x], reverse=True)
-
-        # Fetch and filter
-        items = []
-        for bid in sorted_ids:
-            book = self.db.get_book(bid)
-            if book and self._matches_filters(book, filters):
-                book["_score"] = combined[bid]
-                book["match_type"] = "hybrid"
-                items.append(book)
-
-        total = len(items)
-        start = (page - 1) * per_page
-        end = start + per_page
-        pages = max(1, (total + per_page - 1) // per_page)
-
-        return {
-            "items": items[start:end],
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-            "pages": pages,
-        }
+        return self._page(combined, page, per_page, "hybrid", snippets)
 
     def suggest(self, query: str, limit: int = 8) -> list[dict]:
         return self.db.suggest(query, limit)
-
-    def _matches_filters(self, book: dict, filters: dict) -> bool:
-        """Client-side filter check (for semantic results)."""
-        if filters.get("file_type") and book.get("file_type") != filters["file_type"]:
-            return False
-        if filters.get("category"):
-            cats = book.get("categories", [])
-            if filters["category"] not in cats:
-                return False
-        if filters.get("theme"):
-            themes = book.get("themes", [])
-            if filters["theme"] not in themes:
-                return False
-        if filters.get("language") and book.get("language") != filters["language"]:
-            return False
-        if filters.get("reading_status") and book.get("reading_status") != filters["reading_status"]:
-            return False
-        if filters.get("favorite") and not book.get("favorite"):
-            return False
-        if filters.get("has_cover") and not book.get("has_cover"):
-            return False
-        if filters.get("has_description") and not book.get("has_description"):
-            return False
-        if filters.get("year_min") is not None:
-            year = book.get("publication_year")
-            if year is None or year < int(filters["year_min"]):
-                return False
-        if filters.get("year_max") is not None:
-            year = book.get("publication_year")
-            if year is None or year > int(filters["year_max"]):
-                return False
-        if filters.get("author"):
-            authors = book.get("authors", [])
-            if filters["author"] not in authors:
-                return False
-        return True

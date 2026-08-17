@@ -1,8 +1,8 @@
-import { useState, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
 import { X, BookOpen, Keyboard } from 'lucide-react';
 import { useCompare } from '../../api/books';
 import { LLMPanel } from './LLMPanel';
+import { SimilarPassages } from './SimilarPassages';
 import type { CompareMatch } from '../../api/types';
 
 interface ReaderSidebarProps {
@@ -28,26 +28,23 @@ const READER_SHORTCUTS = [
 
 export function ReaderSidebar({ bookId, bookTitle, selectedText, onClose }: ReaderSidebarProps) {
   const [tab, setTab] = useState<'analysis' | 'shortcuts'>('analysis');
-  const compareMutation = useCompare();
+  const { mutate: compare } = useCompare();
   const [matches, setMatches] = useState<CompareMatch[]>([]);
 
-  const runCompare = useCallback(
-    (text: string) => {
-      if (text.length < 15) return;
-      compareMutation.mutate(
-        { text, book_id: bookId, limit: 5 },
-        { onSuccess: (data) => setMatches(data.matches) },
-      );
-    },
-    [bookId, compareMutation],
-  );
-
-  // Auto-compare when selected text changes
-  useState(() => {
-    if (selectedText && selectedText.length >= 15) {
-      runCompare(selectedText);
-    }
-  });
+  // Auto-compare whenever the selection changes.
+  //
+  // This was a `useState(() => …)` — an initialiser, not an effect, so it ran
+  // exactly once and never again. On that single run `selectedText` was still
+  // empty (the sidebar opens *because* text was selected, but the prop lands
+  // on the following render), so the comparison fired with nothing and the
+  // "Similar in Other Books" panel stayed permanently empty in both readers.
+  useEffect(() => {
+    if (selectedText.length < 15) return;
+    compare(
+      { text: selectedText, book_id: bookId, limit: 5 },
+      { onSuccess: (data) => setMatches(data.matches) },
+    );
+  }, [selectedText, bookId, compare]);
 
   return (
     <div className="flex h-full w-96 shrink-0 flex-col border-l border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50">
@@ -77,6 +74,7 @@ export function ReaderSidebar({ bookId, bookTitle, selectedText, onClose }: Read
         </div>
         <button
           onClick={onClose}
+          aria-label="Close sidebar"
           className="ml-auto rounded p-1 text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
           title="Close sidebar (S)"
         >
@@ -107,32 +105,7 @@ export function ReaderSidebar({ bookId, bookTitle, selectedText, onClose }: Read
             )}
 
             {/* Similar passages from other books */}
-            {matches.length > 0 && (
-              <div>
-                <h4 className="mb-2 text-xs font-semibold text-slate-500">Similar in Other Books</h4>
-                <div className="space-y-2">
-                  {matches.map((m) => (
-                    <Link
-                      key={m.book_id}
-                      to={`/books/${m.book_id}`}
-                      className="block rounded-lg bg-white p-3 text-xs shadow-sm ring-1 ring-slate-100 transition-shadow hover:shadow dark:bg-slate-700 dark:ring-slate-600"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="rounded bg-primary-100 px-1.5 py-0.5 font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300">
-                          {m.similarity}%
-                        </span>
-                        <span className="truncate font-medium text-slate-700 dark:text-slate-300">
-                          {m.title}
-                        </span>
-                      </div>
-                      {m.excerpt && (
-                        <p className="mt-1.5 line-clamp-2 text-slate-500 dark:text-slate-400">{m.excerpt}</p>
-                      )}
-                    </Link>
-                  ))}
-                </div>
-              </div>
-            )}
+            <SimilarPassages matches={matches} />
 
             {/* LLM Analysis */}
             <LLMPanel selectedText={selectedText} bookId={bookId} bookTitle={bookTitle} />

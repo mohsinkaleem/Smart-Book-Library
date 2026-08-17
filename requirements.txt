@@ -1,37 +1,38 @@
-# Core — everything `python build_catalog.py` and `python main.py` need.
-pypdf>=4.0
-cryptography>=3.1  # AES-decryption support for encrypted PDFs (pypdf)
-ebooklib>=0.18
-beautifulsoup4>=4.12
-Pillow>=10.0
-requests>=2.31
-rapidfuzz>=3.0
-numpy>=1.24
+# pip users: this file mirrors `[project].dependencies` in pyproject.toml,
+# which is the source of truth. Keep the two in step when adding a package.
+#
+#   pip install -r requirements.txt          # core
+#   pip install -r requirements.txt -c /dev/null -e '.[embed]'   # + semantic search
+#
+# uv users: `uv sync` reads pyproject.toml and ignores this file. Note that a
+# plain `uv sync` installs the core set only — semantic search needs
+# `uv sync --extra embed`, which pulls in torch (~2 GB).
 
-# Web server
-fastapi>=0.134.0
-uvicorn[standard]>=0.41.0
+# ── Core: everything `python build_catalog.py` and `python main.py` need ──
 aiofiles>=25.1.0
+beautifulsoup4>=4.12
+cryptography>=3.1        # AES-decryption support for encrypted PDFs (pypdf)
+ebooklib>=0.18
+fastapi>=0.134.0
+httpx>=0.27              # async client for the LLM stream; also TestClient
+numpy>=1.24
+Pillow>=10.0
+pypdf>=4.0
 python-multipart>=0.0.22
+rapidfuzz>=3.0
+requests>=2.31
+uvicorn[standard]>=0.41.0
 
-# Development
-pytest>=8.0
+# ── Development ──
+# `pip install -e '.[dev]'` — kept out of the core list so a deploy does not
+# pull the test runner. These two lists disagreed about that before.
+# pytest>=8.0
 
-# Optional — semantic search / similarity (--embed). Pulls in torch (~2 GB).
-# sentence-transformers>=2.2
-
-# Optional — OCR for image-based PDFs
-# pytesseract>=0.3.10
-# pdf2image>=1.16
-# Also requires: brew install tesseract poppler
-
-# Optional — LLM summaries (requires running: ollama serve)
-# (uses requests, no extra pip package needed)
-
-# Optional — cover scraping
-# playwright>=1.40
-# Run after install: playwright install chromium
-
-# Optional — folder watching
-# watchdog>=4.0
-
+# ── Optional extras (see pyproject.toml [project.optional-dependencies]) ──
+# embed  — semantic search / similarity: sentence-transformers>=2.2  (~2 GB, pulls torch)
+# ocr    — image-based PDFs: pytesseract>=0.3.10, pdf2image>=1.16
+#          Also requires: brew install tesseract poppler
+# covers — cover scraping: playwright>=1.40  (then: playwright install chromium)
+# watch  — folder watching: watchdog>=4.0
+#
+# LLM summaries need no extra package — just a running `ollama serve`.

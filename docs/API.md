@@ -1,6 +1,7 @@
 # API Documentation
 
 > Base URL: `http://localhost:8000`  
+> Version: `1.1.0` — see `GET /api/health`  
 > Interactive docs: `http://localhost:8000/docs` (Swagger UI)
 
 All endpoints return JSON unless otherwise noted.
@@ -19,22 +20,22 @@ List books with pagination, sorting, and filtering.
 | ----------------- | ------ | -------- | ---------------------------------------- |
 | `page`            | int    | 1        | Page number (≥ 1)                        |
 | `per_page`        | int    | 48       | Items per page (1–200)                   |
-| `sort`            | string | `title`  | Sort field (`title`, `date_added`, `publication_year`, `size`, `authors`) |
+| `sort`            | string | `title`  | Sort field: `title`, `author`, `date_added`, `year`, `size`, `pages`, `rating`, `last_opened`. Unknown values fall back to `title`. |
 | `order`           | string | `asc`    | Sort direction (`asc` or `desc`)         |
 | `file_type`       | string | —        | `pdf` or `epub`                          |
 | `category`        | string | —        | Filter by category name                  |
 | `theme`           | string | —        | Filter by theme name                     |
 | `author`          | string | —        | Filter by author name                    |
-| `language`        | string | —        | Filter by language code (e.g. `en`)      |
+| `language`        | string | —        | Normalised ISO-639-1 code (e.g. `en`), or `unknown` — see `GET /api/filters` |
 | `reading_status`  | string | —        | `not_started`, `in_progress`, `finished`, `abandoned` |
-| `has_cover`       | bool   | —        | Filter by cover availability             |
-| `has_description` | bool   | —        | Filter by description availability       |
+| `has_cover`       | bool   | —        | `true` requires a cover, `false` requires none |
+| `has_description` | bool   | —        | `true` requires a description, `false` requires none |
 | `year_min`        | int    | —        | Minimum publication year                 |
 | `year_max`        | int    | —        | Maximum publication year                 |
 | `rating_min`      | int    | —        | Minimum user rating (1–5)               |
 | `favorite`        | bool   | —        | Filter favorites only                    |
 | `tag`             | string | —        | Filter by user tag                       |
-| `search`          | string | —        | Quick text search filter                 |
+| `search`          | string | —        | Text filter over metadata **and** book text. Unlike `/api/search` this only filters — results stay in `sort` order and carry no snippet. |
 
 **Response:**
 
@@ -65,33 +66,58 @@ Get semantically similar books using embedding cosine similarity.
 | Param    | Type   | Default    | Description                |
 | -------- | ------ | ---------- | -------------------------- |
 | `limit`  | int    | 8          | Max results (1–20)         |
-| `method` | string | `combined` | `combined`, `semantic`     |
+| `method` | string | `combined` | `combined`, `content`, `metadata` |
 
-**Response:** Array of `Book` objects with `similarity_score`.
+**Response:** Array of `Book` objects with `similarity_score`. Returns `404` for an unknown `book_id`.
 
 ---
 
-### `GET /api/books/{book_id}/text`
+### `GET /api/books/continue-reading`
 
-Get the text excerpt for a book.
+Books that have been opened and not finished, most recently opened first.
+Populated by the readers, which stamp `last_opened`, `progress_percent` and
+`reader_position` as you read.
 
-**Response:**
+| Param   | Type | Default | Description        |
+| ------- | ---- | ------- | ------------------ |
+| `limit` | int  | 8       | Max results (1–24) |
 
-```json
-{
-  "id": "abc123...",
-  "title": "Book Title",
-  "text": "Extracted text content up to ~5000 characters..."
-}
-```
+**Response:** Array of `Book` objects.
+
+---
+
+### `GET /api/books/{book_id}/file`
+
+Serve the raw PDF or EPUB for in-browser reading. `GET /api/books/{book_id}/file.epub`
+is an alias for the same bytes — epub.js chooses its loader from the URL
+extension, and without one it treats the response as an unpacked EPUB
+directory.
+
+**Response:** the file, with `Content-Type` set from `file_type`. `404` if the
+book is unknown or its file is no longer on disk.
 
 ---
 
 ### `PATCH /api/books/{book_id}`
 
-Update book metadata fields.
+Update the user-owned fields of a book. Pipeline-owned metadata is not writable
+here — use `POST /api/review/{book_id}/pin` to correct catalogue data.
 
-**Request Body:** JSON object with fields to update. Accepts any book field name.
+**Request Body:** any subset of
+
+| Field              | Type       | Notes                                                    |
+| ------------------ | ---------- | -------------------------------------------------------- |
+| `reading_status`   | string     | `not_started`, `in_progress`, `finished`, `abandoned`     |
+| `progress_percent` | float      | 0–100                                                     |
+| `reader_position`  | string     | Opaque resume token: an EPUB CFI or a PDF page number (max 2000 chars) |
+| `user_rating`      | float\|null | 0–5; send `null` to clear                                |
+| `user_tags`        | string[]   |                                                           |
+| `favorite`         | bool       |                                                           |
+| `last_opened`      | string     | ISO 8601                                                  |
+
+Only the fields present in the body are written. Unknown field names are
+rejected with `422` — this endpoint previously accepted them and dropped them
+silently. Returns `404` if the book does not exist.
 
 ---
 
@@ -104,7 +130,7 @@ Full-text and/or semantic search across the library.
 | Param      | Type   | Default  | Description                                    |
 | ---------- | ------ | -------- | ---------------------------------------------- |
 | `q`        | string | required | Search query                                   |
-| `mode`            | string | `text`   | `text` (full-text), `semantic`, or `hybrid`    |
+| `mode`            | string | `hybrid` | `text` (full-text), `semantic`, or `hybrid`    |
 | `page`            | int    | 1        | Page number                                    |
 | `per_page`        | int    | 48       | Results per page                               |
 | `file_type`       | string | —        | Filter by `pdf` or `epub`                      |
@@ -121,13 +147,41 @@ Full-text and/or semantic search across the library.
 | `tag`             | string | —        | Filter by user tag                             |
 
 **Search modes:**
-- **`text`** — SQLite FTS5 with Porter stemmer. Matches against title, authors, description, themes, categories, keywords, and publisher. Supports prefix matching, quoted phrase queries, OR operators, and column-scoped search (e.g. `title:python`).
-- **`semantic`** — Encodes the query with `all-MiniLM-L6-v2` and finds nearest neighbors via cosine similarity. Requires embeddings to be generated.
-- **`hybrid`** — Runs both FTS5 and semantic, then merges and re-ranks results (40% FTS + 60% semantic weighting).
+- **`text`** — SQLite FTS5 with Porter stemmer, across **two** indexes: `books_fts`
+  over metadata (title, authors, description, summary, themes, categories,
+  keywords, publisher, raw subjects) and `book_text_fts` over the book's own
+  extracted prose (`text_excerpt`, `front_matter`, `content_sample`). A book
+  matching both is scored on both, with the text side weighted at 0.35 so a
+  title match still outranks a passing mention in a 5 000-character excerpt.
+- **`semantic`** — Encodes the query with `all-MiniLM-L6-v2` and ranks the whole
+  catalog by cosine similarity. Requires embeddings. Results must clear a
+  relevance floor — an absolute 0.28 and 55% of the best score — because
+  otherwise every book in the library scores above zero against every query
+  and `total` would always be the size of the library.
+- **`hybrid`** *(default)* — Runs both and merges on normalised scores
+  (40% FTS + 60% semantic). The FTS side is unioned in, so an exact keyword
+  match is never dropped by the semantic floor.
+
+Every token of the query is quoted before it reaches FTS5, so `AND`, `-`, `*`,
+`"` and `title:` are matched as literal text rather than as operators. Prefix
+matching is applied automatically to tokens longer than two characters;
+quoted phrases, `OR` and column-scoped search are **not** supported as
+operators.
 
 All search modes support the full set of filter parameters, applied server-side.
 
-**Response:** Same paginated format as `GET /api/books`. Each item includes `_score` and `match_type` fields.
+**Response:** Same paginated format as `GET /api/books`, plus per item:
+
+| Field         | Type   | Description                                                    |
+| ------------- | ------ | -------------------------------------------------------------- |
+| `_score`      | float  | Rank score. bm25 for `text` (lower is better), cosine otherwise |
+| `match_type`  | string | `fts`, `semantic` or `hybrid`                                   |
+| `match_field` | string | `text` or `metadata` — which index produced the snippet         |
+| `snippet`     | string | Matching excerpt, present when the match came from FTS          |
+
+Matched terms inside `snippet` are wrapped in the control characters `U+0002`
+and `U+0003` rather than in markup, so a client can highlight them without
+rendering server-supplied HTML. Elisions are marked with `…`.
 
 ---
 
@@ -172,7 +226,7 @@ Accepts the same filter parameters as `GET /api/books`:
 | `file_type`       | string | `pdf` or `epub`                          |
 | `category`        | string | Filter by category name                  |
 | `theme`           | string | Filter by theme name                     |
-| `language`        | string | Filter by language code                  |
+| `language`        | string | Normalised ISO-639-1 code, or `unknown`  |
 | `reading_status`  | string | Filter by reading status                 |
 | `favorite`        | string | `true` to filter favorites               |
 | `has_cover`       | string | `true` to filter books with covers       |
@@ -183,6 +237,13 @@ Accepts the same filter parameters as `GET /api/books`:
 | `tag`             | string | Filter by user tag                       |
 
 When called with no parameters, returns unfiltered global facet counts.
+
+**Language facets are normalised.** Stored values come from file metadata and
+are not all ISO-639-1 — the catalog holds `po`, `sp` and `ge` alongside empty
+strings. Each value is folded to a two-letter code where it validly maps
+(`EN`, `en-GB`, `eng` → `en`) and bucketed as `unknown` where it does not,
+rather than being guessed at. Passing `language=unknown` back as a filter
+matches every raw value in that bucket. `unknown` always sorts last.
 
 **Response:**
 
@@ -199,17 +260,6 @@ When called with no parameters, returns unfiltered global facet counts.
   "total_matching": 85
 }
 ```
-
-### Individual Facet Endpoints
-
-| Endpoint                  | Returns            |
-| ------------------------- | ------------------ |
-| `GET /api/filters/categories` | Category facets |
-| `GET /api/filters/themes`     | Theme facets    |
-| `GET /api/filters/authors`    | Author facets   |
-| `GET /api/filters/languages`  | Language facets |
-| `GET /api/filters/years`      | Year facets     |
-| `GET /api/filters/tags`       | User tag facets |
 
 ---
 
@@ -230,15 +280,17 @@ Library overview statistics.
   "with_cover": 118,
   "with_description": 92,
   "with_embeddings": 0,
+  "duplicates": 24,
   "avg_rating": null,
-  "categories_top": [...],
-  "languages": [...]
+  "categories": [...],
+  "themes": [...],
+  "year_histogram": [...],
+  "recently_processed": [...]
 }
 ```
 
-### `GET /api/stats/reading`
-
-Reading progress statistics.
+All counts exclude records whose file is no longer on disk (`status = "missing"`),
+matching `GET /api/books`.
 
 ---
 
@@ -246,17 +298,28 @@ Reading progress statistics.
 
 ### `GET /api/reading/llm-status`
 
-Check if Ollama is running and available.
+Whether the LLM analysis actions will work, and why not when they will not.
+The result is cached for 30 s, because the frontend gates its Analysis buttons
+on this and each probe costs the connect timeout when Ollama is down.
 
 **Response:**
 
 ```json
-{ "available": true }
+{
+  "available": true,
+  "model": "llama3.2",
+  "model_installed": false,
+  "reason": "model 'llama3.2' is not pulled",
+  "base_url": "http://localhost:11434"
+}
 ```
+
+`model` and `base_url` come from the `OLLAMA_MODEL` and `OLLAMA_BASE_URL`
+environment variables. `reason` is empty when everything is ready.
 
 ### `GET /api/reading/{book_id}/text`
 
-Get book text for the reading view (same as `/api/books/{id}/text`).
+Get book text for the reading view.
 
 ### `POST /api/reading/compare`
 
@@ -314,25 +377,11 @@ data: [DONE]
 
 ---
 
-## User
+## User fields
 
-### `PATCH /api/user/books/{book_id}`
-
-Update user-specific fields for a book.
-
-**Request Body:**
-
-```json
-{
-  "reading_status": "in_progress",
-  "progress_percent": 45,
-  "user_rating": 4,
-  "user_tags": ["favorites", "technical"],
-  "favorite": true
-}
-```
-
-All fields are optional. Only provided fields are updated.
+User-owned fields are written through `PATCH /api/books/{book_id}` — see above.
+There used to be a second, near-identical route at `PATCH /api/user/books/{id}`;
+it has been removed.
 
 ---
 
@@ -340,20 +389,40 @@ All fields are optional. Only provided fields are updated.
 
 ### `GET /api/pipeline/status`
 
-Get current pipeline run status.
+Current pipeline run status. `{"status": "idle"}` when nothing has run this
+process, otherwise the tracked task:
+
+```json
+{
+  "status": "running",
+  "progress": 41,
+  "total": 74,
+  "message": "Extracting metadata: Atomic Habits",
+  "started_at": "2026-08-17T11:04:22",
+  "completed_at": null,
+  "error": null
+}
+```
+
+`status` is one of `idle`, `running`, `completed`, `failed`.
 
 ### `POST /api/pipeline/run`
 
 Trigger a catalog re-processing run.
 
-**Request Body:**
+Returns `409` if a run is already in progress.
 
-```json
-{
-  "force": false,            // Re-process already processed books
-  "book_ids": ["abc123"]     // Optional — process specific books only
-}
-```
+**Request Body:** all fields optional.
+
+| Field        | Type      | Default | Description                                     |
+| ------------ | --------- | ------- | ----------------------------------------------- |
+| `max_books`  | int       | `0`     | Cap the number of books processed; `0` = no cap |
+| `file_types` | string[]  | `null`  | Restrict to e.g. `["pdf"]`                      |
+| `llm`        | bool      | `false` | Run the LLM enrichment stage                    |
+| `embed`      | bool      | `false` | Generate embeddings as part of the run          |
+| `force`      | bool      | `false` | Re-process already processed books              |
+
+There is no `book_ids` parameter.
 
 ### `POST /api/pipeline/generate-embeddings`
 
@@ -365,16 +434,94 @@ Check embedding generation progress.
 
 ### `GET /api/pipeline/unprocessed`
 
-List books that haven't been processed yet.
+Count — not list — the files on disk that are not in the catalog yet.
+
+```json
+{ "unprocessed": 74, "total_files": 618 }
+```
+
+An `error` key is added instead of raising if the scan fails.
+
+### `GET /api/pipeline/report`
+
+Catalog quality report: field fill rates, provenance breakdown and confidence
+distribution.
+
+---
+
+## Review queue
+
+Records the verification gate could not confirm surface here. A human
+correction is pinned as `source: "user"`, `confidence: 1.0`, and no future
+pipeline run may overwrite it.
+
+### `GET /api/review/queue`
+
+Records needing confirmation, lowest confidence first.
+
+| Param      | Type | Default | Description            |
+| ---------- | ---- | ------- | ---------------------- |
+| `page`     | int  | 1       | Page number            |
+| `per_page` | int  | 25      | Items per page (1–100) |
+
+**Response:** the same paginated envelope as `GET /api/books`.
+
+### `POST /api/review/{book_id}/pin`
+
+Pin a corrected field value permanently.
+
+```json
+{ "field": "title", "value": "The Corrected Title" }
+```
+
+`field` must be one of `title`, `subtitle`, `authors`, `publisher`,
+`publication_year`, `isbn_10`, `isbn_13`, `language`, `description`,
+`summary`, `categories`, `themes`, `keywords`, `cover_path` — anything else is
+a `400`. Returns the updated `Book`, or `404` if it does not exist.
+
+### `POST /api/review/{book_id}/resolve`
+
+Mark a record as reviewed.
+
+```json
+{ "resolution": "confirmed" }
+```
+
+---
+
+## Operations
+
+### `GET /api/health`
+
+Liveness, plus the three facts worth knowing before blaming the UI.
+
+```json
+{
+  "status": "ok",
+  "version": "1.1.0",
+  "books": 544,
+  "embeddings_loaded": true,
+  "database": "/path/to/data/catalog.db"
+}
+```
+
+`embeddings_loaded: false` means semantic and hybrid search have nothing to
+rank against.
 
 ---
 
 ## Static Assets
 
-| Path              | Description              |
-| ----------------- | ------------------------ |
-| `/covers/{file}`  | Book cover images        |
-| `/*`              | Frontend SPA (React app) |
+| Path              | Description                                                       |
+| ----------------- | ----------------------------------------------------------------- |
+| `/covers/{file}`  | Book cover images. `Cache-Control: public, max-age=604800`, plus `ETag`/`Last-Modified` conditional requests |
+| `/assets/{file}`  | Built frontend assets                                             |
+| `/*`              | Frontend SPA (React app)                                          |
+
+Paths under `/api/` and `/covers/` are excluded from the SPA fallback and
+return a JSON `404` rather than the app shell. The fallback resolves and
+containment-checks every candidate path, so it cannot serve a file outside
+`frontend/dist`.
 
 ---
 
@@ -389,6 +536,8 @@ All errors return JSON:
 ```
 
 Common HTTP status codes:
-- `400` — Bad request / invalid parameters
+- `400` — Bad request (e.g. an empty `PATCH` body, an unpinnable field)
 - `404` — Resource not found
+- `409` — Conflict: a pipeline or embedding run is already in progress
+- `422` — Request validation failed (wrong parameter type, unknown body field)
 - `500` — Internal server error

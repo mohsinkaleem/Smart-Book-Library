@@ -5,26 +5,29 @@ A local-first web application for managing, cataloging, and exploring your perso
 ## Features
 
 - **Smart Cataloging** — Automatically extracts metadata (title, authors, ISBN, language, page count) from PDF and EPUB files
-- **Full-Text Search** — SQLite FTS5 with Porter stemmer for fast, typo-tolerant search across all book metadata and text. Supports prefix matching, phrase queries, OR operators, and column-scoped searches
+- **Full-Text Search** — SQLite FTS5 with Porter stemmer over two indexes: one for metadata (title, authors, description, themes, keywords…) and one for each book's own extracted prose. Results carry a highlighted snippet showing why they matched. Every token is quoted before it reaches FTS5, so punctuation and bare `AND` are searched as text rather than parsed as operators
 - **Semantic Search** — Sentence-transformer embeddings enable "find books like this" similarity queries
 - **Reactive Filters** — Sidebar filter counts update dynamically based on active search query and other selected filters, showing real-time availability
-- **Reading View** — In-browser text reader with adjustable font size, paragraph formatting, and copy-to-clipboard
+- **Reading View** — In-browser PDF and EPUB readers with adjustable zoom/font size, continuous or paginated flow, and a text-selection sidebar
+- **Resume Where You Left Off** — Both readers persist page or EPUB position and progress percentage, feeding a *Continue reading* shelf on the home page
 - **LLM Analysis** — Ollama-powered streaming analysis (summarize, explain, critique, compare) of selected text passages
 - **Cover Art** — Automatic cover extraction from files and API enrichment from Open Library / Google Books
 - **Dashboard** — Visual statistics with charts showing library composition by category, type, language, and reading progress
-- **Dark Mode** — Full dark/light theme toggle with system preference detection
+- **Four Themes** — Light, Dark, Paper (warm sepia) and Dim (soft dark), applied before first paint with system-preference detection. Press `d` to cycle
 - **Responsive Grid/List Views** — Switch between grid and list layouts with sort and filter controls
 - **Smart Autocomplete** — Multi-tier search suggestions (title prefix → FTS match → fuzzy LIKE fallback) with keyboard navigation and highlight matching
-- **Reading Tracker** — Mark books as not started / in progress / finished / abandoned with progress percentage
+- **Reading Tracker** — Mark books as not started / in progress / finished / abandoned; progress percentage is maintained by the readers themselves
+- **Tags** — Add your own tags to any book and filter the library by them; the tag vocabulary is suggested back to you as you type
+- **Duplicate Detection** — Fuzzy-matched duplicates are counted on the dashboard and flagged on the book page
 
 ## Tech Stack
 
 | Layer      | Technology                                            |
 | ---------- | ----------------------------------------------------- |
 | Backend    | Python 3.11+, FastAPI, uvicorn                        |
-| Database   | SQLite (WAL mode) + FTS5 virtual table                |
+| Database   | SQLite (WAL mode) + two FTS5 virtual tables           |
 | Frontend   | React 18, TypeScript, Vite 8, Tailwind CSS v4         |
-| State      | TanStack Query v5, Zustand                            |
+| State      | TanStack Query v5; UI state in the URL + localStorage |
 | Charts     | Recharts                                              |
 | Icons      | Lucide React                                          |
 | Embeddings | sentence-transformers (`all-MiniLM-L6-v2`)            |
@@ -85,7 +88,12 @@ its version changed, the file's content hash changed, or `--force` is given. Bum
 stage version in `catalog/config.py` re-runs just that stage across the catalog.
 
 **Provider API keys.** Google Books' anonymous quota is small and per-IP, so bulk runs
-get 429s. Put a key in a gitignored `.env` at the project root to lift it:
+get 429s. Copy `.env.example` to a gitignored `.env` at the project root and put a key
+in it to lift the limit:
+
+```bash
+cp .env.example .env
+```
 
 ```
 GOOGLE_BOOKS_API_KEY=your-key-here
@@ -115,7 +123,6 @@ python main.py --host 0.0.0.0     # Custom host
 python main.py --port 3000         # Custom port
 python main.py --network           # LAN access (binds 0.0.0.0)
 python main.py --reload            # Auto-reload for development
-python main.py --migrate           # Run DB migration before starting
 ```
 
 ### 5. Optional: LLM Analysis
@@ -127,7 +134,16 @@ ollama serve
 ollama pull llama3.2
 ```
 
-The reading view's analysis panel will automatically detect Ollama and enable streaming summarization, explanation, critique, and comparison features.
+The reading view's analysis panel checks `GET /api/reading/llm-status` and enables
+its buttons only when Ollama answers *and* the configured model is pulled — otherwise
+it says which of the two is missing instead of failing on click.
+
+Both the model and the endpoint are configurable:
+
+```
+OLLAMA_MODEL=llama3.2
+OLLAMA_BASE_URL=http://localhost:11434
+```
 
 ### 6. Optional: Generate Embeddings
 
@@ -155,33 +171,33 @@ books/
 │   ├── db.py                # BookDatabase — SQLite + FTS5 operations
 │   ├── search.py            # SearchEngine — FTS5, semantic, and hybrid search
 │   ├── similarity.py        # SimilarityEngine — embedding cosine similarity
-│   ├── llm_service.py       # Ollama streaming client
-│   ├── migrate.py           # JSON → SQLite migration
+│   ├── llm_service.py       # Ollama async streaming client
 │   ├── tasks.py             # Background task runner
 │   └── routes/
-│       ├── books.py         # /api/books — CRUD, list, similar, text
-│       ├── search.py        # /api/search — Full-text and semantic search
+│       ├── params.py        # Shared filter query-parameter dependency
+│       ├── schemas.py       # Shared request bodies
+│       ├── books.py         # /api/books — CRUD, list, similar, file, user fields
+│       ├── search.py        # /api/search — Full-text, semantic and hybrid search
 │       ├── filters.py       # /api/filters — Reactive facets scoped to search/filters
 │       ├── stats.py         # /api/stats — Library statistics
 │       ├── reading.py       # /api/reading — Reading text, compare, LLM analyze
 │       ├── pipeline.py      # /api/pipeline — Re-process, embeddings
-│       └── user.py          # /api/user — Reading status, ratings, tags
+│       └── review.py        # /api/review — Review queue, pinned corrections
 │
 ├── frontend/                # React + TypeScript SPA
 │   ├── src/
 │   │   ├── App.tsx          # Router setup
 │   │   ├── api/             # TanStack Query hooks and API client
 │   │   ├── components/
-│   │   │   ├── books/       # BookCard, BookGrid, BookList, BookCover
-│   │   │   ├── common/      # Spinner, ErrorBoundary
-│   │   │   ├── detail/      # BookHeader, SimilarBooks
-│   │   │   ├── layout/      # Header, Sidebar (reactive filter counts)
-│   │   │   ├── reading/     # ReadingView, LLMPanel
-│   │   │   ├── search/      # SearchBar (multi-mode, keyboard nav, highlighting)
+│   │   │   ├── books/       # BookCard, BookGrid, BookList, BookCover, ContinueReading
+│   │   │   ├── common/      # Spinner, ErrorBoundary, EmptyState, Badge, Rating, ProgressBar
+│   │   │   ├── detail/      # BookHeader, SimilarBooks, TagEditor
+│   │   │   ├── layout/      # Header, Sidebar (reactive filter counts), ThemePicker
+│   │   │   ├── reading/     # ReadingView, BookReader, ReaderSidebar, LLMPanel
+│   │   │   ├── search/      # SearchBar (multi-mode, keyboard nav), SnippetText
 │   │   │   └── stats/       # Dashboard charts
-│   │   ├── hooks/           # Custom React hooks
+│   │   ├── hooks/           # useLibraryParams (URL state), useTheme, useReadingProgress, shortcuts
 │   │   ├── pages/           # Route-level page components
-│   │   ├── stores/          # Zustand state stores
 │   │   └── utils/           # Formatting helpers
 │   └── dist/                # Production build output (served by FastAPI)
 │
@@ -199,7 +215,17 @@ books/
 │   ├── duplicate_detector.py# Fuzzy duplicate detection
 │   ├── reading_tracker.py   # Reading status management
 │   ├── ocr_extractor.py     # OCR for scanned PDFs
-│   ├── database.py          # Catalog JSON/DB storage
+│   ├── store.py             # CatalogStore — SQLite store of record
+│   ├── schema.py            # Shared DDL, column lists, FTS index
+│   ├── user_data.py         # User-owned fields and pinned corrections
+│   ├── fts.py               # The one FTS5 query builder
+│   ├── languages.py         # ISO-639-1 normalisation for dirty language values
+│   ├── evidence.py          # Match scoring and verification evidence
+│   ├── providers.py         # Metadata provider clients
+│   ├── taxonomy.py          # Category/theme normalisation
+│   ├── text_utils.py        # Text cleaning helpers
+│   ├── names.py             # Author name parsing
+│   ├── reporting.py         # Catalog quality report
 │   ├── models.py            # BookRecord dataclass
 │   ├── config.py            # Pipeline configuration
 │   ├── pipeline.py          # Orchestration pipeline
@@ -208,8 +234,7 @@ books/
 ├── data/                    # Runtime data (gitignored)
 │   ├── catalog.db           # SQLite database
 │   ├── catalog.json         # Legacy JSON catalog
-│   ├── covers/              # Extracted cover images
-│   └── text_excerpts/       # Extracted text files
+│   └── covers/              # Extracted cover images
 │
 ├── pdfs/                    # PDF book files
 └── epubs/                   # EPUB book files
@@ -226,8 +251,9 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | GET     | `/api/books`               | List books (paginated, filterable)   |
 | GET     | `/api/books/{id}`          | Get single book details              |
 | GET     | `/api/books/{id}/similar`  | Get semantically similar books       |
-| GET     | `/api/books/{id}/text`     | Get book text excerpt                |
-| PATCH   | `/api/books/{id}`          | Update book metadata                 |
+| GET     | `/api/books/continue-reading` | Opened-but-unfinished books, most recent first |
+| GET     | `/api/books/{id}/file`     | Raw PDF/EPUB bytes for the in-browser readers |
+| PATCH   | `/api/books/{id}`          | Update user fields (status, rating, tags, favourite, progress, position) |
 
 **Query parameters for `GET /api/books`:**
 
@@ -235,14 +261,15 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | ----------- | ------ | ------------------------------------------------ |
 | `page`      | int    | Page number (default: 1)                         |
 | `per_page`  | int    | Items per page (default: 48, max: 200)           |
-| `sort`      | string | Sort field: `title`, `date_added`, `year`, etc.  |
+| `sort`      | string | `title`, `author`, `date_added`, `year`, `size`, `pages`, `rating`, `last_opened` |
 | `order`     | string | `asc` or `desc`                                  |
 | `category`  | string | Filter by category                               |
 | `theme`     | string | Filter by theme                                  |
 | `author`    | string | Filter by author                                 |
-| `language`  | string | Filter by language                               |
+| `language`  | string | Normalised ISO-639-1 code, or `unknown`          |
 | `file_type` | string | Filter by type: `pdf`, `epub`                    |
-| `status`    | string | Filter by reading status                         |
+| `reading_status` | string | Filter by reading status                    |
+| `tag`       | string | Filter by user tag                               |
 | `favorite`  | bool   | Filter favorites only                            |
 
 ### Search — `/api/search`
@@ -263,7 +290,7 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | `file_type`       | string | Filter by type: `pdf`, `epub`                        |
 | `category`        | string | Filter by category                                   |
 | `theme`           | string | Filter by theme                                      |
-| `language`        | string | Filter by language                                   |
+| `language`        | string | Normalised ISO-639-1 code, or `unknown`              |
 | `reading_status`  | string | Filter by reading status                             |
 | `favorite`        | bool   | Filter favorites only                                |
 | `has_cover`       | bool   | Filter by cover availability                         |
@@ -278,12 +305,6 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | Method | Endpoint               | Description                                    |
 | ------ | ---------------------- | ---------------------------------------------- |
 | GET    | `/api/filters`         | Reactive filter facets scoped to current query  |
-| GET    | `/api/filters/categories` | Category facets                              |
-| GET    | `/api/filters/themes`  | Theme facets                                    |
-| GET    | `/api/filters/authors` | Author facets                                   |
-| GET    | `/api/filters/languages` | Language facets                               |
-| GET    | `/api/filters/years`   | Publication year facets                         |
-| GET    | `/api/filters/tags`    | User tag facets                                 |
 
 `GET /api/filters` accepts the same filter query parameters as `GET /api/books` (e.g. `search`, `category`, `file_type`, etc.). Each facet dimension excludes its own filter but applies all others, so counts reflect what's available if the user changes that particular filter while all other constraints remain.
 
@@ -292,7 +313,6 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | Method | Endpoint              | Description                    |
 | ------ | --------------------- | ------------------------------ |
 | GET    | `/api/stats`          | Library overview statistics    |
-| GET    | `/api/stats/reading`  | Reading progress statistics    |
 
 ### Reading — `/api/reading`
 
@@ -303,12 +323,6 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | POST   | `/api/reading/compare`       | Compare text semantically            |
 | POST   | `/api/reading/analyze`       | SSE-stream LLM analysis of text      |
 
-### User — `/api/user`
-
-| Method | Endpoint                    | Description                          |
-| ------ | --------------------------- | ------------------------------------ |
-| PATCH  | `/api/user/books/{id}`      | Update reading status, rating, tags  |
-
 ### Pipeline — `/api/pipeline`
 
 | Method | Endpoint                             | Description                    |
@@ -317,7 +331,8 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | POST   | `/api/pipeline/run`                  | Trigger catalog re-processing  |
 | POST   | `/api/pipeline/generate-embeddings`  | Generate sentence embeddings   |
 | GET    | `/api/pipeline/embedding-status`     | Embedding generation status    |
-| GET    | `/api/pipeline/unprocessed`          | List unprocessed books         |
+| GET    | `/api/pipeline/unprocessed`          | Count files on disk not yet catalogued |
+| GET    | `/api/pipeline/report`               | Catalog quality report         |
 
 ### Review — `/api/review`
 
@@ -327,11 +342,48 @@ Records the verification gate could not confirm. A correction made here is pinne
 | Method | Endpoint                      | Description                          |
 | ------ | ----------------------------- | ------------------------------------ |
 | GET    | `/api/review/queue`           | Records needing review, worst first  |
-| GET    | `/api/review/fields`          | Fields a human may correct           |
 | POST   | `/api/review/{id}/pin`        | Pin a corrected field value          |
 | POST   | `/api/review/{id}/resolve`    | Mark a record as reviewed            |
 
+### Operations
+
+| Method | Endpoint       | Description                                            |
+| ------ | -------------- | ------------------------------------------------------ |
+| GET    | `/api/health`  | Version, book count, whether embeddings loaded         |
+
+Cover images under `/covers/` are served with `Cache-Control: public, max-age=604800`
+alongside the `ETag`/`Last-Modified` handling `StaticFiles` already does, so a hard
+refresh no longer re-downloads every image in the library.
+
 ## Development
+
+### Tests and linting
+
+CI (`.github/workflows/ci.yml`) runs all of this on every push and pull request.
+Run it locally the same way:
+
+```bash
+pytest -q                 # backend: catalog pipeline + every API route
+cd frontend
+npx tsc -b                # type check
+npm run lint              # eslint, including the React hooks rules
+npm run build             # production build
+```
+
+`pytest` needs only the `dev` extra (`pip install -e ".[dev]"` or `uv sync --extra dev`).
+The route tests build the real app against a throwaway SQLite database via the
+fixtures in `tests/conftest.py`, so they need no catalog and no embeddings.
+
+### Configuration
+
+Copy `.env.example` to `.env` and fill in what you need. Everything in it is
+optional — the app runs with no `.env` at all.
+
+| Variable                | Default                  | Used by                              |
+| ----------------------- | ------------------------ | ------------------------------------ |
+| `GOOGLE_BOOKS_API_KEY`  | —                        | Catalog enrichment; lifts the anonymous per-IP quota |
+| `OLLAMA_BASE_URL`       | `http://localhost:11434` | Reading-view analysis, `--llm` runs   |
+| `OLLAMA_MODEL`          | `llama3.2`               | Reading-view analysis, `--llm` runs   |
 
 ### Frontend Dev Server
 
@@ -350,13 +402,19 @@ The backend has CORS configured for `localhost:5173`.
 reads it, so there is no JSON round-trip and no "which store is current?" question.
 `data/catalog.json` is produced only by `--export-json`.
 
-The database uses WAL mode for concurrent reads and an FTS5 virtual table for full-text
-search. Three tables hold book data:
+The database uses WAL mode for concurrent reads and two FTS5 virtual tables for
+full-text search — `books_fts` over metadata and `book_text_fts` over each book's
+extracted prose, kept separate so a 5 000-character excerpt cannot outrank an exact
+title match on term frequency alone. Both are external-content indexes over `books`,
+so neither stores a second copy of the text, and triggers keep them in sync.
+
+Three tables hold book data:
 
 - `books` — everything the pipeline produces, including `field_sources` (per-field source
   and confidence), `match_score`, `needs_review` and `stage_versions`
-- `user_data` — ratings, tags, favourites, reading progress and pinned corrections. The
-  pipeline never writes these columns, so a run (or a full rebuild) cannot destroy them
+- `user_data` — ratings, tags, favourites, reading progress, reader position and pinned
+  corrections. The pipeline never writes these columns, so a run (or a full rebuild)
+  cannot destroy them
 - `embeddings` — content and metadata vectors
 
 To inspect the database:
@@ -372,7 +430,21 @@ SELECT count(*) FROM books;
 
 1. Drop PDF/EPUB files into the `pdfs/` or `epubs/` directory
 2. Run `python build_catalog.py` to process new files
-3. Or use the Settings page in the UI to trigger a pipeline run
+3. Or use the Settings page in the UI, which shows how many files on disk are
+   not yet in the catalog and reports per-book progress while a run is going
+
+### Schema migrations
+
+`catalog/schema.py` is the only place the DDL lives, and `ensure_schema()` runs
+on every start from both the pipeline and the server. It adds missing columns
+in place and rebuilds an FTS index whenever its indexed column set changes, so
+upgrading is just starting the app. It is additive only — no existing table is
+dropped or rewritten — but `data/catalog.db` is your library's memory, so take
+a copy before a version jump:
+
+```bash
+sqlite3 data/catalog.db ".backup 'data/catalog.db.bak'"
+```
 
 ## License
 

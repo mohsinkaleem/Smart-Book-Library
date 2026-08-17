@@ -66,8 +66,7 @@ def get_unprocessed(request: Request):
 
         db = request.app.state.db
         existing = {
-            row["file_path"]
-            for row in db.conn.execute("SELECT file_path FROM books").fetchall()
+            row["file_path"] for row in db.query("SELECT file_path FROM books")
         }
         # `scan_all_directories` returns Paths; the old code called `.get()` on
         # them, raised AttributeError, and always reported zero.
@@ -82,8 +81,17 @@ def get_unprocessed(request: Request):
 
 @router.get("/report")
 def quality_report(request: Request):
-    """Catalog quality report: fill rates, provenance, confidence (M6)."""
+    """
+    Catalog quality report: fill rates, provenance, confidence (M6).
+
+    `CatalogStore()` opens its own SQLite connection; nothing closed it, so
+    every hit of this endpoint leaked a connection and a file handle.
+    """
     from catalog.reporting import build_report
     from catalog.store import CatalogStore
 
-    return build_report(CatalogStore())
+    store = CatalogStore()
+    try:
+        return build_report(store)
+    finally:
+        store.close()

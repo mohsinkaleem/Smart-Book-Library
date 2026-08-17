@@ -12,10 +12,13 @@ interface SearchBarProps {
 }
 
 const MODE_INFO: Record<string, { icon: typeof Search; label: string; desc: string }> = {
-  text: { icon: Type, label: 'Text', desc: 'Full-text keyword search' },
+  text: { icon: Type, label: 'Text', desc: 'Keyword search over metadata and book text' },
   semantic: { icon: Sparkles, label: 'Semantic', desc: 'AI meaning-based search' },
-  hybrid: { icon: Blend, label: 'Hybrid', desc: 'Combined text + semantic' },
+  hybrid: { icon: Blend, label: 'Hybrid', desc: 'Combined text + semantic (default)' },
 };
+
+const SUGGESTIONS_ID = 'search-suggestions';
+const optionId = (idx: number) => `${SUGGESTIONS_ID}-option-${idx}`;
 
 export function SearchBar({ value, onChange, mode, onModeChange }: SearchBarProps) {
   const [focused, setFocused] = useState(false);
@@ -23,7 +26,6 @@ export function SearchBar({ value, onChange, mode, onModeChange }: SearchBarProp
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const debounced = useDebounce(local, 250);
   const inputRef = useRef<HTMLInputElement>(null);
-  const dropdownRef = useRef<HTMLDivElement>(null);
   const { data: suggestions } = useSuggestions(debounced);
 
   useEffect(() => { onChange(debounced); }, [debounced, onChange]);
@@ -85,6 +87,8 @@ export function SearchBar({ value, onChange, mode, onModeChange }: SearchBarProp
           focused ? 'ring-primary-400 shadow-md max-w-[600px]' : 'ring-slate-200 dark:ring-slate-700 max-w-[500px]',
         )}>
           <Search size={18} className="ml-3 shrink-0 text-slate-400" />
+          {/* The dropdown implements full keyboard navigation and announced
+              none of it: no combobox role, no listbox, no active option. */}
           <input
             ref={inputRef}
             type="text"
@@ -94,6 +98,14 @@ export function SearchBar({ value, onChange, mode, onModeChange }: SearchBarProp
             onFocus={() => setFocused(true)}
             onBlur={() => setTimeout(() => setFocused(false), 200)}
             onKeyDown={handleKeyDown}
+            role="combobox"
+            aria-label="Search books"
+            aria-expanded={!!showDropdown}
+            aria-controls={SUGGESTIONS_ID}
+            aria-autocomplete="list"
+            aria-activedescendant={
+              showDropdown && selectedIdx >= 0 ? optionId(selectedIdx) : undefined
+            }
             className="w-full bg-transparent px-3 py-2.5 text-sm outline-none placeholder:text-slate-400"
           />
           {local && (
@@ -131,30 +143,35 @@ export function SearchBar({ value, onChange, mode, onModeChange }: SearchBarProp
       </div>
       {/* Suggestions dropdown */}
       {showDropdown && (
-        <div ref={dropdownRef} className="absolute top-12 left-0 z-50 w-full max-w-[500px] overflow-hidden rounded-lg bg-white shadow-lg ring-1 ring-slate-200 dark:bg-slate-800 dark:ring-slate-700">
+        <div className="absolute top-12 left-0 z-50 w-full max-w-[500px] overflow-hidden rounded-lg bg-white shadow-lg ring-1 ring-slate-200 dark:bg-slate-800 dark:ring-slate-700">
           <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
             Suggestions
           </div>
-          {suggestions!.map((s, idx) => (
-            <button
-              key={s.id}
-              className={clsx(
-                'flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors',
-                idx === selectedIdx
-                  ? 'bg-primary-50 dark:bg-primary-900/20'
-                  : 'hover:bg-slate-50 dark:hover:bg-slate-700',
-              )}
-              onMouseDown={() => { setLocal(s.title); onChange(s.title); }}
-              onMouseEnter={() => setSelectedIdx(idx)}
-            >
-              <Search size={14} className="shrink-0 text-slate-400" />
-              <div className="flex-1 min-w-0">
-                <span className="truncate font-medium block">{highlightMatch(s.title, local)}</span>
-              </div>
-              <span className="ml-auto shrink-0 truncate max-w-[150px] text-xs text-slate-400">{s.author}</span>
-              {idx === selectedIdx && <ArrowRight size={12} className="shrink-0 text-primary-400" />}
-            </button>
-          ))}
+          <ul id={SUGGESTIONS_ID} role="listbox" aria-label="Search suggestions">
+            {suggestions!.map((s, idx) => (
+              <li
+                key={s.id}
+                id={optionId(idx)}
+                role="option"
+                aria-selected={idx === selectedIdx}
+                onMouseDown={() => { setLocal(s.title); onChange(s.title); }}
+                onMouseEnter={() => setSelectedIdx(idx)}
+                className={clsx(
+                  'flex w-full cursor-pointer items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors',
+                  idx === selectedIdx
+                    ? 'bg-primary-50 dark:bg-primary-900/20'
+                    : 'hover:bg-slate-50 dark:hover:bg-slate-700',
+                )}
+              >
+                <Search size={14} className="shrink-0 text-slate-400" />
+                <div className="flex-1 min-w-0">
+                  <span className="truncate font-medium block">{highlightMatch(s.title, local)}</span>
+                </div>
+                <span className="ml-auto shrink-0 truncate max-w-[150px] text-xs text-slate-400">{s.author}</span>
+                {idx === selectedIdx && <ArrowRight size={12} className="shrink-0 text-primary-400" />}
+              </li>
+            ))}
+          </ul>
           {local.length >= 2 && (
             <div className="border-t border-slate-100 px-3 py-2 text-[11px] text-slate-400 dark:border-slate-700">
               Press <kbd className="rounded border border-slate-200 px-1 text-[10px] dark:border-slate-600">Enter</kbd> to search

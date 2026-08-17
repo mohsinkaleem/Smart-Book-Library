@@ -11,11 +11,37 @@ interface SidebarProps {
   searchQuery?: string;
 }
 
+/**
+ * "en" → "English".
+ *
+ * The server hands back ISO-639-1 codes (plus a single `unknown` bucket for
+ * the values that are not codes at all — the catalog holds `po`, `sp` and
+ * `ge`). `Intl.DisplayNames` is in every browser this app targets and knows
+ * all of them, so there is no name table to keep in sync here.
+ */
+const languageNames =
+  typeof Intl !== 'undefined' && 'DisplayNames' in Intl
+    ? new Intl.DisplayNames(['en'], { type: 'language' })
+    : null;
+
+function languageLabel(code: string): string {
+  if (!code || code === 'unknown') return 'Unknown';
+  try {
+    return languageNames?.of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
 function FilterSection({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="border-b border-slate-100 py-3 dark:border-slate-700/50">
-      <button onClick={() => setOpen(!open)} className="flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+      <button
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400"
+      >
         {title}
         {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
       </button>
@@ -24,13 +50,16 @@ function FilterSection({ title, children, defaultOpen = true }: { title: string;
   );
 }
 
-function FilterRadio({ label, value: _value, selected, count, onChange }: {
-  label: string; value: string; selected: boolean; count?: number; onChange: () => void;
+function FilterRadio({ label, selected, count, onChange }: {
+  label: string; selected: boolean; count?: number; onChange: () => void;
 }) {
   const isEmpty = count === 0;
   return (
     <button
       onClick={onChange}
+      // These are toggles rendered as buttons; without this a screen reader
+      // cannot tell an applied filter from an unapplied one.
+      aria-pressed={selected}
       className={clsx(
         'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors',
         selected
@@ -88,10 +117,10 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* Categories */}
       <FilterSection title="Categories">
-        <FilterRadio label="All" value="" selected={!filters.category} onChange={() => onFilterChange('category', '')} />
+        <FilterRadio label="All" selected={!filters.category} onChange={() => onFilterChange('category', '')} />
         {facets?.categories.slice(0, 15).map((c) => (
           <FilterRadio
-            key={c.name} label={c.name} value={c.name} count={c.count}
+            key={c.name} label={c.name} count={c.count}
             selected={filters.category === c.name}
             onChange={() => onFilterChange('category', filters.category === c.name ? '' : c.name)}
           />
@@ -100,10 +129,10 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* File Type */}
       <FilterSection title="File Type">
-        <FilterRadio label="All" value="" selected={!filters.file_type} onChange={() => onFilterChange('file_type', '')} />
+        <FilterRadio label="All" selected={!filters.file_type} onChange={() => onFilterChange('file_type', '')} />
         {facets?.file_types.map((ft) => (
           <FilterRadio
-            key={ft.name} label={ft.name.toUpperCase()} value={ft.name} count={ft.count}
+            key={ft.name} label={ft.name.toUpperCase()} count={ft.count}
             selected={filters.file_type === ft.name}
             onChange={() => onFilterChange('file_type', filters.file_type === ft.name ? '' : ft.name)}
           />
@@ -112,10 +141,10 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* Reading Status */}
       <FilterSection title="Status" defaultOpen={false}>
-        <FilterRadio label="All" value="" selected={!filters.reading_status} onChange={() => onFilterChange('reading_status', '')} />
+        <FilterRadio label="All" selected={!filters.reading_status} onChange={() => onFilterChange('reading_status', '')} />
         {facets?.reading_statuses.map((rs) => (
           <FilterRadio
-            key={rs.name} label={rs.name.replace('_', ' ')} value={rs.name} count={rs.count}
+            key={rs.name} label={rs.name.replace('_', ' ')} count={rs.count}
             selected={filters.reading_status === rs.name}
             onChange={() => onFilterChange('reading_status', filters.reading_status === rs.name ? '' : rs.name)}
           />
@@ -124,10 +153,10 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* Language */}
       <FilterSection title="Language" defaultOpen={false}>
-        <FilterRadio label="All" value="" selected={!filters.language} onChange={() => onFilterChange('language', '')} />
+        <FilterRadio label="All" selected={!filters.language} onChange={() => onFilterChange('language', '')} />
         {facets?.languages.slice(0, 10).map((l) => (
           <FilterRadio
-            key={l.name} label={l.name || 'Unknown'} value={l.name} count={l.count}
+            key={l.name} label={languageLabel(l.name)} count={l.count}
             selected={filters.language === l.name}
             onChange={() => onFilterChange('language', filters.language === l.name ? '' : l.name)}
           />
@@ -137,17 +166,17 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
       {/* Quick filters */}
       <FilterSection title="Quick Filters">
         <FilterRadio
-          label="Favorites" value="fav"
+          label="Favorites"
           selected={filters.favorite === 'true'}
           onChange={() => onFilterChange('favorite', filters.favorite === 'true' ? '' : 'true')}
         />
         <FilterRadio
-          label="Has Cover" value="cover"
+          label="Has Cover"
           selected={filters.has_cover === 'true'}
           onChange={() => onFilterChange('has_cover', filters.has_cover === 'true' ? '' : 'true')}
         />
         <FilterRadio
-          label="Has Description" value="desc"
+          label="Has Description"
           selected={filters.has_description === 'true'}
           onChange={() => onFilterChange('has_description', filters.has_description === 'true' ? '' : 'true')}
         />
@@ -155,10 +184,10 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* Themes */}
       <FilterSection title="Themes" defaultOpen={false}>
-        <FilterRadio label="All" value="" selected={!filters.theme} onChange={() => onFilterChange('theme', '')} />
+        <FilterRadio label="All" selected={!filters.theme} onChange={() => onFilterChange('theme', '')} />
         {facets?.themes.slice(0, 12).map((t) => (
           <FilterRadio
-            key={t.name} label={t.name} value={t.name} count={t.count}
+            key={t.name} label={t.name} count={t.count}
             selected={filters.theme === t.name}
             onChange={() => onFilterChange('theme', filters.theme === t.name ? '' : t.name)}
           />
@@ -172,7 +201,6 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
             <input
               type="number"
               placeholder={String(facets.years.min)}
-              value={filters.year_min || ''}
               onChange={(e) => onFilterChange('year_min', e.target.value)}
               className="w-20 rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs dark:border-slate-600 dark:bg-slate-700"
             />
@@ -180,7 +208,6 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
             <input
               type="number"
               placeholder={String(facets.years.max)}
-              value={filters.year_max || ''}
               onChange={(e) => onFilterChange('year_max', e.target.value)}
               className="w-20 rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs dark:border-slate-600 dark:bg-slate-700"
             />

@@ -141,23 +141,26 @@ def run_embedding_generation(db, similarity_engine):
 
             task_tracker.start_task("embeddings", message="Generating embeddings...")
             store = CatalogStore()
-            records = store.all_records()
-            task_tracker.update_progress("embeddings", 0, "Loading model...", total=len(records))
+            try:
+                records = store.all_records()
+                task_tracker.update_progress("embeddings", 0, "Loading model...", total=len(records))
 
-            count = 0
-            for i, record in enumerate(records):
-                if not store.has_embedding(record.id):
-                    generate_embeddings(record)
-                    if record.embedding or record.metadata_embedding:
-                        content = (np.array(record.embedding, dtype=np.float32).tobytes()
-                                   if record.embedding else None)
-                        meta = (np.array(record.metadata_embedding, dtype=np.float32).tobytes()
-                                if record.metadata_embedding else None)
-                        store.store_embedding(record.id, content, meta)
-                        count += 1
-                task_tracker.update_progress(
-                    "embeddings", i + 1, f"Processing {i + 1}/{len(records)}"
-                )
+                count = 0
+                for i, record in enumerate(records):
+                    if not store.has_embedding(record.id):
+                        generate_embeddings(record)
+                        if record.embedding or record.metadata_embedding:
+                            content = (np.array(record.embedding, dtype=np.float32).tobytes()
+                                       if record.embedding else None)
+                            meta = (np.array(record.metadata_embedding, dtype=np.float32).tobytes()
+                                    if record.metadata_embedding else None)
+                            store.store_embedding(record.id, content, meta)
+                            count += 1
+                    task_tracker.update_progress(
+                        "embeddings", i + 1, f"Processing {i + 1}/{len(records)}"
+                    )
+            finally:
+                store.close()
 
             similarity_engine.load_embeddings()
             task_tracker.complete_task("embeddings", f"Generated {count} new embeddings")

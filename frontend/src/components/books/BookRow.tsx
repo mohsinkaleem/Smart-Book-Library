@@ -3,6 +3,7 @@ import type { Book } from '../../api/types';
 import { BookCover } from './BookCover';
 import { Rating } from '../common/Rating';
 import { Badge } from '../common/Badge';
+import { SnippetText } from '../search/SnippetText';
 import { formatBytes } from '../../utils/format';
 
 interface BookRowProps {
@@ -25,6 +26,7 @@ export function BookRow({ book }: BookRowProps) {
       <BookCover coverUrl={book.cover_url} title={book.title} fileType={book.file_type} className="h-10 w-8 shrink-0" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-slate-900 dark:text-white">{book.title || 'Untitled'}</p>
+        {book.snippet && <SnippetText snippet={book.snippet} className="line-clamp-1" />}
       </div>
       <div className="hidden w-40 truncate text-sm text-slate-600 dark:text-slate-400 md:block">
         {book.author_primary || 'Unknown'}
@@ -36,7 +38,12 @@ export function BookRow({ book }: BookRowProps) {
       <div className="hidden w-16 text-center text-xs text-slate-500 lg:block">{book.page_count || '—'}</div>
       <div className="hidden w-16 text-center text-xs font-medium uppercase text-slate-500 lg:block">{book.file_type}</div>
       <div className="w-20"><Rating value={book.user_rating} size={12} readonly /></div>
-      <div className="hidden w-20 text-xs text-slate-500 xl:block">{statusLabel[book.reading_status]}</div>
+      <div className="hidden w-20 text-xs text-slate-500 xl:block">
+        {statusLabel[book.reading_status]}
+        {book.progress_percent > 0 && book.reading_status !== 'finished' && (
+          <span className="ml-1 tabular-nums text-slate-400">{Math.round(book.progress_percent)}%</span>
+        )}
+      </div>
       <div className="hidden w-16 text-right text-xs text-slate-400 xl:block">{formatBytes(book.size)}</div>
     </Link>
   );

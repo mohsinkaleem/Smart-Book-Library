@@ -3,7 +3,9 @@ import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, ZoomIn, ZoomOut, BookOpen, Info, Copy, Check, ChevronRight } from 'lucide-react';
 import { useBook, useBookText, useCompare } from '../../api/books';
 import { Spinner } from '../common/Spinner';
+import { ErrorState } from '../common/ErrorBoundary';
 import { LLMPanel } from './LLMPanel';
+import { SimilarPassages } from './SimilarPassages';
 import type { CompareMatch } from '../../api/types';
 
 function formatTextToParagraphs(text: string): string[] {
@@ -16,38 +18,41 @@ function formatTextToParagraphs(text: string): string[] {
 export function ReadingView() {
   const { id } = useParams<{ id: string }>();
   const { data: book } = useBook(id || '');
-  const { data: textData, isLoading } = useBookText(id || '');
+  const { data: textData, isLoading, isError, error, refetch } = useBookText(id || '');
   const [fontSize, setFontSize] = useState(16);
   const [selectedText, setSelectedText] = useState('');
   const [showPanel, setShowPanel] = useState(false);
   const [copied, setCopied] = useState(false);
-  const compareMutation = useCompare();
+  const { mutate: compare } = useCompare();
   const [matches, setMatches] = useState<CompareMatch[]>([]);
 
-  const paragraphs = useMemo(() => {
-    if (!textData?.text) return [];
-    return formatTextToParagraphs(textData.text);
-  }, [textData?.text]);
+  const bookText = textData?.text;
+  const paragraphs = useMemo(
+    () => (bookText ? formatTextToParagraphs(bookText) : []),
+    [bookText],
+  );
 
   const handleTextSelect = useCallback(() => {
     const sel = window.getSelection()?.toString().trim();
     if (sel && sel.length > 10) {
       setSelectedText(sel);
       setShowPanel(true);
-      compareMutation.mutate(
+      // `mutate` is stable; the mutation *object* is a new identity every
+      // render, which is what made the old dependency list churn.
+      compare(
         { text: sel, book_id: id, limit: 5 },
         { onSuccess: (data) => setMatches(data.matches) },
       );
     }
-  }, [id, compareMutation]);
+  }, [id, compare]);
 
   const handleCopyText = useCallback(async () => {
-    if (textData?.text) {
-      await navigator.clipboard.writeText(textData.text);
+    if (bookText) {
+      await navigator.clipboard.writeText(bookText);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
-  }, [textData?.text]);
+  }, [bookText]);
 
   if (isLoading) {
     return (
@@ -57,6 +62,18 @@ export function ReadingView() {
           <p className="mt-3 text-sm text-slate-500">Loading text...</p>
         </div>
       </div>
+    );
+  }
+
+  // A server error used to fall through to "No Text Available", blaming the
+  // book for a failed request.
+  if (isError) {
+    return (
+      <ErrorState
+        title="Couldn't load the text"
+        message={(error as Error)?.message}
+        onRetry={() => refetch()}
+      />
     );
   }
 
@@ -208,34 +225,9 @@ export function ReadingView() {
               </div>
             )}
 
-            {matches.length > 0 && (
-              <div className="mb-4">
-                <h4 className="mb-2 text-xs font-semibold text-slate-500">Similar in Other Books</h4>
-                <div className="space-y-2">
-                  {matches.map((m) => (
-                    <Link
-                      key={m.book_id}
-                      to={`/books/${m.book_id}`}
-                      className="block rounded-lg bg-white p-3 text-xs shadow-sm ring-1 ring-slate-100 transition-shadow hover:shadow dark:bg-slate-700 dark:ring-slate-600"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="rounded bg-primary-100 px-1.5 py-0.5 font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300">
-                          {m.similarity}%
-                        </span>
-                        <span className="truncate font-medium text-slate-700 dark:text-slate-300">
-                          {m.title}
-                        </span>
-                      </div>
-                      {m.excerpt && (
-                        <p className="mt-1.5 line-clamp-2 text-slate-500 dark:text-slate-400">
-                          {m.excerpt}
-                        </p>
-                      )}
-                    </Link>
-                  ))}
-                </div>
-              </div>
-            )}
+            <div className="mb-4">
+              <SimilarPassages matches={matches} />
+            </div>
 
             <LLMPanel selectedText={selectedText} bookId={id || ''} bookTitle={textData.title} />
           </div>

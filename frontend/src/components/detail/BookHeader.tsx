@@ -2,6 +2,7 @@ import type { Book } from '../../api/types';
 import { BookCover } from '../books/BookCover';
 import { Rating } from '../common/Rating';
 import { Badge } from '../common/Badge';
+import { ProgressBar } from '../common/ProgressBar';
 import { Heart } from 'lucide-react';
 import { formatBytes, formatDate } from '../../utils/format';
 import clsx from 'clsx';
@@ -58,6 +59,7 @@ export function BookHeader({ book, onRate, onFavorite, onStatusChange }: BookHea
           <select
             value={book.reading_status}
             onChange={(e) => onStatusChange(e.target.value)}
+            aria-label="Reading status"
             className="rounded-lg border-0 bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 ring-1 ring-inset ring-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:ring-slate-600"
           >
             {statusOptions.map((o) => (
@@ -65,6 +67,22 @@ export function BookHeader({ book, onRate, onFavorite, onStatusChange }: BookHea
             ))}
           </select>
         </div>
+
+        {/* Reading progress. Written by the readers, which until now never
+            touched `progress_percent` or `last_opened`. */}
+        {book.progress_percent > 0 && (
+          <div className="flex max-w-sm items-center gap-3">
+            <ProgressBar percent={book.progress_percent} className="h-1.5" />
+            <span className="shrink-0 text-xs tabular-nums text-slate-500">
+              {Math.round(book.progress_percent)}%
+            </span>
+            {book.last_opened && (
+              <span className="shrink-0 text-xs text-slate-400">
+                opened {formatDate(book.last_opened)}
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Metadata grid */}
         <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm md:grid-cols-3">

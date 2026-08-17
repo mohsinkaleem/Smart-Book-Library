@@ -106,6 +106,9 @@ class BookRecord:
     last_opened: Optional[str] = None
     reading_status: str = "not_started"
     progress_percent: float = 0.0
+    # Opaque resume token written by whichever reader opened the book: an EPUB
+    # CFI, or a PDF page number as a string.
+    reader_position: str = ""
     user_rating: Optional[float] = None
     user_tags: list = field(default_factory=list)
     favorite: bool = False

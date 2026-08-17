@@ -11,12 +11,13 @@ export const SHORTCUTS: ShortcutDef[] = [
   { key: '/', label: 'Focus search', category: 'Navigation' },
   { key: 'g h', label: 'Go to Home', category: 'Navigation' },
   { key: 'g s', label: 'Go to Stats', category: 'Navigation' },
+  { key: 'g r', label: 'Go to Review queue', category: 'Navigation' },
   { key: 'g p', label: 'Go to Settings', category: 'Navigation' },
   { key: 'Escape', label: 'Go back / close', category: 'Navigation' },
   { key: '1', label: 'Grid view', category: 'View' },
   { key: '2', label: 'List view', category: 'View' },
   { key: 't', label: 'Toggle sidebar', category: 'View' },
-  { key: 'd', label: 'Toggle dark/light mode', category: 'View' },
+  { key: 'd', label: 'Cycle theme (light / dark / paper / dim)', category: 'View' },
   { key: 'j', label: 'Next page', category: 'Pagination' },
   { key: 'k', label: 'Previous page', category: 'Pagination' },
   { key: '?', label: 'Show keyboard shortcuts', category: 'Help' },
@@ -25,18 +26,22 @@ export const SHORTCUTS: ShortcutDef[] = [
 interface ShortcutHandlers {
   onToggleView?: (v: 'grid' | 'list') => void;
   onToggleSidebar?: () => void;
-  onToggleDark?: () => void;
+  onCycleTheme?: () => void;
   onShowHelp?: () => void;
   onNextPage?: () => void;
   onPrevPage?: () => void;
   currentView?: 'grid' | 'list';
+  /** Off inside the readers, which bind the same keys themselves. */
+  enabled?: boolean;
 }
 
 export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
   const navigate = useNavigate();
   const location = useLocation();
+  const enabled = handlers.enabled !== false;
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (handlers.enabled === false) return;
     const target = e.target as HTMLElement;
     const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable;
     
@@ -64,10 +69,10 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
       return;
     }
 
-    // d — toggle dark mode
+    // d — step to the next theme
     if (e.key === 'd' && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
-      handlers.onToggleDark?.();
+      handlers.onCycleTheme?.();
       return;
     }
 
@@ -103,8 +108,9 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
     }
   }, [handlers, navigate, location.pathname]);
 
-  // Handle "g" prefix shortcuts (g+h, g+s, g+p)
+  // Handle "g" prefix shortcuts (g+h, g+s, g+p, g+r)
   useEffect(() => {
+    if (!enabled) return;
     let gPressed = false;
     let gTimer: ReturnType<typeof setTimeout>;
 
@@ -125,6 +131,7 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
         if (e.key === 'h') { e.preventDefault(); navigate('/'); }
         if (e.key === 's') { e.preventDefault(); navigate('/stats'); }
         if (e.key === 'p') { e.preventDefault(); navigate('/settings'); }
+        if (e.key === 'r') { e.preventDefault(); navigate('/review'); }
       }
     };
 
@@ -133,10 +140,11 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
       window.removeEventListener('keydown', handler);
       clearTimeout(gTimer);
     };
-  }, [navigate]);
+  }, [navigate, enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleKeyDown]);
+  }, [handleKeyDown, enabled]);
 }

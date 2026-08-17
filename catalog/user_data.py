@@ -17,8 +17,8 @@ from datetime import datetime
 from typing import Any, Optional
 
 USER_FIELDS = {
-    "reading_status", "progress_percent", "user_rating", "user_tags",
-    "favorite", "last_opened",
+    "reading_status", "progress_percent", "reader_position", "user_rating",
+    "user_tags", "favorite", "last_opened",
 }
 
 # Fields a human is allowed to pin. Pinning writes `source: "user"`,

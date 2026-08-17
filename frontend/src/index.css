@@ -17,14 +17,110 @@
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 
+/* ==========================================================================
+   THEMES
+
+   Four themes, no per-component work. Components keep saying `bg-white`,
+   `bg-slate-800`, `text-slate-500`; a theme only redefines what those names
+   resolve to. Tailwind v4 compiles `bg-slate-800` to
+   `background-color: var(--color-slate-800)`, so overriding the variable
+   retints every use of it at once.
+
+   `light` and `dark` are the stock Tailwind ramps and need no block here —
+   `light` is the base, and `dark` is reached through the `.dark` class the
+   `dark:` variant already keys on.
+
+   The two new ones each retint one *end* of the ramp:
+
+   - `paper` is a light-family theme (no `.dark`), so it moves the light end —
+     50 through 300 plus `white` — to warm parchment, and darkens 500 through
+     900 into warm ink for text.
+   - `dim` is a dark-family theme (`.dark` is applied), so it moves the dark
+     end — 700 through 950 plus `white` — to a desaturated blue-grey that
+     halates far less than near-black behind white text.
+
+   Both keep the *direction* of the primary ramp (50 light → 900 dark). Dark
+   mode uses `dark:bg-primary-900/30` as a tint behind `dark:text-primary-300`,
+   so inverting it would light the pill up instead of the text.
+
+   These blocks are deliberately unlayered: Tailwind emits its own variables
+   inside `@layer theme`, and unlayered declarations win over any layer
+   regardless of specificity.
+   ========================================================================== */
+
+[data-theme="paper"] {
+  color-scheme: light;
+
+  --color-white: #fdfaf3;
+  --color-slate-50: #f5eddc;
+  --color-slate-100: #ece1c9;
+  --color-slate-200: #dccfb2;
+  --color-slate-300: #c4b493;
+  --color-slate-400: #8a7b5f;
+  --color-slate-500: #6f6350;
+  --color-slate-600: #574d3e;
+  --color-slate-700: #43392d;
+  --color-slate-800: #33291f;
+  --color-slate-900: #292118;
+  --color-slate-950: #1b160f;
+
+  /* Indigo on parchment reads as a mistake; the accent goes warm too. */
+  --color-primary-50: #fbf1e4;
+  --color-primary-100: #f5e0c8;
+  --color-primary-200: #eac59a;
+  --color-primary-300: #dda56c;
+  --color-primary-400: #c9854a;
+  --color-primary-500: #b26a33;
+  --color-primary-600: #99552a;
+  --color-primary-700: #7c4423;
+  --color-primary-800: #5f341c;
+  --color-primary-900: #452615;
+}
+
+[data-theme="dim"] {
+  color-scheme: dark;
+
+  /* Headings use `dark:text-white`; pure white on a dark ground is the main
+     source of halation at night, so "white" is an off-white here. */
+  --color-white: #e6edf3;
+  --color-slate-50: #e6edf3;
+  --color-slate-100: #d5e0eb;
+  --color-slate-200: #c6d2de;
+  --color-slate-300: #b3c0cc;
+  --color-slate-400: #9aa7b4;
+  --color-slate-500: #7a8794;
+  --color-slate-600: #444c56;
+  --color-slate-700: #30363d;
+  --color-slate-800: #22272e;
+  --color-slate-900: #1a1f26;
+  --color-slate-950: #12161c;
+
+  --color-primary-50: #eaf3ff;
+  --color-primary-100: #d3e6ff;
+  --color-primary-200: #aed1ff;
+  --color-primary-300: #86b9f5;
+  --color-primary-400: #6cb6ff;
+  --color-primary-500: #4c9de8;
+  --color-primary-600: #3b82c7;
+  --color-primary-700: #2f6aa3;
+  --color-primary-800: #24507c;
+  --color-primary-900: #1b3c5e;
+}
+
 body {
   @apply bg-slate-50 text-slate-900 antialiased dark:bg-slate-900 dark:text-slate-100;
   font-family: var(--font-sans);
 }
 
-/* Smooth transitions for theme toggle */
+/* Smooth transitions for theme changes */
 body, header, aside, main {
   transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body, header, aside, main {
+    transition: none;
+  }
 }
 
 /* Scrollbar */
@@ -47,23 +143,19 @@ body, header, aside, main {
   @apply outline-2 outline-offset-2 outline-primary-500;
 }
 
-/* Skeleton loading animation */
-@keyframes shimmer {
-  0% { background-position: -200px 0; }
-  100% { background-position: calc(200px + 100%) 0; }
+/* react-reader renders into its own DOM and paints its own white/dark; point
+   it at the theme variables so all four themes reach inside the reader. */
+.ReactReader .readerArea {
+  background: var(--color-white) !important;
 }
-.skeleton {
-  background: linear-gradient(90deg, transparent 0%, rgba(148, 163, 184, 0.15) 50%, transparent 100%);
-  background-size: 200px 100%;
-  animation: shimmer 1.5s infinite;
+.ReactReader .tocArea {
+  background: var(--color-slate-50) !important;
 }
-
-/* Override react-reader defaults for dark mode */
 .dark .ReactReader .readerArea {
-  background: #0f172a !important;
+  background: var(--color-slate-900) !important;
 }
 .dark .ReactReader .tocArea {
-  background: #1e293b !important;
+  background: var(--color-slate-800) !important;
 }
 
 /* react-pdf page styling */
@@ -75,7 +167,7 @@ body, header, aside, main {
   user-select: text !important;
 }
 .react-pdf__Page__textContent span::selection {
-  background: rgba(99, 102, 241, 0.3);
+  background: color-mix(in srgb, var(--color-primary-500) 35%, transparent);
 }
 .react-pdf__Page__annotations {
   pointer-events: auto;

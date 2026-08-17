@@ -15,8 +15,3 @@ export function formatDate(iso: string | null): string {
     });
   } catch { return iso; }
 }
-
-export function truncate(str: string, len: number): string {
-  if (!str) return '';
-  return str.length > len ? str.slice(0, len) + '...' : str;
-}
