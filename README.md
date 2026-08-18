@@ -413,8 +413,9 @@ Three tables hold book data:
 - `books` — everything the pipeline produces, including `field_sources` (per-field source
   and confidence), `match_score`, `needs_review` and `stage_versions`
 - `user_data` — ratings, tags, favourites, reading progress, reader position and pinned
-  corrections. The pipeline never writes these columns, so a run (or a full rebuild)
-  cannot destroy them
+  corrections. The pipeline does not write these columns, so a run (or a full rebuild)
+  cannot destroy them. One declared exception: the opt-in reading-progress stage may
+  *advance* `last_opened` when the filesystem reports a newer open, never move it back
 - `embeddings` — content and metadata vectors
 
 To inspect the database:

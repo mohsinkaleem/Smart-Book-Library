@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -179,6 +180,67 @@ class TestStoreUserData(StageTestCase):
         self.store.upsert(enriched_record())
         for query in ('title:"', "AND", "*", "verified OR"):
             self.store.search(query)   # must not raise
+
+
+class TestReadingProgressIsMonotonic(StageTestCase):
+    """
+    `last_opened` is user-owned: the reader writes it on every open, while
+    Spotlight only knows when the *file* was last opened on disk. The stage
+    used to write the filesystem hint unconditionally, walking real reading
+    history backwards.
+    """
+
+    APP_WROTE = "2026-08-18T13:45:00.000Z"      # what the reader stores
+    SPOTLIGHT_OLDER = "2026-08-01T09:00:00+00:00"
+    SPOTLIGHT_NEWER = "2026-08-19T09:00:00+00:00"
+
+    def setUp(self):
+        super().setUp()
+        self.record = enriched_record()
+        self.store.upsert(self.record)
+        self.book = self.dir / "book.pdf"
+        self.book.write_bytes(b"%PDF-1.4\n")
+
+    def run_stage(self, spotlight_says):
+        """Run the stage with the filesystem hint stubbed to a known value."""
+        import catalog.reading_tracker as tracker
+
+        pipe = self.pipeline(reading_progress=True)
+        pipe._touched = [self.record]
+        pipe.config.only = ["book.pdf"]          # narrowed, so `_touched` is the scope
+        with unittest.mock.patch.object(
+            tracker, "_get_last_opened_macos", return_value=spotlight_says
+        ), unittest.mock.patch.object(pipeline_mod, "PROJECT_ROOT", self.dir):
+            self.record.file_path = self.book.name
+            pipe._stage_reading_progress()
+        return self.store.user_field(self.record.id, "last_opened", self.record.file_path)
+
+    def test_an_older_filesystem_hint_never_overwrites_the_app(self):
+        self.store.update_user_fields(
+            self.record.id, {"last_opened": self.APP_WROTE}, self.record.file_path
+        )
+        self.assertEqual(self.run_stage(self.SPOTLIGHT_OLDER), self.APP_WROTE)
+
+    def test_a_newer_filesystem_hint_advances_it(self):
+        self.store.update_user_fields(
+            self.record.id, {"last_opened": self.APP_WROTE}, self.record.file_path
+        )
+        self.assertEqual(self.run_stage(self.SPOTLIGHT_NEWER), self.SPOTLIGHT_NEWER)
+
+    def test_it_fills_in_when_nothing_is_recorded_yet(self):
+        self.assertEqual(self.run_stage(self.SPOTLIGHT_OLDER), self.SPOTLIGHT_OLDER)
+
+    def test_a_fresh_in_memory_record_still_compares_against_user_data(self):
+        """
+        The record's own `last_opened` is empty for a record built this run —
+        the comparison has to go to `user_data`, or the guard reads as "nothing
+        recorded yet" and writes the older hint anyway.
+        """
+        self.store.update_user_fields(
+            self.record.id, {"last_opened": self.APP_WROTE}, self.record.file_path
+        )
+        self.record.last_opened = None
+        self.assertEqual(self.run_stage(self.SPOTLIGHT_OLDER), self.APP_WROTE)
 
 
 if __name__ == "__main__":

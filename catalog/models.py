@@ -39,6 +39,59 @@ def source_rank(source: str) -> int:
     return SOURCE_RANK.get(source, 0)
 
 
+# How much each identity-bearing field contributes to `identity_confidence`.
+# Renormalised over the fields actually present, so a record with no author is
+# not silently capped — the same trick `evidence.score_candidate` uses.
+IDENTITY_WEIGHTS = {"title": 0.5, "authors": 0.25, "isbn": 0.25}
+
+
+def _field(record, name):
+    """Read `name` off a BookRecord or off a plain row dict (the server's)."""
+    if isinstance(record, dict):
+        return record.get(name)
+    return getattr(record, name, None)
+
+
+def identity_confidence(record) -> float:
+    """
+    How sure we are about *which book this is* — from provenance alone.
+
+    `match_score` cannot answer this. It is the score of an *API candidate*, so
+    it is `None` for a record identified perfectly from its own embedded
+    metadata or from a validated ISBN in the file. Wherever "lowest confidence
+    first" was wanted, treating a missing score as -1 sorted exactly those
+    records below a 0.20 rubbish match.
+
+    Nothing is stored: this is computed from `field_sources`, which already
+    holds a per-field `{source, confidence}`. A rollup column would only drift
+    from it the moment a human pins a correction.
+
+    Accepts a `BookRecord` or a row dict; both expose the same field names.
+    """
+    if not _field(record, "title"):
+        return 0.0                     # "unknown" is a valid state, and it scores 0
+
+    sources = _field(record, "field_sources") or {}
+
+    def conf(name: str) -> float:
+        return float((sources.get(name) or {}).get("confidence") or 0.0)
+
+    parts = [(IDENTITY_WEIGHTS["title"], conf("title"))]
+    if _field(record, "authors"):
+        parts.append((IDENTITY_WEIGHTS["authors"], conf("authors")))
+    isbn = max(
+        conf("isbn_13") if _field(record, "isbn_13") else 0.0,
+        conf("isbn_10") if _field(record, "isbn_10") else 0.0,
+    )
+    if isbn:
+        parts.append((IDENTITY_WEIGHTS["isbn"], isbn))
+
+    total = sum(weight for weight, _ in parts)
+    if total <= 0:
+        return 0.0
+    return round(sum(weight * value for weight, value in parts) / total, 3)
+
+
 @dataclass
 class BookRecord:
     """Complete book record matching the catalog schema."""
@@ -168,6 +221,10 @@ class BookRecord:
 
     def field_confidence(self, name: str) -> float:
         return float((self.field_sources.get(name) or {}).get("confidence") or 0.0)
+
+    def identity_confidence(self) -> float:
+        """Confidence in *which book this is*, as opposed to how well described."""
+        return identity_confidence(self)
 
     def reset_field(self, name: str) -> bool:
         """

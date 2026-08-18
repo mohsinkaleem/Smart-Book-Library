@@ -239,6 +239,19 @@ class CatalogStore:
         with self._lock:
             return write_user_fields(self.conn, book_id, fields, file_path)
 
+    def user_field(self, book_id: str, name: str, file_path: str = None):
+        """
+        Read one user-owned value straight from `user_data`.
+
+        The mirrored copy on `books` can be stale for a record built fresh this
+        run, and `user_data` is the side that survives a full rebuild.
+        """
+        if name not in USER_COLUMNS:
+            raise KeyError(f"'{name}' is not a user-owned field")
+        with self._lock:
+            row = self._user_row(book_id, file_path)
+        return None if row is None else row[name]
+
     def pin_field(self, book_id: str, name: str, value, file_path: str = None) -> bool:
         """Pin a human correction so no future run can overwrite it."""
         from .user_data import pin_field

@@ -4,6 +4,11 @@ import { get, post } from './client';
 import type { Book, PaginatedResponse } from './types';
 
 export interface ReviewBook extends Book {
+  /** How sure we are *which book this is*, derived from `field_sources`.
+   *  Distinct from `match_score`, which only scores an API candidate and is
+   *  null for a record identified from the file's own metadata. Drives the
+   *  queue order. */
+  identity_confidence: number;
   match_score: number | null;
   review_reasons: string[];
   field_sources: Record<string, { source: string; confidence: number; at: string }>;

@@ -4,7 +4,7 @@ Catalog quality reporting.
 "You cannot improve accuracy you cannot measure — the fact that OpenLibrary
 contributed zero records for months is the proof." The old summary printed ten
 counters, all of them success counts. This adds per-field provenance, fill
-rates, the confidence distribution and the worst records by confidence.
+rates, the confidence distribution and the least certain identities.
 """
 import json
 from collections import Counter
@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional
 
 from .config import REPORT_FILE
+from .models import identity_confidence
 from .store import CatalogStore
 
 _TRACKED_FIELDS = [
@@ -50,10 +51,11 @@ def build_report(store: CatalogStore, stats: Optional[dict] = None) -> dict:
             buckets["<0.45"] += 1
 
     review = [r for r in records if r.needs_review]
-    worst = sorted(
-        review,
-        key=lambda r: (r.match_score if r.match_score is not None else -1.0),
-    )[:25]
+    # Ranked by identity confidence, not `match_score`. A record with no API
+    # match has `match_score is None`, and sorting that as -1 put an EPUB
+    # identified perfectly from its own `dc:` metadata at the very top of the
+    # "worst" list, below a 0.20 rubbish match.
+    worst = sorted(review, key=identity_confidence)[:25]
 
     categories = Counter()
     for record in records:
@@ -79,6 +81,7 @@ def build_report(store: CatalogStore, stats: Optional[dict] = None) -> dict:
             {
                 "file_name": r.file_name,
                 "title": r.title,
+                "identity_confidence": identity_confidence(r),
                 "match_score": r.match_score,
                 "reasons": r.review_reasons,
                 "title_source": r.field_source("title"),
@@ -122,11 +125,15 @@ def print_report(report: dict):
         print(f"    {bucket:<12} {count}")
 
     if report["worst_records"]:
-        print("\n  Lowest-confidence records (review these first):")
+        print("\n  Least certain identities (review these first):")
+        print("    identity = how sure we are which book this is; "
+              "match = the API candidate's score")
         for item in report["worst_records"][:15]:
-            score = "—" if item["match_score"] is None else f"{item['match_score']:.2f}"
-            reason = (item["reasons"] or [""])[0][:60]
-            print(f"    [{score:>4}] {item['file_name'][:44]:<44} {reason}")
+            identity = item.get("identity_confidence") or 0.0
+            match = "—" if item["match_score"] is None else f"{item['match_score']:.2f}"
+            reason = (item["reasons"] or [""])[0][:52]
+            print(f"    [id {identity:.2f} | match {match:>4}] "
+                  f"{item['file_name'][:38]:<38} {reason}")
 
     metrics = (report.get("run_stats") or {}).get("provider_metrics") or {}
     if metrics:

@@ -6,6 +6,11 @@ Derives a last-opened timestamp from filesystem hints (macOS Spotlight
 a reading status: opening a file in Preview to check the cover is not the same
 as starting to read it, and guessing here used to overwrite what the user had
 set in the UI.
+
+`last_opened` is user-owned — the reader writes it every time a book is opened
+in the app. Spotlight only knows when the *file* was last opened on disk, which
+is usually older, so the hint may only ever move the timestamp **forward**.
+Writing it unconditionally silently walked real reading history backwards.
 """
 import logging
 import subprocess
@@ -19,19 +24,63 @@ from .models import BookRecord
 logger = logging.getLogger(__name__)
 
 
-def update_reading_progress(record: BookRecord, file_path: Path = None) -> BookRecord:
-    """Record when the file was last opened, if the filesystem knows."""
+def update_reading_progress(
+    record: BookRecord,
+    file_path: Path = None,
+    known_last_opened: Optional[str] = None,
+) -> BookRecord:
+    """
+    Advance `last_opened` if the filesystem knows of a *newer* open.
+
+    `known_last_opened` is the authoritative stored value, when the caller has
+    it; otherwise whatever the record carries is used as the baseline.
+    """
     if file_path is None:
         file_path = PROJECT_ROOT / record.file_path
 
     if not file_path.exists():
         return record
 
-    last_opened = _get_last_opened_macos(file_path)
-    if last_opened:
-        record.last_opened = last_opened
+    current = known_last_opened if known_last_opened is not None else record.last_opened
+    hint = _get_last_opened_macos(file_path)
+    if hint and is_newer(hint, current):
+        record.last_opened = hint
 
     return record
+
+
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """
+    Parse a stored timestamp into an aware datetime.
+
+    Three writers, three shapes: the web reader sends `...Z` from
+    `Date.toISOString()`, Spotlight yields `+00:00`, and the atime fallback is
+    naive local time. Comparing those as strings gets the ordering wrong, which
+    is the whole point of the comparison.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed.astimezone() if parsed.tzinfo is None else parsed
+
+
+def is_newer(candidate: Optional[str], current: Optional[str]) -> bool:
+    """True when `candidate` is a strictly later timestamp than `current`."""
+    if not candidate:
+        return False
+    existing = _parse_timestamp(current)
+    if existing is None:
+        return True                      # nothing recorded yet: anything is news
+    incoming = _parse_timestamp(candidate)
+    if incoming is None:
+        return False                     # unparseable hint never displaces a real value
+    return incoming > existing
 
 
 def _get_last_opened_macos(file_path: Path) -> Optional[str]:

@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from catalog.fts import fts_query  # noqa: E402
 from catalog.languages import UNKNOWN as LANG_UNKNOWN  # noqa: E402
 from catalog.languages import normalise_language  # noqa: E402
+from catalog.models import identity_confidence as _identity_confidence  # noqa: E402
 from catalog.schema import PIPELINE_COLUMNS, ensure_schema  # noqa: E402
 from catalog.user_data import clear_review as _clear_review  # noqa: E402
 from catalog.user_data import pin_field as _pin_field  # noqa: E402
@@ -55,6 +56,16 @@ MATCHING_ROWIDS_SQL = (
     "SELECT rowid FROM books_fts WHERE books_fts MATCH ? "
     "UNION SELECT rowid FROM book_text_fts WHERE book_text_fts MATCH ?"
 )
+
+def _parse_field_sources(val: Any) -> dict:
+    """Provenance is an object, not an array — and never `None`."""
+    if isinstance(val, dict):
+        return val
+    try:
+        return json.loads(val or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
 
 def _json_field(val: Any) -> str:
     """Convert a list/dict to JSON string for storage."""
@@ -187,10 +198,7 @@ class BookDatabase:
                 d[field] = _parse_json_field(d.get(field))
         # Provenance is an object, not an array.
         if "field_sources" in d:
-            try:
-                d["field_sources"] = json.loads(d.get("field_sources") or "{}")
-            except (json.JSONDecodeError, TypeError):
-                d["field_sources"] = {}
+            d["field_sources"] = _parse_field_sources(d.get("field_sources"))
         # Convert int booleans
         d["has_text"] = bool(d.get("has_text", 1))
         d["ocr_required"] = bool(d.get("ocr_required", 0))
@@ -201,6 +209,9 @@ class BookDatabase:
         d["has_description"] = bool(d.get("description"))
         d["title_source"] = (d.get("field_sources") or {}).get("title", {}).get("source", "")
         d["title_verified"] = d["title_source"] in ("user", "isbn_match", "api_verified")
+        # How sure we are *which book this is*, as opposed to how well it is
+        # described. Derived, never stored — see `catalog.models`.
+        d["identity_confidence"] = _identity_confidence(d)
         # Cover URL
         if d.get("cover_path"):
             cover_name = Path(d["cover_path"]).name
@@ -381,20 +392,55 @@ class BookDatabase:
     # ── Review queue (M2) ────────────────────────────────────────────────
 
     def get_review_queue(self, page: int = 1, per_page: int = 25) -> dict:
-        """Records the verification gate could not confirm, worst first."""
-        total = self.query_one(
-            "SELECT COUNT(*) AS cnt FROM books WHERE needs_review = 1 AND status != 'missing'"
-        )["cnt"]
-        offset = (page - 1) * per_page
-        rows = self.query(
-            """SELECT * FROM books
-               WHERE needs_review = 1 AND status != 'missing'
-               ORDER BY match_score IS NULL DESC, match_score ASC, file_name
-               LIMIT ? OFFSET ?""",
-            (per_page, offset),
+        """
+        Records the verification gate could not confirm, least certain first.
+
+        Ordered by identity confidence, not `match_score`. A record with no API
+        match has a NULL score, so `ORDER BY match_score IS NULL DESC` put a
+        book identified perfectly from its own embedded metadata at the *head*
+        of the queue, ahead of genuinely doubtful matches.
+
+        The ordering is computed in Python from `field_sources` rather than
+        stored in a column, which would drift from the per-field provenance it
+        summarises. Only the ordering keys are read for the whole queue — a few
+        hundred rows — and the page itself is then fetched by id.
+        """
+        ranked = self.query(
+            """SELECT id, file_name, title, authors, isbn_13, isbn_10, field_sources
+               FROM books
+               WHERE needs_review = 1 AND status != 'missing'"""
         )
+        total = len(ranked)
+
+        def certainty(row: sqlite3.Row) -> tuple:
+            keys = {
+                "title": row["title"],
+                # `authors` is JSON in the row: the string "[]" is truthy, and
+                # would count as an author we do not have.
+                "authors": _parse_json_field(row["authors"]),
+                "isbn_13": row["isbn_13"],
+                "isbn_10": row["isbn_10"],
+                "field_sources": _parse_field_sources(row["field_sources"]),
+            }
+            return (_identity_confidence(keys), row["file_name"] or "")
+
+        ordered = sorted(ranked, key=certainty)
+        offset = (page - 1) * per_page
+        page_ids = [row["id"] for row in ordered[offset:offset + per_page]]
+
+        items: list[dict] = []
+        if page_ids:
+            placeholders = ",".join("?" * len(page_ids))
+            by_id = {
+                row["id"]: row
+                for row in self.query(
+                    f"SELECT * FROM books WHERE id IN ({placeholders})", page_ids
+                )
+            }
+            items = [self._row_to_dict(by_id[i]) for i in page_ids if i in by_id]
+
         return {
-            "items": [self._row_to_dict(r) for r in rows],
+            "items": items,
             "total": total,
             "page": page,
             "per_page": per_page,

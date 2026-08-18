@@ -652,7 +652,16 @@ class Pipeline:
         self.stats["stages_completed"].append("cover_scrape")
 
     def _stage_reading_progress(self):
-        """Filesystem-derived reading hints go to `user_data`, like the UI's."""
+        """
+        Filesystem-derived reading hints, advanced monotonically.
+
+        The one stage that touches a user-owned column, and the only one that
+        may: `last_opened` is written by the reader on every open, while
+        Spotlight only knows when the *file* was last opened on disk — usually
+        older. So the stored value is the baseline and the hint may only move
+        it forward. The comparison is against `user_data`, not the mirrored
+        copy on the record, which is empty for a record built fresh this run.
+        """
         from .reading_tracker import update_reading_progress
         logger.info("\n📖 TRACKING reading progress...")
         updated = 0
@@ -661,9 +670,12 @@ class Pipeline:
                 path = PROJECT_ROOT / record.file_path
                 if not path.exists():
                     continue
-                before = record.last_opened
-                update_reading_progress(record, path)
-                if record.last_opened != before:
+                before = self.store.user_field(
+                    record.id, "last_opened", record.file_path
+                ) or record.last_opened
+                record.last_opened = before
+                update_reading_progress(record, path, known_last_opened=before)
+                if record.last_opened and record.last_opened != before:
                     updated += 1
                     self.store.update_user_fields(
                         record.id,

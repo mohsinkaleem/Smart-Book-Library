@@ -22,7 +22,7 @@ from catalog.evidence import (  # noqa: E402
     collect_evidence,
     score_candidate,
 )
-from catalog.models import BookRecord  # noqa: E402
+from catalog.models import BookRecord, identity_confidence  # noqa: E402
 
 
 def evidence(title="", source="filename", authors=None, year=None, isbns=None):
@@ -188,6 +188,88 @@ class TestEvidenceCollection(unittest.TestCase):
         ev = collect_evidence(record)
         self.assertIn("9789004412866", ev.isbns)
         self.assertTrue(any("Ibn Taymiyya" in c.text for c in ev.titles))
+
+
+class TestIdentityConfidence(unittest.TestCase):
+    """
+    Identity confidence answers "which book is this?"; `match_score` only
+    scores an API candidate. Conflating them sorted a record identified
+    perfectly from its own embedded metadata — `match_score is None` — below a
+    rubbish 0.20 match wherever "least certain first" was wanted.
+    """
+
+    @staticmethod
+    def verified():
+        record = BookRecord()
+        record.set_field("title", "The Road To Mecca", "isbn_match", 1.0)
+        record.set_field("authors", ["Muhammad Asad"], "isbn_match", 1.0)
+        record.set_field("isbn_13", "9789839154078", "isbn_match", 1.0)
+        record.match_score = 1.0
+        return record
+
+    @staticmethod
+    def from_file_metadata():
+        """An EPUB with good `dc:` metadata that no provider ever matched."""
+        record = BookRecord()
+        record.set_field("title", "Understanding Salafism", "file_meta", 0.7)
+        record.set_field("authors", ["A Real Author"], "file_meta", 0.7)
+        record.set_field("isbn_13", "9780000000002", "file_meta", 0.9)
+        record.match_score = None
+        return record
+
+    @staticmethod
+    def filename_guess():
+        record = BookRecord()
+        record.set_field("title", "Some Book Name", "filename", 0.4)
+        record.match_score = None
+        return record
+
+    @staticmethod
+    def untitled():
+        record = BookRecord()
+        record.match_score = None
+        return record
+
+    def test_no_title_scores_zero(self):
+        self.assertEqual(0.0, identity_confidence(self.untitled()))
+
+    def test_a_verified_record_scores_top(self):
+        self.assertEqual(1.0, identity_confidence(self.verified()))
+
+    def test_file_metadata_beats_a_bare_filename(self):
+        self.assertGreater(
+            identity_confidence(self.from_file_metadata()),
+            identity_confidence(self.filename_guess()),
+        )
+
+    def test_a_human_pin_is_certain_without_author_or_isbn(self):
+        """Renormalised over the fields present, so a title-only record is not capped."""
+        record = BookRecord()
+        record.set_field("title", "The Catcher in the Rye", "user", 1.0)
+        self.assertEqual(1.0, identity_confidence(record))
+
+    def test_a_null_match_score_no_longer_sorts_as_the_worst_record(self):
+        records = [self.verified(), self.from_file_metadata(),
+                   self.filename_guess(), self.untitled()]
+
+        by_match = sorted(records, key=lambda r: r.match_score if r.match_score is not None else -1.0)
+        self.assertIs(by_match[0], records[1])          # the good EPUB, ranked worst
+
+        by_identity = sorted(records, key=identity_confidence)
+        self.assertIs(by_identity[0], records[3])       # no title at all
+        self.assertIs(by_identity[-1], records[0])      # the verified record
+
+    def test_it_reads_a_plain_row_dict_too(self):
+        """The server passes a row dict, not a BookRecord."""
+        record = self.verified()
+        row = {
+            "title": record.title,
+            "authors": record.authors,
+            "isbn_13": record.isbn_13,
+            "isbn_10": record.isbn_10,
+            "field_sources": record.field_sources,
+        }
+        self.assertEqual(identity_confidence(record), identity_confidence(row))
 
 
 if __name__ == "__main__":

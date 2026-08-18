@@ -11,13 +11,26 @@ import { useReviewQueue, usePinField, useResolveReview, type ReviewBook } from '
 import { Spinner } from '../components/common/Spinner';
 import { EmptyState } from '../components/common/EmptyState';
 
+const MUTED = 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200';
+
+function band(score: number): string {
+  if (score >= 0.75) return 'bg-emerald-100 text-emerald-800';
+  if (score >= 0.45) return 'bg-amber-100 text-amber-800';
+  return 'bg-rose-100 text-rose-800';
+}
+
+/** The API candidate's score. Null whenever no provider match was applied. */
 function scoreLabel(score: number | null): { text: string; className: string } {
   if (score === null || score === undefined) {
-    return { text: 'no match', className: 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200' };
+    return { text: 'no match', className: MUTED };
   }
-  if (score >= 0.75) return { text: score.toFixed(2), className: 'bg-emerald-100 text-emerald-800' };
-  if (score >= 0.45) return { text: score.toFixed(2), className: 'bg-amber-100 text-amber-800' };
-  return { text: score.toFixed(2), className: 'bg-rose-100 text-rose-800' };
+  return { text: `match ${score.toFixed(2)}`, className: band(score) };
+}
+
+/** Confidence in the *identity*, which is what the queue is ordered by. */
+function identityLabel(score: number | null | undefined): { text: string; className: string } {
+  const value = score ?? 0;
+  return { text: `identity ${value.toFixed(2)}`, className: band(value) };
 }
 
 function ReviewCard({ book }: { book: ReviewBook }) {
@@ -26,6 +39,7 @@ function ReviewCard({ book }: { book: ReviewBook }) {
   const pin = usePinField();
   const resolve = useResolveReview();
   const badge = scoreLabel(book.match_score);
+  const identity = identityLabel(book.identity_confidence);
   const titleSource = book.field_sources?.title?.source ?? 'none';
 
   const saveCorrections = async () => {
@@ -53,9 +67,20 @@ function ReviewCard({ book }: { book: ReviewBook }) {
             {book.file_type ? ` · ${book.file_type}` : ''}
           </p>
         </div>
-        <span className={`shrink-0 rounded px-2 py-0.5 text-xs font-medium ${badge.className}`}>
-          {badge.text}
-        </span>
+        <div className="flex shrink-0 gap-1.5">
+          <span
+            title="How sure we are which book this is, from the provenance of title, authors and ISBN. This is the queue's order."
+            className={`rounded px-2 py-0.5 text-xs font-medium ${identity.className}`}
+          >
+            {identity.text}
+          </span>
+          <span
+            title="Score of the best API candidate, if one was applied."
+            className={`rounded px-2 py-0.5 text-xs font-medium ${badge.className}`}
+          >
+            {badge.text}
+          </span>
+        </div>
       </div>
 
       <ul className="mb-3 space-y-1">
@@ -138,8 +163,8 @@ export function ReviewPage() {
       <header className="mb-4">
         <h1 className="text-xl font-bold text-slate-900 dark:text-white">Review queue</h1>
         <p className="text-sm text-slate-500 dark:text-slate-400">
-          {data.total} record(s) the verification gate could not confirm. Corrections are pinned
-          and survive future pipeline runs.
+          {data.total} record(s) the verification gate could not confirm, least certain identity
+          first. Corrections are pinned and survive future pipeline runs.
         </p>
       </header>
 

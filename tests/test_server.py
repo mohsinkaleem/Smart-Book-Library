@@ -366,3 +366,86 @@ def test_llm_status_reports_the_configured_model(client, monkeypatch):
     assert body["reason"] == "refused"
     assert body["model"] == llm.OLLAMA_MODEL
     assert body["base_url"] == llm.OLLAMA_BASE_URL
+
+
+# ── Review queue ordering ────────────────────────────────────────────────────
+
+@pytest.fixture
+def flagged_books(catalog_db):
+    """
+    Three flagged records whose `match_score` ordering disagrees with how
+    certain their identities actually are.
+    """
+    import json
+    import sqlite3
+
+    def sources(**fields):
+        return json.dumps({
+            name: {"source": src, "confidence": conf}
+            for name, (src, conf) in fields.items()
+        })
+
+    rows = [
+        # Perfect embedded metadata, no provider match: NULL score used to put
+        # this at the very head of the queue.
+        ("flag-file-meta", "Understanding Salafism", '["A Real Author"]', "9780000000002",
+         None, sources(title=("file_meta", 0.7), authors=("file_meta", 0.7),
+                       isbn_13=("file_meta", 0.9))),
+        # A filename guess with a borderline match applied to nothing.
+        ("flag-filename", "Some Book Name", "[]", "",
+         0.61, sources(title=("filename", 0.4))),
+        # Nothing at all could be established.
+        ("flag-untitled", "", "[]", "", None, "{}"),
+    ]
+    conn = sqlite3.connect(str(catalog_db))
+    for book_id, title, authors, isbn, score, field_sources in rows:
+        conn.execute(
+            """INSERT INTO books (id, title, authors, isbn_13, match_score, field_sources,
+                                  file_name, file_path, file_type, status, needs_review,
+                                  categories, themes, user_tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pdf', 'ok', 1, '[]', '[]', '[]')""",
+            (book_id, title, authors, isbn, score, field_sources,
+             f"{book_id}.pdf", f"pdfs/{book_id}.pdf"),
+        )
+    conn.commit()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def test_review_queue_is_ordered_by_identity_not_match_score(client, flagged_books):
+    """
+    `match_score` scores an API candidate, so it is NULL for a record
+    identified from the file's own metadata. Ordering on it put the best
+    record in the queue at the top of the "worst first" list.
+    """
+    items = client.get("/api/review/queue").json()["items"]
+    order = [i["id"] for i in items]
+
+    assert order.index("flag-untitled") < order.index("flag-filename")
+    assert order.index("flag-filename") < order.index("flag-file-meta")
+
+    by_id = {i["id"]: i for i in items}
+    assert by_id["flag-untitled"]["identity_confidence"] == 0.0
+    assert by_id["flag-file-meta"]["identity_confidence"] > by_id["flag-filename"]["identity_confidence"]
+    # The candidate score is still reported, it just no longer sets the order.
+    assert by_id["flag-filename"]["match_score"] == 0.61
+    assert by_id["flag-file-meta"]["match_score"] is None
+
+
+def test_review_queue_paginates_without_dropping_or_repeating(client, flagged_books):
+    """The page is fetched by id after ranking, so the slicing must still be exact."""
+    first = client.get("/api/review/queue?page=1&per_page=2").json()
+    second = client.get("/api/review/queue?page=2&per_page=2").json()
+
+    assert first["total"] == second["total"] == 3
+    assert first["pages"] == 2
+    seen = [i["id"] for i in first["items"]] + [i["id"] for i in second["items"]]
+    assert len(seen) == len(set(seen)) == 3
+
+
+def test_identity_confidence_is_on_every_book(client):
+    """Derived on the row mapper, so the ordinary book payload carries it too."""
+    book = client.get("/api/books/book-one").json()
+    assert "identity_confidence" in book
+    assert 0.0 <= book["identity_confidence"] <= 1.0
+

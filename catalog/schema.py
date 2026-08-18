@@ -8,8 +8,9 @@ the DDL exists in exactly one place.
 
 Two tables own book data:
 
-* ``books``     — everything the pipeline produces. The pipeline never writes
-                  the user-owned columns (R5).
+* ``books``     — everything the pipeline produces. The pipeline does not write
+                  the user-owned columns (R5); the one exception is the opt-in
+                  reading-progress stage, which may only advance `last_opened`.
 * ``user_data`` — ratings, tags, favourites, reading progress and pinned field
                   corrections. Keyed by book id *and* file path so the data
                   survives a full catalog rebuild.
@@ -63,7 +64,10 @@ BOOK_COLUMNS: list[tuple[str, str]] = [
     ("last_processed", "TEXT DEFAULT ''"),
     ("date_added", "TEXT DEFAULT ''"),
     ("author_primary", "TEXT DEFAULT ''"),
-    # ── user-owned; mirrored from user_data, never written by the pipeline ──
+    # ── user-owned; mirrored from user_data. The pipeline does not write
+    #    these, with one declared exception: the opt-in reading-progress stage
+    #    may advance `last_opened` when the filesystem reports an open *newer*
+    #    than the one on record. It may never move it backwards.
     ("last_opened", "TEXT"),
     ("reading_status", "TEXT DEFAULT 'not_started'"),
     ("progress_percent", "REAL DEFAULT 0"),

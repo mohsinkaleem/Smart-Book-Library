@@ -57,6 +57,12 @@ Get full details for a single book.
 
 **Response:** Full `Book` object with all metadata fields plus `has_embeddings: boolean`.
 
+Every `Book` also carries `identity_confidence` (float, 0–1): how sure the catalog
+is about *which book this is*, computed from `field_sources` for `title`, `authors`
+and the ISBNs. It is derived on read, never stored, so it cannot drift from the
+per-field provenance it summarises — and unlike `match_score` it is defined for a
+record no provider ever matched.
+
 ---
 
 ### `GET /api/books/{book_id}/similar`
@@ -457,7 +463,12 @@ pipeline run may overwrite it.
 
 ### `GET /api/review/queue`
 
-Records needing confirmation, lowest confidence first.
+Records needing confirmation, least certain identity first.
+
+Ordered by `identity_confidence` — how sure we are *which book this is*, derived
+from the provenance of `title`, `authors` and the ISBNs — not by `match_score`,
+which only scores an API candidate and is `null` for a record identified from
+the file's own embedded metadata.
 
 | Param      | Type | Default | Description            |
 | ---------- | ---- | ------- | ---------------------- |
