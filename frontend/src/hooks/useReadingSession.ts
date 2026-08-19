@@ -19,9 +19,13 @@ const HEARTBEAT_MS = 60_000;
 export function useReadingSession(bookId: string, page?: number | null) {
   // The page is read through a ref so a page turn does not tear down and
   // rebuild the interval — otherwise a reader turning pages steadily would
-  // reset the timer before it ever fired.
+  // reset the timer before it ever fired. Written in an effect rather than
+  // during render: a ref mutated mid-render is not safe under concurrent
+  // rendering, where a render can be thrown away.
   const pageRef = useRef(page);
-  pageRef.current = page;
+  useEffect(() => {
+    pageRef.current = page;
+  }, [page]);
 
   useEffect(() => {
     if (!bookId) return;

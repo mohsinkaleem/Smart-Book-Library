@@ -348,14 +348,36 @@ Find semantically similar passages across other books.
   "matches": [
     {
       "book_id": "def456",
-      "title": "Similar Book",
-      "author": "Author Name",
-      "excerpt": "First 300 chars of text...",
-      "similarity": 87.3,
-      "cover_url": "/covers/def456.jpg"
+      "chunk_id": 18422,
+      "title": "The Impossible State",
+      "author": "Wael B. Hallaq",
+      "excerpt": "The matching passage itself, not the book's opening pages.",
+      "similarity": 79.0,
+      "cover_url": "/covers/def456.jpg",
+      "page_start": 212,
+      "page_end": 213,
+      "spine_index": null,
+      "section": "CHAPTER 3",
+      "is_passage": true,
+      "deep_link": "/read/def456?page=212&chunk=18422"
     }
-  ]
+  ],
+  "source": "passages"
 }
+```
+
+Reimplemented on the passage index. `excerpt` is now the passage that actually
+matched, with the page it sits on and a link that opens the book there — it
+used to be the first characters of the matched book, shown under a similarity
+badge as though it were the matching text.
+
+`source` is `"passages"` or `"books"`. Books the passage index has not reached
+fall back to book-level matching, which returns `is_passage: false` and no
+page, because there is no matching passage to point at. Build the index to
+remove the fallback:
+
+```bash
+python scripts/build_passage_index.py
 ```
 
 ### `POST /api/reading/analyze`
@@ -393,6 +415,285 @@ data: {"token": "passage "}
 data: {"token": "discusses..."}
 data: [DONE]
 ```
+
+---
+
+## Passages
+
+Retrieval over the chunk index (Part 1). Every endpoint here answers **503**
+with a build instruction when the index has not been built, rather than
+returning an empty list — "not indexed" and "no matches" look identical in an
+empty response and mean entirely different things.
+
+### `GET /api/passages/status`
+
+Whether passage search will work, and what it is built over. The reader and the
+passage-search page both gate on this.
+
+```json
+{
+  "available": true,
+  "built": true,
+  "model_id": "BAAI/bge-small-en-v1.5",
+  "dim": 384,
+  "count": 23920,
+  "book_count": 59,
+  "dtype": "float16",
+  "built_at": "2026-08-19T14:50:10",
+  "chunk_chars": 1500,
+  "chunk_overlap": 250
+}
+```
+
+### `POST /api/passages/search`
+
+```json
+{
+  "query": "the modern state and religion",
+  "text": null,
+  "scope": "catalog",
+  "book_id": null,
+  "exclude_book": null,
+  "limit": 10,
+  "mode": "hybrid",
+  "rerank": true
+}
+```
+
+**`query` and `text` are not interchangeable.** bge is an asymmetric retrieval
+model: a short search phrase is encoded *with* its instruction prefix, a
+passage of prose *without* it. Sending a paragraph as `query` silently degrades
+the results rather than failing, which is why these are two fields and not one
+field with a flag.
+
+| Field | Meaning |
+|---|---|
+| `scope` | `catalog` (default) · `book` (requires `book_id`) · `category` / `author`, which take the usual book filter query parameters |
+| `mode` | `hybrid` (default: dense + BM25, fused with RRF) · `semantic` (dense only) · `keyword` (BM25 only, **no relevance floor** — this is "every mention of X") |
+| `rerank` | Cross-encoder reranking of the fused pool. Requires `PASSAGE_RERANK=1`; falls back silently to the fused order when the model will not load. |
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "chunk_id": 18422,
+      "book_id": "def456",
+      "chunk_idx": 137,
+      "text": "The passage itself.",
+      "score": 0.8041,
+      "rrf": 0.03252,
+      "page_start": 212,
+      "page_end": 213,
+      "spine_index": null,
+      "anchor_text": "The passage itself",
+      "section": "CHAPTER 3",
+      "matched": "both",
+      "title": "The Impossible State",
+      "author": "Wael B. Hallaq",
+      "year": 2012,
+      "cover_url": "/covers/def456.jpg",
+      "file_type": "pdf",
+      "deep_link": "/read/def456?page=212&chunk=18422"
+    }
+  ],
+  "scope": "catalog",
+  "reranked": false
+}
+```
+
+`score` is the **cosine** against the query, in every mode — comparable between
+queries and the number the relevance floors are calibrated on. `rrf` is the
+Reciprocal Rank Fusion value: it decides the ordering and nothing else, and
+lives around 0.03 because it is a sum of reciprocal ranks. They are separate
+fields because they are separate things; conflating them made every result read
+as a 3% match and made the floors unenforceable.
+
+`matched` says which system found the hit — `both`, `semantic` or `keyword`. A
+hit both proposed is the strongest kind there is; a keyword-only hit shares the
+words, not necessarily the argument.
+
+### `POST /api/passages/similar`
+
+Passages resembling a selection.
+
+```json
+{ "text": "A selected passage…", "book_id": "abc123", "scope": "book", "limit": 8 }
+```
+
+`scope: "book"` is **"elsewhere in this book"** — the same idea recurring in
+chapter 2 and chapter 11. It was structurally impossible before the chunk
+index: the old compare endpoint skipped the current book outright, and there
+was one vector per book to match against anyway. It is also the cheapest query
+in the system, because the builder writes each book's chunks contiguously and
+the search slices the matrix before the matmul (measured at 0.008 ms).
+
+The selection's own chunk is filtered out of the results — a 1.0 match with
+itself tells the reader nothing.
+
+### `GET /api/passages/{chunk_id}`
+
+One passage, its neighbours and a deep link, so a hit can be read in context.
+`?span=N` (0–5, default 1) sets how many chunks either side to include.
+
+### `POST /api/passages/stance`
+
+Supports / complicates / contradicts, grounded entirely in retrieved text.
+
+```json
+{ "text": "A claim to test…", "book_id": "abc123", "limit": 8 }
+```
+
+Returns `groups` keyed `supports` / `complicates` / `contradicts` /
+`unsorted`, each entry a full passage plus a one-line `why`, and the flat
+`passages` list it was drawn from. Requires a running Ollama (**503** without
+one).
+
+Passages the model did not assign land in `unsorted` rather than being
+dropped: a 4B model does not reliably return clean JSON, and a passage it
+failed to mention is still a real retrieved passage the reader should see.
+
+### `GET /api/books/{book_id}/threads`
+
+Recurring concepts within one book. A thread is a passage plus the others in
+the same book that resemble it *from a different part of it* — chapter 2 and
+chapter 11 making the same argument is the finding; chapter 2 resembling
+chapter 2 is not, so neighbouring chunks are excluded by construction.
+
+`?limit=` (1–20) threads, `?per_thread=` (2–10) passages each.
+
+Seeds are filtered to passages that are arguments rather than apparatus.
+Without that, the first run over a conference proceedings returned four threads
+at strength 0.935 and every one was a bibliography — reference lists recur
+across a book and resemble each other more than any two arguments do.
+
+---
+
+## LLM threads
+
+Passage-scoped conversations. The passage and its retrieved context are pinned
+at creation and replayed into every turn, which is what makes a follow-up like
+"why?" answerable — and what makes the exchange worth storing.
+
+### `GET /api/threads` · `POST /api/threads`
+
+```json
+{
+  "book_id": "abc123",
+  "passage": "The selected passage…",
+  "surrounding": "Prose around it…",
+  "page": 212,
+  "cfi": "",
+  "retrieve": true
+}
+```
+
+`retrieve` gathers and pins related passages at creation. On by default: fixed
+context is the point, and re-retrieving per turn would change the model's
+evidence under the reader.
+
+`GET` takes `?book_id=` and `?limit=`, and returns threads newest-updated first
+with a `message_count` but without their messages.
+
+### `GET` · `PATCH` · `DELETE /api/threads/{thread_id}`
+
+`GET` includes the full `messages` array. `PATCH` accepts **only** `title` —
+the passage and context are the thread's identity, and changing them would
+leave every stored answer grounded in material no longer shown, which reads as
+the model having invented it. `DELETE` returns 204 and takes the messages with
+it.
+
+### `POST /api/threads/{thread_id}/messages`
+
+```json
+{ "content": "Why does that follow?", "action": "ask" }
+```
+
+Server-sent events, `data: {"token": "..."}` per token and `data: [DONE]` at
+the end — the same shape as `/api/reading/analyze`. Both turns are persisted:
+the user's before the stream, the assistant's from the accumulated text
+**after** it completes, so a failed generation leaves no empty answer behind.
+
+---
+
+## Reading sessions
+
+### `POST /api/sessions/heartbeat`
+
+```json
+{ "book_id": "abc123", "page": 212 }
+```
+
+The reader calls this on a timer rather than opening and closing a session,
+because there is no reliable "closed the laptop" event and a session closed
+only on unmount reports a fourteen-hour reading day. A beat extends the current
+session; one arriving more than 15 minutes after the last starts a new one. The
+worst case is losing the final interval, not gaining a night.
+
+### `GET /api/sessions` · `GET /api/sessions/stats`
+
+`stats` takes `?days=` (1–365, default 30) and returns reading time, pages per
+week, current and longest streaks, and a per-day series for the Dashboard.
+Sessions under 30 seconds are excluded everywhere — those are page-flips, and
+counting them would pad the streak with every accidental click into a book.
+
+---
+
+## EPUB locations
+
+### `GET` · `POST /api/books/{book_id}/locations`
+
+`book.locations.generate()` walks the whole book and costs seconds, which is
+why EPUB progress was an approximate spine ratio. The reader generates it once
+in the background, posts it here, and every later open restores it with
+`locations.load()` — a parse rather than a walk — for exact "page X of Y".
+
+`GET` returns `{"generated": false}` when there is none.
+
+---
+
+## Export
+
+### `GET /api/export/markdown`
+
+Highlights, notes, bookmarks and LLM threads as one Markdown document, grouped
+by book. `?book_id=` scopes it to one book; `?include_threads=false` omits the
+conversations. Returns `text/markdown` with a `Content-Disposition` filename.
+
+A formatter over what `/api/annotations` and `/api/threads` already return —
+it holds no knowledge those endpoints do not.
+
+---
+
+## Duplicates
+
+Surfaces what `catalog/duplicate_detector.py` and the `duplicate_of` column
+have recorded since the pipeline shipped and nothing ever showed.
+
+**Nothing here deletes a file.** Resolving a duplicate reassigns `duplicate_of`
+and changes which copy the library shows. Choosing which of two files on disk
+to destroy is the user's call to make in a file manager, and a wrong one is not
+recoverable from inside this app.
+
+### `GET /api/duplicates`
+
+Groups, canonical first, each with the fields that actually differ between
+copies — size, page count and whether there is a text layer. A group whose
+canonical book has left the catalog is still reported, flagged `orphaned`;
+otherwise its copies would be marked as duplicates of an invisible record with
+no screen on which to unmark them.
+
+### `POST /api/duplicates/{book_id}/keep`
+
+Makes this copy canonical. The whole group is repointed in one statement,
+including the copy that was canonical before — a group with two canonical
+members, or a chain of `duplicate_of` pointers, is a state nothing downstream
+expects.
+
+### `DELETE /api/duplicates/{book_id}`
+
+Not a duplicate after all: clears the mark, leaves both books in the library.
 
 ---
 
@@ -603,20 +904,24 @@ Mark a record as reviewed.
 
 ### `GET /api/health`
 
-Liveness, plus the three facts worth knowing before blaming the UI.
+Liveness, plus the facts worth knowing before blaming the UI.
 
 ```json
 {
   "status": "ok",
   "version": "1.1.0",
-  "books": 544,
+  "books": 618,
   "embeddings_loaded": true,
+  "passage_index": { "available": true, "chunks": 23920, "books": 59 },
   "database": "/path/to/data/catalog.db"
 }
 ```
 
 `embeddings_loaded: false` means semantic and hybrid search have nothing to
-rank against.
+rank against. `passage_index.available: false` means every passage feature —
+"elsewhere in this book", real cross-book excerpts, stance, concept threads,
+library-wide passage search — is inert; run
+`python scripts/build_passage_index.py`.
 
 ---
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Page } from 'react-pdf';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 
@@ -34,18 +34,29 @@ export function PdfThumbnails({ doc, numPages, currentPage, onNavigate }: PdfThu
   const scrollRef = useRef<HTMLDivElement>(null);
   const [range, setRange] = useState<[number, number]>([1, 20]);
   const [rowHeight, setRowHeight] = useState(160);
-  const firstSlotRef = useRef<HTMLDivElement>(null);
 
-  // Measure a real row once one has rendered. Page aspect ratios vary between
-  // documents, and a hard-coded row height makes the scrollbar lie by a factor
-  // that grows with the page count.
-  useEffect(() => {
-    const measured = firstSlotRef.current?.getBoundingClientRect().height;
-    if (measured && Math.abs(measured - rowHeight) > 4) setRowHeight(measured);
-  });
+  /**
+   * Measure a real row as it attaches. Page aspect ratios differ between
+   * documents, and a hard-coded row height makes the scrollbar lie by a factor
+   * that grows with the page count.
+   *
+   * A callback ref rather than an effect: measuring belongs to the moment the
+   * node exists, and setting state from an effect body to describe the DOM you
+   * just rendered is the cascading-render pattern. The 4px guard terminates it
+   * — a measurement within a few pixels of what is stored is not worth a
+   * re-render.
+   */
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (!node) return;
+      const measured = node.getBoundingClientRect().height;
+      if (measured && Math.abs(measured - rowHeight) > 4) setRowHeight(measured);
+    },
+    [rowHeight],
+  );
 
-  const recompute = useMemo(
-    () => () => {
+  const recompute = useCallback(
+    () => {
       const el = scrollRef.current;
       if (!el) return;
       const first = Math.floor(el.scrollTop / rowHeight) + 1;
@@ -92,7 +103,7 @@ export function PdfThumbnails({ doc, numPages, currentPage, onNavigate }: PdfThu
           {pages.map((page) => (
             <div
               key={page}
-              ref={page === from ? firstSlotRef : undefined}
+              ref={page === from ? measureRow : undefined}
               style={{
                 position: 'absolute',
                 top: (page - 1) * rowHeight,

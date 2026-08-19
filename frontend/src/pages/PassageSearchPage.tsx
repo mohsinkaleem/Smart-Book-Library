@@ -6,7 +6,7 @@ import {
   usePassageSearch,
   type PassageMode,
 } from '../api/passages';
-import { passageLocation } from '../components/reading/PassagePanel';
+import { passageLocation } from '../components/reading/passageLocation';
 import { Spinner } from '../components/common/Spinner';
 import type { Passage } from '../api/types';
 

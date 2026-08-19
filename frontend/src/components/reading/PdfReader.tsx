@@ -168,7 +168,7 @@ export function PdfReader() {
       setCurrentPage(saved);
       setRenderedRange([Math.max(1, saved - WINDOW_BEFORE), Math.min(numPages, saved + WINDOW_AFTER)]);
     }
-  }, [numPages, book]);
+  }, [numPages, book, deepLinkPage]);
 
   // ── Fit-to-width / fit-to-page ────────────────────────────────────────────
   //

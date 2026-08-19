@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { BookOpen, CornerDownRight, Layers, Search, Sparkles } from 'lucide-react';
 import { useSimilarPassages, usePassageIndexStatus } from '../../api/passages';
 import { MIN_COMPARE_CHARS } from './selection';
+import { passageLocation } from './passageLocation';
 import { Spinner } from '../common/Spinner';
 import type { Passage } from '../../api/types';
 
@@ -19,19 +20,6 @@ const TABS: { id: Tab; label: string; icon: typeof BookOpen }[] = [
   { id: 'book', label: 'This book', icon: Layers },
   { id: 'catalog', label: 'Library', icon: Search },
 ];
-
-/** Where a passage sits, in whichever way its format can say. */
-export function passageLocation(passage: Passage): string {
-  if (passage.page_start) {
-    return passage.page_end && passage.page_end !== passage.page_start
-      ? `pp. ${passage.page_start}–${passage.page_end}`
-      : `p. ${passage.page_start}`;
-  }
-  if (passage.spine_index !== null && passage.spine_index !== undefined) {
-    return `Section ${passage.spine_index + 1}`;
-  }
-  return '';
-}
 
 /**
  * How a passage was found.
@@ -135,7 +123,13 @@ function PassageCard({
  */
 export function PassagePanel({ bookId, selectedText, onNavigate }: PassagePanelProps) {
   const [tab, setTab] = useState<Tab>('book');
-  const [results, setResults] = useState<Record<Tab, Passage[]>>({ book: [], catalog: [] });
+  // Results carry the selection they answer. Clearing them synchronously at the
+  // top of the effect would be a cascading render for something a comparison
+  // already tells us — and would blank the panel for a frame on every reselect.
+  const [results, setResults] =
+    useState<{ key: string; book: Passage[]; catalog: Passage[] }>({
+      key: '', book: [], catalog: [],
+    });
   const { data: status } = usePassageIndexStatus();
   const { mutate: search, isPending } = useSimilarPassages();
 
@@ -143,13 +137,18 @@ export function PassagePanel({ bookId, selectedText, onNavigate }: PassagePanelP
 
   useEffect(() => {
     if (!enabled) return;
-    setResults({ book: [], catalog: [] });
     for (const scope of ['book', 'catalog'] as Tab[]) {
       search(
         { text: selectedText, book_id: bookId, scope, limit: 6 },
         {
           onSuccess: (data) =>
-            setResults((prev) => ({ ...prev, [scope]: data.results })),
+            setResults((prev) => ({
+              // A reply for a selection the reader has moved on from is
+              // discarded rather than merged into the current one.
+              ...(prev.key === selectedText ? prev : { key: selectedText, book: [], catalog: [] }),
+              key: selectedText,
+              [scope]: data.results,
+            })),
         },
       );
     }
@@ -176,7 +175,7 @@ export function PassagePanel({ bookId, selectedText, onNavigate }: PassagePanelP
 
   if (!selectedText) return null;
 
-  const current = results[tab];
+  const current = results.key === selectedText ? results[tab] : [];
   const indexedBooks = status?.book_count ?? 0;
 
   return (

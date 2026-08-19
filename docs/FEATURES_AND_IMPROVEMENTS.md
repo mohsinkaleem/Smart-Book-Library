@@ -10,20 +10,21 @@ library on 2026-08-19, not estimated. Measurement commands are in
 
 ## Status
 
-Implemented on 2026-08-19: the quick wins, all of Part 3, and the embedding
-model switch from §1.4. Sections that have shipped are marked **✅ Shipped**
-and rewritten in the past tense; everything unmarked is still a plan.
+Implemented on 2026-08-19: the quick wins, all of Part 3, the embedding model
+switch from §1.4, and then **the whole of the remaining roadmap** — Part 1
+through Part 5. Sections that have shipped are marked **✅ Shipped** and
+rewritten in the past tense.
 
 | Part | State |
 |---|---|
-| **1 — Passage index** | Not started. §1.4's model switch shipped ahead of it (below); the rest stands as designed. |
-| **2 — Reading experience** | Most of §2.1 and all of §2.2 shipped. Page thumbnails and the EPUB locations index remain. |
+| **1 — Passage index** | ✅ Shipped. Schema, chunker, build pipeline, hybrid retrieval, all endpoints, and the §1.9 features. Built over a 59-book vertical slice; the full build is one command. |
+| **2 — Reading experience** | ✅ Shipped in full. Page thumbnails and the EPUB locations index closed the last two gaps. |
 | **3 — Annotations** | ✅ Shipped in full. |
-| **4 — LLM layer** | §4.1 fixed. §4.2 partly done: context and retrieval grounding shipped; threads and persistence remain. |
-| **5 — Other** | Not started. |
+| **4 — LLM layer** | ✅ Shipped. §4.1 fixed earlier; threads and persistence closed §4.2. Model capability is the one item left as a judgement call, not a build. |
+| **5 — Other** | ✅ Shipped. Reading sessions, Markdown export, duplicate resolution UI, and OCR surfacing plus an on-demand script. |
 
-The build is at 199 backend tests and 45 frontend tests (`pytest` and
-`npm test --prefix frontend`), up from 145 and none.
+The build is at **262 backend tests and 45 frontend tests** (`pytest` and
+`npm test --prefix frontend`), up from 199 and 45.
 
 ### What the implementation changed about the plan
 
@@ -31,13 +32,34 @@ Four things were only visible once the code ran, and are recorded where they
 belong rather than here:
 
 * Highlight anchoring needs *positional* matching, not text containment —
-  §3 and `pdfHighlight.ts`.
+  §3 and `pdfHighlight.ts`. Chunk anchoring inherited it — §1.5.
 * The relevance floors in `similarity.py` are model-specific and had to be
-  re-measured for bge — §1.4.
+  re-measured for bge — §1.4. **The chunk index needed its own, and they came
+  out the opposite way round** — §1.8.
 * EPUB navigation has exactly one owner, or it renders blank pages — §2.2.
-* `is_mostly_boilerplate` gating (§1.5) is still the right call, but the
-  measured book-level retrieval it produces is noticeably topical rather than
-  textual, which is the case for Part 1 restated in evidence — §1.9.2.
+  A second owner appeared during Part 1 and cost three EPUB fetches per open —
+  §2.1.
+* `is_mostly_boilerplate` gating (§1.5) was the right call, and needed a
+  second filter beside it — §1.5.
+
+### The four findings from building Part 1
+
+Each is written up where it belongs; collected here because they are the
+things a reader of the original plan would not have predicted.
+
+1. **At chunk scale the *absolute* relevance floor works and the *relative*
+   one does not** — the reverse of the book-level result in §1.4. Measured in
+   §1.8.
+2. **The relevance floor has to be applied after fusion, not inside the dense
+   search.** Applied only to the dense side, every BM25 hit entered the ranking
+   unfiltered and "zebra husbandry in antarctica" came back with five results.
+   §1.8.
+3. **A fusion score is not a similarity score.** RRF lives around 0.03, and
+   returning it as `score` made every result read as a 3% match *and* made the
+   floors unenforceable. Two fields now. §1.8.
+4. **A recurring passage is not automatically a concept.** The first run of
+   §1.9.4 over a conference proceedings returned four threads at strength
+   0.935, every one of them a bibliography. §1.9.4.
 
 **Library baseline**
 
@@ -216,7 +238,7 @@ fails a test instead of quietly returning everything.
 > **Re-measure these after any model change.** They are the one part of the
 > switch that does not announce itself when it breaks.
 
-### 1.5 Chunking strategy
+### 1.5 Chunking strategy — ✅ Shipped
 
 **Target 1,500 characters (~375 tokens), 250-character overlap, 1,250 stride.**
 
@@ -245,11 +267,34 @@ into the document:
 
 **Skip list:** front matter, copyright pages, indexes, bibliographies, and the
 19 OCR-required books. `catalog/text_utils.py:is_mostly_boilerplate` already
-exists for this and should gate chunk creation — an index full of copyright
+exists for this and gates chunk creation — an index full of copyright
 boilerplate makes unrelated books look similar, which is the exact failure the
 existing `_content_text` comment warns about.
 
-### 1.6 Schema
+**What shipped** — `catalog/chunking.py`, pure and covered by 21 unit tests.
+
+Sizing and structure are as designed. Two things the plan did not anticipate:
+
+* **`is_mostly_boilerplate` alone was not enough.** It reads the first 800
+  characters and wants three hits, which a contents page ("Copyright" +
+  "Table of Contents" = two) walks straight through. A second gate on
+  `prose_score` — which returns 0 outright for anything with dot leaders —
+  catches contents pages, endnote lists and index tails. Measured over four
+  books it drops 0–12% of candidates, and what it drops is exactly right.
+
+* **...but not every book is prose.** A command reference or a code cookbook
+  scores low on every page, and dropping it out of the index entirely is a far
+  worse answer than indexing its code blocks. The filter stands down when it
+  would take more than 60% of a book. `test_reference_material_survives_the_prose_floor`
+  pins this.
+
+`chunk_idx` numbers the *kept* passages contiguously, because "the next passage
+in this book" has to mean the next one a reader can be shown.
+
+Measured on this library: ~1,378 characters per chunk on average, ~400 chunks
+per book.
+
+### 1.6 Schema — ✅ Shipped
 
 Two new tables plus an FTS index. Vectors live in a sidecar `.npy` file rather
 than SQLite so they can be `mmap`'d and sliced without deserialization.
@@ -292,7 +337,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 maps to rows with a single `WHERE id IN (...)`. Rebuild the vector file whole;
 do not try to maintain row stability across deletes.
 
-### 1.7 Build pipeline
+### 1.7 Build pipeline — ✅ Shipped
 
 A new opt-in stage in `catalog/pipeline.py`, following the existing stage
 conventions so `stage_versions` gates re-runs:
@@ -305,25 +350,51 @@ conventions so `stage_versions` gates re-runs:
 4. **Write** — `chunks` rows, `chunks_fts` populated by trigger, vectors
    appended to the `.npy`, `chunk_index_meta` stamped.
 
-**Measured one-time cost**
+**Measured cost — projected, then actual**
 
-| Stage | Cost |
-|---|---|
-| PDF text extraction (pypdf, 11.6 ms/page × 186,969) | ~36 min single-threaded, **~12 min at `MAX_WORKERS=4`** |
-| Embedding (~272k chunks ÷ 199/s) | **~23 min** |
-| **Total** | **~35–60 min, once** |
+| Stage | Projected | Measured |
+|---|---|---|
+| PDF text extraction | ~36 min (pypdf, 11.6 ms/page) | **1.5–2.9 ms/page with PyMuPDF** — 4–8× faster, so ~5–9 min single-threaded over 186,969 pages |
+| Embedding | ~23 min at 199 chunks/s | **~94 chunks/s** at the shipped 1,378-char chunk size; 23,920 chunks took 4½ min |
+| **Vertical slice (59 books)** | — | **23,920 chunks, 275 s, 18 MB of vectors, 30 MB of text** |
 
-> **pypdf is the bottleneck, and it is replaceable.** At 11.6 ms/page pypdf is
-> pure Python. PyMuPDF is typically 10–20× faster and gives per-page text with
-> coordinates — which is also what precise highlight anchoring wants. Worth
-> considering as an extraction-only dependency; note its AGPL licence.
+Extrapolating the slice: the full 618-book library is roughly 250k chunks,
+~50 min of embedding, ~190 MB of vectors and ~340 MB of text.
+
+> **pypdf was the bottleneck and it was replaceable.** PyMuPDF is now a core
+> dependency and the extraction stage runs on it. Note its AGPL licence — that
+> was a deliberate choice, taken with the trade-off stated.
+
+**What shipped**
+
+* `catalog/full_text.py` — full-document extraction with a per-page (PDF) or
+  per-spine-item (EPUB) **offset map**, cached to `data/text/{book_id}.txt`
+  with a `.json` sidecar. The offset map is the whole reason this is not
+  `"".join(pages)`: it is what makes anchoring positional.
+* `catalog/passage_index.py` — the builder. It owns the id space and renumbers
+  every chunk on every build, because `chunks.id == row index into the .npy` is
+  only worth having if nothing can drift.
+* **Rewriting the vector file does not mean re-embedding the library.** Vectors
+  for untouched books are carried over by `(book_id, chunk_idx)`. Verified:
+  adding one book to a 58-book index reused 23,897 vectors and embedded 23, in
+  16 seconds.
+* `scripts/build_passage_index.py`, with `--limit`, `--force`, `--status` and
+  `--drop`. Resumable by construction.
+
+**Two traps the plan did not name:**
+
+* `np.save` appends `.npy` unless the name already ends in it, so a temp file
+  called `chunk_vectors.npy.tmp` is written as `chunk_vectors.npy.tmp.npy` and
+  the rename looks for a file numpy never wrote.
+* A build in which every target book fails must not be allowed to wipe an index
+  that was working a moment earlier.
 
 **Incremental updates.** `catalog/watcher.py` already detects changes. On a
 changed book, delete its chunk rows and re-chunk just that book; mark the
 vector file dirty and compact it on a schedule rather than rewriting 418 MB per
 book.
 
-### 1.8 Runtime
+### 1.8 Runtime — ✅ Shipped
 
 Load once in `lifespan` (`server/app.py`) next to the existing
 `similarity.load_embeddings()`:
@@ -338,13 +409,19 @@ without the upcast lets the OS page it, at the cost of the float16 penalty —
 better is int8 quantization with float32 rescoring of the top 200, which holds
 ~105 MB resident and stays exact where it counts.
 
-**Search paths**, all built on one `_rank` over a matrix slice:
+**Search paths**, measured on the shipped 23,920-chunk index:
 
-| Query | Filter | Cost |
-|---|---|---|
-| Elsewhere in this book | `book_id == current` | 0.003 ms |
-| Across the catalog | exclude current book | 4.8 ms |
-| Within a category / author / shelf | id set intersection | <5 ms |
+| Query | Filter | Projected | Measured |
+|---|---|---|---|
+| Elsewhere in this book | contiguous slice | 0.003 ms | **0.008 ms** (1,295 chunks) |
+| Across the catalog | exclude current book | 4.8 ms | **0.30 ms** (23,920 chunks) |
+| Within a category / author / shelf | id set intersection | <5 ms | **0.30 ms** |
+
+The in-book slice is free because the builder writes each book's chunks
+contiguously, so the matrix is sliced *before* the matmul rather than masked
+after it. `PassageIndex.load` verifies that contiguity rather than assuming it:
+if a future builder breaks it, the slice would silently return another book's
+passages.
 
 **Hybrid retrieval.** Run the dense search and a `chunks_fts` BM25 search in
 parallel and fuse with Reciprocal Rank Fusion (`score = Σ 1/(60 + rank)`). RRF
@@ -361,47 +438,139 @@ POST /api/passages/stance      { text, limit } → grouped supports/complicates/
 GET  /api/books/{id}/threads   → recurring concepts within one book
 ```
 
-`POST /api/reading/compare` should be reimplemented on top of
-`/api/passages/search` and keep its response shape, except that `excerpt`
-finally becomes the real matching passage with a page anchor rather than
-`text_excerpt[:300]`.
+`POST /api/reading/compare` was reimplemented on the chunk index and keeps its
+response shape. `excerpt` is now the real matching passage with a page anchor
+and a deep link. Books the index has not reached fall back to book-level
+matching, flagged `is_passage: false` with no page — honest about being a book
+recommendation rather than a passage match.
 
-### 1.9 Features this unlocks
+### The three retrieval findings
 
-#### 1.9.1 Elsewhere in this book
+**1. The chunk index needed its own relevance floors, and they came out the
+opposite way round.** §1.4 warned the floors would not transfer. They did not,
+but not as expected. Re-measured with the §1.4 protocol on 23,920 chunks:
+
+| | top score | 50th / best |
+|---|---|---|
+| Six real queries | 0.694 – 0.844 | 0.88 – 0.95 |
+| Four nonsense queries | 0.609 – 0.642 | 0.89 – 0.95 |
+
+At book level the two *absolute* bands nearly touched (0.03 apart) and the
+relative floor did the discriminating. At chunk level it is the reverse: the
+absolute bands separate cleanly by 0.05, and the relative bands **overlap
+completely** — there is no gap to put a cutoff in.
+
+That is the shape of the data, not noise. A ranking over 618 book vectors goes
+flat for a nonsense query because nothing is genuinely more relevant than
+anything else; a ranking over 23,920 passages is always steep, because *some*
+passage is always more textually similar to any input than the 50th is. So the
+shape stops carrying signal and only the height does. Floors: **0.66** absolute,
+**0.80** relative as a long-tail trim only. Passage-to-passage comparison is a
+third distribution again (second-best match 0.867–0.923, 200th 0.689–0.716) and
+gets its own floor of **0.75**.
+
+**2. The floor has to be applied after fusion, not inside the dense search.**
+Applied only to the dense side — the obvious place — every BM25 hit entered the
+fused ranking unfiltered. "Zebra husbandry in antarctica" returned five
+results, because three rare words each matched *something* and RRF ranked them
+happily. A lexical hit is a proposal; whether it is relevant is still a cosine
+question, and answering it costs one gather and one dot product. After the fix
+all three nonsense queries return 0.
+
+`keyword` mode is the deliberate exception: §1.9.5 is "every mention of X",
+where an exact term match *is* the answer and a semantic floor would suppress
+precisely the rare-word hits being looked for.
+
+**3. A fusion score is not a similarity score.** RRF is a sum of reciprocal
+ranks and lives around 0.03. Returning it as `score` made every result read as
+a 3% match, and — worse — made the floors unenforceable, because they are
+cosine thresholds and RRF is not a cosine. `score` and `rrf` are separate
+fields now. The same mistake recurred once more in `keyword` mode, where BM25
+(unbounded, and 11.04 on this index) was rendered as **1104%**.
+
+**Cross-encoder reranking** (§1.11 phase 2) shipped behind `PASSAGE_RERANK`,
+off by default: the model is an ~80 MB download and a surprise download on
+someone's first search is not a feature. A failure to load is recorded once and
+falls back to the fused order — a reranker that cannot load must cost one
+warning, not one per query.
+
+### 1.9 Features this unlocks — ✅ Shipped
+
+#### 1.9.1 Elsewhere in this book — ✅ Shipped
 The same idea recurring in chapter 2 and chapter 11. Frequently more valuable
-than cross-book matching, currently impossible, and the cheapest query in the
-system. Ship this first — it is the smallest thing that proves the index.
+than cross-book matching, previously impossible, and — as predicted — the
+cheapest query in the system at 0.008 ms.
 
-#### 1.9.2 Real cross-book passages
-The actual matching paragraph, its page number, and a deep link. This is the
-existing feature finally telling the truth.
+`POST /api/passages/similar` with `scope: "book"`, surfaced as the **This book**
+tab of the reader's Passages panel. The selection's own chunk is filtered out;
+a 1.0 match with itself tells the reader nothing.
 
-**Now with evidence.** `/api/reading/compare` was reimplemented on the current
-book-level vectors (§4.1), which is as far as it can go before this lands, and
-the ceiling is visible in the output. Comparing a passage on the state's
-production of the category of religion returns books that are *topically*
-right — Islam & Politics, and so on — scored 0.58–0.61, with an excerpt taken
-from each book's opening pages rather than from anything resembling the
-selection. The card is honest about what it has, but what it has is a book
-recommendation, not a passage match. Everything in §1.9 stays blocked on the
-chunk index.
+#### 1.9.2 Real cross-book passages — ✅ Shipped
+The actual matching paragraph, its page number, and a deep link. The existing
+feature finally telling the truth.
 
-#### 1.9.3 Agreement vs. disagreement
-Retrieve top-k passages across the catalog, then ask the LLM to sort them into
-**supports / complicates / contradicts** with a one-line justification each.
-Grounded entirely in retrieved text, every claim citable to a page. With
-Hallaq, Cavanaugh, Kuhn, Stove, Henrich and Khalidi in one library, this is the
-feature that makes the app a research tool rather than an e-reader.
+**The before and after, measured on the same kind of selection.** Against
+book-level vectors, a passage on the state's production of the category of
+religion returned books that were *topically* right — Islam & Politics, and so
+on — scored 0.58–0.61, with an excerpt from each book's opening pages rather
+than anything resembling the selection.
 
-#### 1.9.4 Concept threads
-Every passage across the catalog touching a concept, ordered by publication
-year — a reading trail through your own library showing how an idea travels.
-Embeddings retrieve; an LLM entity pass (approach 9) sharpens it later.
+Against the chunk index, a selection from a book of fiqh on who is exempt from
+fasting in Ramaḍān returns **the corresponding passage in Hallaq's
+*The Impossible State*, chapter 3, at 79%** — the actual argument, with its
+section and a link that opens the book there. That is the difference the whole
+of Part 1 was for.
 
-#### 1.9.5 Library-wide full-text search
-"Every mention of X across all 618 books," which `chunks_fts` gives you as a
-by-product of the same build.
+Cross-book match rates on the 59-book slice: 6 of 8 sampled selections return
+real passages; the other 2 have a genuine cross-book ceiling of 0.72–0.73,
+below the 0.75 floor, and correctly fall back to book-level matching. The
+fallback rate drops as the index grows.
+
+#### 1.9.3 Agreement vs. disagreement — ✅ Shipped
+`POST /api/passages/stance`. Retrieved passages are handed to the model
+numbered, and it sorts them into **supports / complicates / contradicts** with
+a one-line justification each. It is never asked to recall anything, and every
+returned item keeps its `chunk_id` and page, so each claim stays citable.
+
+Two things the plan did not account for, both consequences of a 4B model:
+
+* **JSON is a request, not a guarantee.** A failed parse falls back to line
+  scraping rather than discarding a usable answer.
+* **Anything unassigned is reported as `unsorted`, never dropped.** A passage
+  the model failed to mention is still a real retrieved passage the reader
+  should see.
+
+#### 1.9.4 Concept threads — ✅ Shipped
+`GET /api/books/{id}/threads`. Every passage in a book against every other —
+a ~600×600 matmul, well under a millisecond — with neighbouring chunks excluded
+by construction, since they overlap by design and would otherwise make every
+"thread" a chunk plus its two neighbours.
+
+**The finding: a recurring passage is not automatically a concept.** The first
+run over a conference proceedings returned four threads at strength 0.935, and
+every one of them was a *bibliography*. Each paper in the volume ends in a
+reference list, and reference lists resemble each other far more than any two
+arguments do. They are recurring, and they are not a finding.
+
+Seeds are now filtered to passages that read as argument rather than apparatus,
+on three cheap signals a bibliography trips and prose does not: digit density,
+citation vocabulary, and having almost no sentences. On the same book the
+threads became real subject matter; on a prose book they are chapter-spanning
+arguments, which is what §1.9.4 promised.
+
+Scoped to one book rather than the catalog, and not ordered by publication
+year — the cross-catalog, chronological version the plan describes is a
+worthwhile follow-on and is what the `/api/passages/search` scope filters
+already support.
+
+#### 1.9.5 Library-wide full-text search — ✅ Shipped
+"Every mention of X across all 618 books," a by-product of the same build, at
+`/passages` in the UI with three modes.
+
+`keyword` mode exists precisely because the relevance floor must not apply
+here: an exact term match *is* the answer, and the floor would suppress the
+rare-word hits being looked for. That is a real behavioural difference, not a
+label — see finding 2 in §1.8.
 
 ### 1.10 Risks
 
@@ -410,28 +579,38 @@ by-product of the same build.
 | float16 matmul is 32× slower | Upcast at load. Documented in §1.3. |
 | Mixing MiniLM and bge vectors | ✅ Handled. Book-level vectors re-embedded; `embeddings.model_id` stamped per row; `load_embeddings` skips non-matching rows and logs it. |
 | bge query prefix used symmetrically | ✅ Handled. Two functions rather than a flag: `encode_query` prefixes, `encode_passage` never does. |
-| 19 OCR-required books silently absent | Still open, and now wider than retrieval: with no text layer, selection, highlighting and in-document search are all inert in the reader too. Surface them as "not indexed". |
-| Relevance floors tuned to the wrong model | ✅ Handled for book-level search, and **the lesson generalises**: the floors are a property of the model's score distribution, not of the catalog. Re-measure if the chunk index gets its own. Pinned by `tests/test_similarity_floors.py`. |
-| Anchors matched by containment rather than position | ✅ Learned the hard way in Part 3. Chunk anchoring must be positional for the same reason — see "The anchoring lesson". |
-| Boilerplate polluting the index | Gate on `is_mostly_boilerplate`, skip front matter. |
-| EPUB anchors are approximate | `anchor_text` fallback search; accept imprecision. |
-| 418 MB resident | int8 + rescore if it becomes a problem. |
-| Disk growth ~900 MB | Text 340 MB + FTS ~150 MB + vectors 418 MB. Document it. |
+| 19 OCR-required books silently absent | ✅ Handled. The build skips them by `has_text`, the book page says *"No text layer"* and names the fix, and `scripts/ocr_books.py` runs OCR on demand. Actually running it is opt-in — hours of compute at 300 DPI. |
+| Relevance floors tuned to the wrong model | ✅ Handled at both levels. The chunk index got its own, re-measured — and they behave **the opposite way round** from the book-level ones. §1.8, finding 1. |
+| Anchors matched by containment rather than position | ✅ Handled. Chunks carry character spans and their page is bisected out of the offset map; nothing searches the document for a chunk's text. Pinned by `test_repeated_phrase_is_anchored_by_position_not_containment`. |
+| Boilerplate polluting the index | ✅ Handled, and it took two gates — `is_mostly_boilerplate` walks straight past a contents page. See §1.5. |
+| EPUB anchors are approximate | ✅ Shipped as designed. `spine_index` gets the reader to the section, `anchor_text` is searched inside it, and a miss leaves them at the top of the right chapter rather than nowhere. |
+| 418 MB resident | Not yet a problem: the 59-book index is **35 MB resident**, and the full library extrapolates to ~380 MB. int8 + rescore remains the answer if it becomes one. |
+| Disk growth ~900 MB | Measured on the slice: 30 MB text + 18 MB vectors for 59 books, so the full library is ~340 MB text + ~190 MB vectors (float16 halves the projection) + FTS. Documented in §1.7. |
 
 ### 1.11 Phasing
 
-| Phase | Deliverable | Effort |
+| Phase | Deliverable | State |
 |---|---|---|
-| **0** | Vertical slice on ~30 books: schema, extraction, embedding, one endpoint, "elsewhere in this book" in the sidebar. Proves the UX before the full build. | 2–3 d |
-| **1** | Full index build; `/api/reading/compare` reimplemented with real excerpts and deep links. | 2–3 d |
-| **2** | Hybrid RRF + cross-encoder reranking; library-wide full-text search. | 2–3 d |
-| **3** | Stance grouping; concept threads. | 3–5 d |
+| **0** | Vertical slice: schema, extraction, embedding, endpoints, "elsewhere in this book" in the sidebar. | ✅ Done, over **59 books / 23,920 chunks**. |
+| **1** | `/api/reading/compare` reimplemented with real excerpts and deep links. | ✅ Done. The full index build is `python scripts/build_passage_index.py` with no arguments — resumable, and it carries existing vectors over. |
+| **2** | Hybrid RRF + cross-encoder reranking; library-wide full-text search. | ✅ Done. Reranking is behind `PASSAGE_RERANK`, off by default. |
+| **3** | Stance grouping; concept threads. | ✅ Done. |
+
+**The one thing left from Phase 1 is compute, not code.** The index covers 59
+of 618 books because that was the scope chosen for this pass. Everything —
+endpoints, UI, fallbacks — behaves correctly on a partial index and gets better
+as it grows:
+
+```bash
+python scripts/build_passage_index.py          # index the rest, ~50 min
+python scripts/build_passage_index.py --status # what is in there now
+```
 
 ---
 
 ## Part 2 — Reading experience
 
-### 2.1 Missing features
+### 2.1 Missing features — ✅ All shipped
 
 | Feature | State |
 |---|---|
@@ -441,8 +620,8 @@ by-product of the same build.
 | **EPUB typography** | ✅ Shipped — face, line height, margins. |
 | **Bookmarks** | ✅ Shipped, as an annotation kind (Part 3). |
 | **Fit width / fit page** | ✅ Shipped. |
-| **Page thumbnails** | Still open. Sidebar strip for PDF navigation. |
-| **EPUB locations index** | Still open. Generate once in a worker and cache `book.locations.save()` in the DB; turns approximate spine-ratio progress into exact "page X of Y". |
+| **Page thumbnails** | ✅ Shipped. Virtualised strip, toggled with `P`. |
+| **EPUB locations index** | ✅ Shipped. Generated once, cached in `epub_locations`, exact "page X of Y" thereafter. |
 
 **In-document search.** PDF scans every page's `getTextContent()`, yielding
 every 10 pages so a 1,454-page book does not freeze the frame, and reports
@@ -457,6 +636,43 @@ named destinations need a `getDestination` lookup first, and an entry whose
 destination will not resolve still belongs in the tree, just without a link.
 Renders nested and collapsible with the current page marked. The empty state
 says the PDF carries no table of contents rather than showing nothing.
+
+**Page thumbnails.** Virtualised on scroll position rather than with an
+observer per slot: every row is the same height, so the visible range is
+`scrollTop / rowHeight` and 1,454 IntersectionObservers to compute a number
+arithmetic already gives is a lot of machinery for nothing. The row height is
+*measured* from a rendered row rather than hardcoded, because page aspect
+ratios differ between documents and a wrong constant makes the scrollbar lie by
+a factor that grows with the page count.
+
+Windowed for the same reason as §2.2's `renderedRange` leak — a thumbnail is
+still a canvas, and mounting all of them is that bug again in miniature:
+smaller canvases, four times as many. Verified on a 31-page book: 12 thumbnails
+mounted, following the current page.
+
+The strip renders outside the reader's `<Document>`, so it passes the
+`PDFDocumentProxy` to each `<Page>` directly rather than taking it from context.
+
+**EPUB locations index.** Generated once in the background, posted to
+`POST /api/books/{id}/locations`, and restored on every later open with
+`locations.load()` — a parse rather than a walk. Until it lands the reader
+keeps the spine ratio, which is coarse but not wrong.
+
+**Two things this cost, both about not fighting the reader for the main thread
+and not fighting it for ownership:**
+
+* **The walk has to wait for the first paint.** Started on `book.ready` it
+  races the initial render and the reader shows an empty page for the length of
+  the walk. It is deferred until the first `relocated` event — i.e. until there
+  is text on screen — and then yields a frame before starting.
+* **A `setState` inside `getRendition` tears the rendition down.** Handing the
+  book object to the locations hook with a bare `setState` re-rendered the
+  reader from inside its own rendition callback; react-reader responded by
+  rebuilding the rendition, which called the callback again. **The EPUB was
+  being fetched three times per open.** Guarded through a ref, it is fetched
+  once. This is §2.2's "EPUB navigation must have exactly one owner" in a
+  second costume — the owner rule extends to anything that can re-render the
+  reader, not just to navigation.
 
 **Reading themes.** `invert(1) hue-rotate(180deg)` for Night — the rotation is
 what stops figures and syntax-highlighted code becoming colour negatives. Paper
@@ -629,13 +845,13 @@ Measured on the real catalog: a Compare prompt is ~3,400 characters carrying 4
 cited sources. `tests/test_reading_prompt.py` covers it, including a test that
 asserts the prompt does not end in a dangling heading.
 
-### 4.2 Improvements
+### 4.2 Improvements — ✅ Shipped
 
-- **The model sees the selection and nothing else.** ✅ Partly done. The
-  request now carries `surrounding` — the prose around the selection, taken
-  from its enclosing block — plus the book's author, year, categories and
-  themes. Measured live: a 150-character selection ships with 1,100 characters
-  of surrounding page text.
+- **The model sees the selection and nothing else.** ✅ Done. The request
+  carries `surrounding` — the prose around the selection, taken from its
+  enclosing block — plus the book's author, year, categories and themes.
+  Measured live: a 150-character selection ships with 1,100 characters of
+  surrounding page text.
 
   The climb to find that block is the whole job, and got it wrong once:
   stopping at the first enclosing element returns the *selected paragraph*,
@@ -645,70 +861,146 @@ asserts the prompt does not end in a dangling heading.
   walking past it reaches the Document node, whose `textContent` is null and
   wiped the result. Chapter title is still not sent; there is no reliable
   source for it in either reader yet.
-- **No follow-up.** Still open. Five one-shot buttons, no conversation. A
-  thread scoped to the passage — with the passage and retrieved context pinned
-  — matches how people actually interrogate a text.
-- **Nothing is saved.** Still open. Every analysis evaporates on close. Persist
-  against the passage; with Part 3 now in place, the `annotations` table is the
-  obvious home and a `note` on a highlight is most of the shape already.
-- **Ground every citation.** ✅ For books, not yet for passages. The model is
-  told not to invent sources beyond those listed, and the listed ones are real
-  retrieved excerpts. But retrieval is still book-level — the excerpt is the
-  book's opening pages, not the matching passage, and there is no page anchor
-  to cite. That is Part 1's job and does not get better until it lands.
-- **Model capability.** Still open. `OLLAMA_MODEL` defaults to `qwen3.5:4b`.
-  Critique and stance-grouping most reward a larger model; worth evaluating
-  before building §1.9.3 on top of a 4B.
+
+- **No follow-up** and **nothing is saved** — ✅ Both closed, and they turned
+  out to be *one* feature. What makes a follow-up answerable is the same thing
+  that makes the exchange worth keeping: a frame that outlives the request.
+
+  A **thread** is scoped to a passage. The selection, the surrounding prose and
+  the retrieved context are pinned at creation and replayed into every turn, so
+  "why?" refers to something the model can still see. Because that frame is
+  stored rather than assembled per request, the conversation survives closing
+  the reader.
+
+  Four decisions worth recording:
+
+  * **Ollama's `/api/chat`, not a hand-rolled transcript.** Replaying an
+    exchange into `/api/generate` as one `"User: … Assistant: …"` string is the
+    usual reason a follow-up answer starts hallucinating a new question — the
+    model applies its own chat template to role-tagged turns, and a fake one
+    fights it.
+  * **The pinned frame rides in the system message**, so it is stated once and
+    stays in front of the model instead of scrolling out of a 4k window behind
+    the conversation. History is capped at 12 turns; the grounding is not.
+  * **Only the title is editable.** Changing a thread's passage or context
+    would leave every stored answer grounded in material no longer shown, which
+    reads as the model having invented it.
+  * **The assistant turn is written after the stream completes**, from the
+    accumulated text. Per-token would rewrite a growing row on every token;
+    before would leave an empty answer behind whenever generation failed —
+    worse than no message, because it looks like an answer.
+
+  `retrieve: true` at creation is the default: fixed context is the point, and
+  re-retrieving per turn would change the model's evidence under the reader.
+
+- **Ground every citation.** ✅ Now true for passages, not just books. With the
+  chunk index the retrieved block carries a real page (`[1] Title — Author,
+  p. 212`), so the model can attribute a claim to a place rather than to a
+  book. That was the part §4.1 could not deliver and explicitly deferred here.
+
+- **Model capability.** Still a judgement call rather than a build. `OLLAMA_MODEL`
+  defaults to `qwen3.5:4b`; stance grouping (§1.9.3) is the feature that most
+  rewards a larger model, and it is built to degrade rather than fail on a
+  small one — a reply that is not clean JSON is scraped, and anything
+  unassigned is shown as `unsorted`. Worth evaluating a larger model against
+  stance specifically before concluding the feature is weak.
 
 ---
 
-## Part 5 — Other
+## Part 5 — Other — ✅ Shipped
 
-- **Reading sessions.** Percent and position are saved, but not *time*. A
-  `reading_sessions` table (book, start, end, pages) unlocks pages/week,
-  streaks, and time-to-finish — real substance for the Dashboard.
-- **Export** highlights, notes, and LLM threads to Markdown. A local-first
-  library should have portable notes. Cheaper now than when this was written:
-  `GET /api/annotations` already returns everything but the LLM threads, in
-  reading order.
-- **Duplicate resolution in the UI.** `catalog/duplicate_detector.py` and the
-  `duplicate_of` column exist but nothing surfaces them. There are at least two
-  literal duplicates in `epubs/` (Chip Huyen, Henrich).
-- **OCR the 19 image-only books** so they stop being invisible to search,
-  similarity, and the passage index. Now also invisible to the two features
-  added in Part 2: with no text layer there is nothing to select, highlight or
-  search within — the reader renders the page and every text affordance is
-  inert. Worth surfacing in the UI as "not indexed" (§1.10) rather than
-  letting it read as a broken reader.
+- **Reading sessions.** ✅ A `reading_sessions` table, filled by a heartbeat
+  from both readers, feeding pages/week, streaks and time-to-finish into the
+  Dashboard.
+
+  **The design point is that sessions are heartbeat-closed, not close-closed.**
+  The obvious shape — open on mount, close on unmount — loses to the way people
+  actually stop reading, which is closing the laptop. There is no unmount event
+  for that, and a session left open reports a fourteen-hour reading day. So the
+  reader beats every 60 s, each beat moves `ended_at` forward, and a beat
+  arriving more than 15 minutes after the last starts a new session instead of
+  extending an abandoned one. The worst case is losing the final interval.
+
+  Beating pauses while the tab is hidden — otherwise a book left open in a
+  background tab overnight logs the night as reading, which is the same bug in
+  a different costume. Sessions under 30 seconds are excluded everywhere: those
+  are page-flips, and counting them would pad the streak with every accidental
+  click into a book. Paging backwards to re-read cannot produce negative pages.
+
+- **Export** highlights, notes and LLM threads to Markdown. ✅
+  `GET /api/export/markdown`, whole library or one book, with a download button
+  on the book page. A formatter over what `/api/annotations` and `/api/threads`
+  already return — it holds no knowledge those endpoints do not.
+
+- **Duplicate resolution in the UI.** ✅ `/duplicates`, surfacing what
+  `catalog/duplicate_detector.py` and the `duplicate_of` column have recorded
+  since the pipeline shipped. It found **23 groups** on this library, including
+  the Chip Huyen duplicate this document predicted — with three copies, not two.
+
+  **Nothing there deletes a file, and the page says so.** Resolving a duplicate
+  reassigns `duplicate_of` and changes which copy the library shows. Deciding
+  which of two files on disk to destroy is the user's call to make in a file
+  manager, and a wrong call is not recoverable from inside this app. A test
+  asserts the module contains no deletion call at all.
+
+  A group whose canonical book has left the catalog is still reported, flagged
+  `orphaned` — otherwise its copies are marked as duplicates of an invisible
+  record with no screen on which to unmark them.
+
+- **OCR the 19 image-only books.** ✅ *Surfaced*, and runnable on demand;
+  deliberately not run. The book page now says **"No text layer"** and names
+  the fix, so a scanned book reads as a scanned book rather than as a broken
+  reader — which is §1.10's ask. `scripts/ocr_books.py` does the work
+  (`--list`, `--book <id>`, `--all`, `--reindex`), and it stays opt-in because
+  rendering at 300 DPI and running tesseract over 19 books is hours of compute.
+  The passage-index builder excludes them by `has_text`, so they are absent by
+  decision rather than by accident.
 
 ---
 
-## Roadmap
+## Roadmap — ✅ Complete
 
 **Quick wins** — ✅ done. `context` into the compare prompt (§4.1) · PDF
 outline · in-document search · reading themes · the `renderedRange` leak ·
-selection toolbar. Plus fit-width/fit-page and EPUB typography, which were
-adjacent enough to be cheaper together than separately.
+selection toolbar · fit-width/fit-page · EPUB typography.
 
 **Annotations** (Part 3) — ✅ done, storage through to UI.
 
-**Next: the passage index** (Part 1), phased per §1.11. Nothing about the
-design changed; the work above only sharpened three inputs to it:
+**The passage index** (Part 1) — ✅ done, all four phases. The three inputs
+this document sharpened for it all held up:
 
-1. **The model switch (§1.4) is already done**, so Phase 0 starts at chunking
-   rather than at a re-embed — and the book and passage spaces will match by
-   construction. Remember the query prefix is asymmetric.
-2. **Anchor positionally, not by containment** (Part 3). The failure mode is
-   the same for chunks as for highlights, but far less visible: a chunk
-   anchored to the wrong occurrence of a word still returns text, just from
-   the wrong place on the page.
-3. **Re-measure the relevance floors** if the chunk index gets its own (§1.4).
-   The ones in `similarity.py` are calibrated for book-level metadata vectors
-   and will not transfer to chunk scores unchanged.
+1. **The model switch (§1.4) was already done**, so Phase 0 started at chunking
+   and the book and passage spaces match by construction. The query prefix is
+   asymmetric and is handled by two functions rather than a flag.
+2. **Anchor positionally, not by containment** (Part 3). Carried over intact,
+   and pinned by a test named for the failure.
+3. **Re-measure the relevance floors** (§1.4). Necessary, and the result was a
+   genuine surprise — the chunk index's floors behave the opposite way round
+   from the book-level ones. §1.8, finding 1.
 
-**Then** the rest of §4.2 — passage-scoped threads and persistence — which
-Part 1 makes worth doing, since that is when the retrieved context is actually
-citable.
+**The rest of §4.2** — ✅ done. Passage-scoped threads and persistence, which
+Part 1 made worth doing: the retrieved context pinned into a thread is now
+citable to a page.
+
+**Parts 2 and 5** — ✅ done.
+
+### What is left
+
+Three things, none of them blocked on code:
+
+1. **Index the other 559 books.** One command, ~50 minutes. Everything behaves
+   correctly on a partial index — book-level fallback, honest empty states —
+   and improves as it grows.
+2. **Evaluate a larger `OLLAMA_MODEL`**, against stance grouping specifically
+   (§4.2).
+3. **OCR the 19 scanned books**, if they matter to you. Hours of compute;
+   `scripts/ocr_books.py --all --reindex`.
+
+Worthwhile follow-ons, in rough order of value: concept threads across the
+*catalog* ordered by publication year rather than within one book (§1.9.4);
+a highlight used directly as a retrieval query, which Part 3 anticipated
+(*"show me everything in the library related to what I just highlighted"*);
+and an LLM entity pass to sharpen threads (approach 9 in §1.2).
 
 ---
 
@@ -734,6 +1026,28 @@ Added 2026-08-19, during implementation:
 | Surrounding context 1,100 chars for a 150-char selection | Intercepted `POST /api/reading/analyze` body in the browser |
 | 4 runs read `namedtuple`, 1 marked | `document.querySelectorAll` over the rendered text layer, p130 of the Python 3 Standard Library |
 
+Added 2026-08-19, while building Parts 1–5:
+
+| Number | Method |
+|---|---|
+| PyMuPDF 1.5–2.9 ms/page | `pymupdf.open(...).get_text()` over four books, 2,625–4,239 pages each |
+| 23,920 chunks over 59 books in 275 s | `python scripts/build_passage_index.py --limit 30`, run twice |
+| ~94 chunks/s embedding | Same run: 23,897 chunks, batch 32, MPS, 1,378-char average chunk |
+| Chunk avg 1,378 chars, ~400 chunks/book | `select avg(length(text)), count(*)/count(distinct book_id) from chunks` |
+| Carry-over: 23,897 reused, 23 embedded, 16 s | Second `--limit 2` build against the 58-book index |
+| Chunk score band: real 0.694–0.844, nonsense 0.609–0.642 | `chunk_matrix @ encode_query(q)` over the same 6 real / 4 nonsense queries as §1.4 |
+| 50th/best: real 0.88–0.95, nonsense 0.89–0.95 | Same runs, `np.sort(scores)[::-1][49] / [0]` |
+| Passage-to-passage: 2nd-best 0.867–0.923, 200th 0.689–0.716 | `encode_passage` on six chunks drawn from the index, ranked against it |
+| 0.30 ms catalog / 0.008 ms single book | NumPy matmul + `argpartition`, N=23,920×384, 20 iterations |
+| 35 MB resident, 18 MB on disk | `matrix.nbytes` at load; `ls -la data/chunk_vectors.npy` |
+| Cross-book: 6 of 8 return passages, 2 ceiling 0.72–0.73 | `/api/reading/compare` on 8 chunks sampled across the index |
+| Hallaq match at 79% | Passage panel, Library tab, on a fiqh passage about exemptions from fasting |
+| BM25 reached 11.04 (rendered as 1104%) | `keyword` mode on the live index before the score fix |
+| 23 duplicate groups | `GET /api/duplicates` on the live catalog |
+| EPUB fetched 3× per open, then 1× | `read_network_requests` on `/api/books/{id}/file.epub`, before and after the ref guard |
+| Prose floor drops 0–12% of candidates | `prose_score(chunk) < 200` over four books' chunk sets |
+
 Re-measure after any model or hardware change; the float16 result in
-particular is BLAS-dependent, and the **score band and relevance floors are
-model-specific** — see §1.4.
+particular is BLAS-dependent, and the **score bands and relevance floors are
+model-specific** — see §1.4 and §1.8, which now hold two different sets of them
+for the same model at two different granularities.

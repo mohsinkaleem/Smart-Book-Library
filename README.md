@@ -7,18 +7,25 @@ A local-first web application for managing, cataloging, and exploring your perso
 - **Smart Cataloging** — Automatically extracts metadata (title, authors, ISBN, language, page count) from PDF and EPUB files
 - **Full-Text Search** — SQLite FTS5 with Porter stemmer over two indexes: one for metadata (title, authors, description, themes, keywords…) and one for each book's own extracted prose. Results carry a highlighted snippet showing why they matched. Every token is quoted before it reaches FTS5, so punctuation and bare `AND` are searched as text rather than parsed as operators
 - **Semantic Search** — Sentence-transformer embeddings enable "find books like this" similarity queries
+- **Passage Search** — A chunk-level index over the full text of every book. Search the *inside* of your library by meaning, by exact term, or both fused with Reciprocal Rank Fusion; every hit carries its page and a link that opens the book there
 - **Reactive Filters** — Sidebar filter counts update dynamically based on active search query and other selected filters, showing real-time availability
 - **Reading View** — In-browser PDF and EPUB readers with adjustable zoom/font size, continuous or paginated flow, and a text-selection sidebar
 - **Resume Where You Left Off** — Both readers persist page or EPUB position and progress percentage, feeding a *Continue reading* shelf on the home page
+- **Similar Passages** — Select any paragraph and see where the same idea recurs *elsewhere in the same book*, and which passages in other books resemble it — the actual matching prose with its page, not a book recommendation
+- **Stance Grouping** — Retrieved passages sorted into supports / complicates / contradicts, grounded entirely in retrieved text so every claim stays citable to a page
+- **Concept Threads** — Recurring arguments within a book: the same idea in chapter 2 and chapter 11, found and linked
 - **LLM Analysis** — Ollama-powered streaming analysis (summarize, explain, critique, compare) of selected text passages
+- **Passage-Scoped Conversations** — Follow-up threads that pin the passage and its retrieved context, so "why?" still refers to something; saved against the book and exportable
 - **Cover Art** — Automatic cover extraction from files and API enrichment from Open Library / Google Books
 - **Dashboard** — Visual statistics with charts showing library composition by category, type, language, and reading progress
 - **Four Themes** — Light, Dark, Paper (warm sepia) and Dim (soft dark), applied before first paint with system-preference detection. Press `d` to cycle
 - **Responsive Grid/List Views** — Switch between grid and list layouts with sort and filter controls
 - **Smart Autocomplete** — Multi-tier search suggestions (title prefix → FTS match → fuzzy LIKE fallback) with keyboard navigation and highlight matching
 - **Reading Tracker** — Mark books as not started / in progress / finished / abandoned; progress percentage is maintained by the readers themselves
+- **Reading Sessions** — Time actually spent reading, pages per week and streaks, recorded by heartbeat so closing the laptop does not log a fourteen-hour day
+- **Markdown Export** — Highlights, notes, bookmarks and LLM threads out to a portable file, per book or for the whole library
 - **Tags** — Add your own tags to any book and filter the library by them; the tag vocabulary is suggested back to you as you type
-- **Duplicate Detection** — Fuzzy-matched duplicates are counted on the dashboard and flagged on the book page
+- **Duplicate Resolution** — Fuzzy-matched duplicates are grouped on their own page where you can choose which copy to keep. Nothing there deletes a file
 
 ## Tech Stack
 
@@ -167,6 +174,34 @@ do not match. After changing `EMBEDDING_MODEL`, re-embed the whole catalog:
 python scripts/reembed.py
 ```
 
+### 7. Optional: Build the Passage Index
+
+Everything under *Passage Search*, *Similar Passages*, *Stance Grouping* and
+*Concept Threads* runs on a chunk-level index over your books' full text. Until
+it is built those features say so rather than returning empty results.
+
+```bash
+python scripts/build_passage_index.py --limit 30   # try it on 30 books first
+python scripts/build_passage_index.py              # then the whole library
+python scripts/build_passage_index.py --status     # what is indexed now
+```
+
+It is resumable: a second run indexes only the books the first did not reach,
+and carries existing vectors over rather than recomputing them. Measured on a
+618-book / 187,000-page library: roughly **50 minutes once**, and about
+**530 MB** on disk (extracted text plus float16 vectors plus the FTS index).
+
+Passage search is exact brute-force — a NumPy matmul over the whole index,
+measured at 0.30 ms for 24,000 chunks. There is no ANN index to tune and no
+approximation to debug.
+
+Two optional switches:
+
+```bash
+PASSAGE_RERANK=1 python main.py    # cross-encoder reranking (~80 MB model, +50 ms/query)
+CHUNK_TARGET_CHARS=1200 python scripts/build_passage_index.py --force
+```
+
 ## Project Structure
 
 ```
@@ -181,7 +216,8 @@ books/
 │   ├── config.py            # Paths and constants
 │   ├── db.py                # BookDatabase — SQLite + FTS5 operations
 │   ├── search.py            # SearchEngine — FTS5, semantic, and hybrid search
-│   ├── similarity.py        # SimilarityEngine — embedding cosine similarity
+│   ├── similarity.py        # SimilarityEngine — book-level embedding cosine similarity
+│   ├── passages.py          # PassageIndex — chunk retrieval: dense + BM25, RRF, reranking
 │   ├── llm_service.py       # Ollama async streaming client
 │   ├── tasks.py             # Background task runner
 │   └── routes/
@@ -192,6 +228,12 @@ books/
 │       ├── filters.py       # /api/filters — Reactive facets scoped to search/filters
 │       ├── stats.py         # /api/stats — Library statistics
 │       ├── reading.py       # /api/reading — Reading text, compare, LLM analyze
+│       ├── passages.py      # /api/passages — Passage search, stance, concept threads
+│       ├── annotations.py   # /api/annotations — Highlights, notes, bookmarks
+│       ├── threads.py       # /api/threads — Passage-scoped LLM conversations
+│       ├── sessions.py      # /api/sessions — Reading time; EPUB locations cache
+│       ├── export.py        # /api/export — Markdown export of notes and threads
+│       ├── duplicates.py    # /api/duplicates — Duplicate groups and resolution
 │       ├── pipeline.py      # /api/pipeline — Re-process, embeddings
 │       └── review.py        # /api/review — Review queue, pinned corrections
 │
@@ -204,7 +246,7 @@ books/
 │   │   │   ├── common/      # Spinner, ErrorBoundary, EmptyState, Badge, Rating, ProgressBar
 │   │   │   ├── detail/      # BookHeader, SimilarBooks, TagEditor
 │   │   │   ├── layout/      # Header, Sidebar (reactive filter counts), ThemePicker
-│   │   │   ├── reading/     # ReadingView, BookReader, ReaderSidebar, LLMPanel
+│   │   │   ├── reading/     # PdfReader, EpubReader, ReaderSidebar, PassagePanel, ThreadPanel
 │   │   │   ├── search/      # SearchBar (multi-mode, keyboard nav), SnippetText
 │   │   │   └── stats/       # Dashboard charts
 │   │   ├── hooks/           # useLibraryParams (URL state), useTheme, useReadingProgress, shortcuts
@@ -213,6 +255,12 @@ books/
 │   └── dist/                # Production build output (served by FastAPI)
 │
 ├── catalog/                 # Catalog pipeline modules
+│   ├── full_text.py         # Whole-document extraction with a page/spine offset map
+│   ├── chunking.py          # Passage chunker — structure-first, positionally anchored
+│   ├── passage_index.py     # Index builder — chunk, embed, write chunks + vectors
+│   ├── annotations.py       # Highlights, bookmarks and notes (shared write path)
+│   ├── threads.py           # LLM thread and message storage
+│   ├── reading_sessions.py  # Heartbeat-closed reading sessions, streaks
 │   ├── scanner.py           # File system scanner
 │   ├── pdf_extractor.py     # PDF metadata + text extraction
 │   ├── epub_extractor.py    # EPUB metadata + text extraction
@@ -331,8 +379,32 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 | ------ | ---------------------------- | ------------------------------------ |
 | GET    | `/api/reading/llm-status`    | Check Ollama availability            |
 | GET    | `/api/reading/{id}/text`     | Get book text for reading view       |
-| POST   | `/api/reading/compare`       | Compare text semantically            |
+| POST   | `/api/reading/compare`       | Passages resembling a selection      |
 | POST   | `/api/reading/analyze`       | SSE-stream LLM analysis of text      |
+
+### Passages — `/api/passages`
+
+| Method | Endpoint                        | Description                                   |
+| ------ | ------------------------------- | --------------------------------------------- |
+| GET    | `/api/passages/status`          | Whether the index is built, and over what     |
+| POST   | `/api/passages/search`          | Hybrid / semantic / keyword passage search    |
+| POST   | `/api/passages/similar`         | Passages resembling a selection               |
+| GET    | `/api/passages/{chunk_id}`      | One passage plus its neighbours               |
+| POST   | `/api/passages/stance`          | Supports / complicates / contradicts          |
+| GET    | `/api/books/{id}/threads`       | Recurring concepts within one book            |
+
+### Threads, sessions and export
+
+| Method | Endpoint                          | Description                              |
+| ------ | --------------------------------- | ---------------------------------------- |
+| GET/POST | `/api/threads`                  | Passage-scoped LLM conversations         |
+| POST   | `/api/threads/{id}/messages`      | Ask a follow-up; SSE, both turns stored  |
+| POST   | `/api/sessions/heartbeat`         | "Still reading" — extends a session      |
+| GET    | `/api/sessions/stats`             | Time, pages/week, streaks                |
+| GET    | `/api/books/{id}/locations`       | Cached EPUB locations index              |
+| GET    | `/api/export/markdown`            | Highlights, notes and threads as Markdown |
+| GET    | `/api/duplicates`                 | Duplicate groups, canonical first        |
+| POST   | `/api/duplicates/{id}/keep`       | Make this copy canonical                 |
 
 ### Pipeline — `/api/pipeline`
 
@@ -374,11 +446,12 @@ CI (`.github/workflows/ci.yml`) runs all of this on every push and pull request.
 Run it locally the same way:
 
 ```bash
-pytest -q                 # backend: catalog pipeline + every API route
+pytest -q                 # backend: 262 tests — catalog pipeline + every API route
 cd frontend
 npx tsc -b                # type check
 npm run lint              # eslint, including the React hooks rules
 npm run build             # production build
+npx vitest run            # frontend: 45 unit tests
 ```
 
 `pytest` needs only the `dev` extra (`pip install -e ".[dev]"` or `uv sync --extra dev`).

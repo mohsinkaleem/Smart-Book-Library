@@ -3,16 +3,7 @@ import { Clock, Flame, BookOpenCheck, CalendarDays } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { useSessionStats } from '../../api/threads';
 import { Spinner } from '../common/Spinner';
-
-/** "3h 42m", or "42m", or "—". Hours matter, seconds never do. */
-export function formatDuration(seconds: number): string {
-  if (!seconds) return '—';
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
-  if (hours && minutes) return `${hours}h ${minutes}m`;
-  if (hours) return `${hours}h`;
-  return `${minutes}m`;
-}
+import { formatDuration } from '../../utils/duration';
 
 function Tile({
   icon: Icon, label, value, hint,

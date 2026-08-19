@@ -6,11 +6,13 @@ Build the passage index (Part 1).
     python scripts/build_passage_index.py --force        # re-chunk and re-embed all
     python scripts/build_passage_index.py --status       # what is in there now
 
-Measured cost for the full library: extraction ~3 min with PyMuPDF, embedding
-~23 min for ~272k chunks at 199 chunks/s, ~900 MB on disk (text 340 MB, FTS
-~150 MB, vectors ~210 MB at float16). It is resumable — a second run indexes
-only the books the first one did not reach, and carries the existing vectors
-over rather than recomputing them.
+Measured on this machine over a 59-book slice: 23,920 chunks in 275 s, at
+1.5-2.9 ms/page for extraction and ~94 chunks/s for embedding. Extrapolated to
+the full 618-book library that is roughly 250k chunks, ~50 min, and ~530 MB on
+disk (~340 MB extracted text + ~190 MB float16 vectors, plus the FTS index).
+
+It is resumable — a second run indexes only the books the first one did not
+reach, and carries the existing vectors over rather than recomputing them.
 """
 import argparse
 import json
