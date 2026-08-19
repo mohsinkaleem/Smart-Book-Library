@@ -156,13 +156,217 @@ USER_DATA_ADDED_COLUMNS = [
     ("reader_position", "TEXT DEFAULT ''"),
 ]
 
+# Highlights, bookmarks and margin notes.
+#
+# Keyed by book id *and* file path for the same reason `user_data` is: a full
+# catalog rebuild reassigns nothing a user typed. The id is a content hash, so
+# it survives a move but not a re-encode; the path survives a re-encode but not
+# a move. Keeping both means a rebuild can relocate an orphaned annotation
+# either way.
+#
+# Anchoring differs by format and neither is exact:
+#   * PDF  — `page` plus `anchor_text`. The page is durable; the text locates
+#            the highlight within it.
+#   * EPUB — `cfi`, with `anchor_text` as the fallback when a re-rendered
+#            document shifts the CFI out from under it.
+# `anchor_text` is therefore not redundant with `text`: it is the shorter,
+# stable needle used to re-find a highlight, and it is what §1.5 of the
+# features doc wants chunk anchoring to share.
+ANNOTATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS annotations (
+    id          TEXT PRIMARY KEY,
+    book_id     TEXT NOT NULL,
+    file_path   TEXT,
+    kind        TEXT NOT NULL DEFAULT 'highlight',
+    text        TEXT DEFAULT '',
+    note        TEXT DEFAULT '',
+    color       TEXT DEFAULT 'yellow',
+    page        INTEGER,
+    cfi         TEXT DEFAULT '',
+    anchor_text TEXT DEFAULT '',
+    created_at  TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_book ON annotations(book_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_path ON annotations(file_path);
+CREATE INDEX IF NOT EXISTS idx_annotations_kind ON annotations(book_id, kind);
+"""
+
+ANNOTATION_KINDS = ("highlight", "bookmark", "note")
+
+# ── The passage index (Part 1) ───────────────────────────────────────────────
+#
+# `chunks.id` is the row index into `data/chunk_vectors.npy`, so a top-k result
+# maps back to its text with a single `WHERE id IN (...)`. That coupling is the
+# reason ids are assigned by the builder rather than by AUTOINCREMENT, and the
+# reason the vector file is rewritten whole: trying to keep row indices stable
+# across deletes buys nothing and gets the mapping wrong exactly once, silently.
+#
+# Anchoring is per format and, as Part 3 learned the hard way, *positional*:
+# a chunk is located by character offsets into the book's extracted text and
+# those offsets are mapped to a page, never by searching for the chunk's text
+# and taking the first hit. A word occurring twice on a page is the common
+# case, and containment picks the wrong one without any visible symptom.
+CHUNKS_SQL = """
+CREATE TABLE IF NOT EXISTS chunks (
+    id          INTEGER PRIMARY KEY,   -- row index into the vector file
+    book_id     TEXT NOT NULL,
+    chunk_idx   INTEGER NOT NULL,      -- ordinal within the book
+    text        TEXT NOT NULL,
+    char_start  INTEGER,               -- offset into data/text/{book_id}.txt
+    char_end    INTEGER,
+    page_start  INTEGER,               -- PDF
+    page_end    INTEGER,               -- PDF
+    spine_index INTEGER,               -- EPUB
+    anchor_text TEXT DEFAULT '',       -- EPUB: first ~60 chars, for locating
+    section     TEXT DEFAULT '',       -- chapter/heading if detectable
+    UNIQUE(book_id, chunk_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_book ON chunks(book_id);
+"""
+
+# One row. Stamped at build time so a model or chunking change is a detectable
+# re-index rather than a silent corruption — the same lesson as
+# `embeddings.model_id`, applied before it could be learned twice.
+CHUNK_INDEX_META_SQL = """
+CREATE TABLE IF NOT EXISTS chunk_index_meta (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    model_id      TEXT DEFAULT '',
+    dim           INTEGER DEFAULT 0,
+    count         INTEGER DEFAULT 0,
+    book_count    INTEGER DEFAULT 0,
+    dtype         TEXT DEFAULT 'float16',
+    built_at      TEXT DEFAULT '',
+    chunk_chars   INTEGER DEFAULT 0,
+    chunk_overlap INTEGER DEFAULT 0
+);
+"""
+
+# External content: indexes chunk text without a second copy of it, exactly as
+# `books_fts` does for `books`. This is also §1.9.5 — library-wide full-text
+# search falls out of the same build for free.
+CHUNKS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+
+DROP TRIGGER IF EXISTS chunks_ai;
+DROP TRIGGER IF EXISTS chunks_ad;
+DROP TRIGGER IF EXISTS chunks_au;
+
+CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
+# ── LLM threads (§4.2) ───────────────────────────────────────────────────────
+#
+# A thread is scoped to a passage: the selection and the retrieved context are
+# pinned to the thread once and replayed into every turn, so a follow-up
+# question does not have to restate what "it" refers to. Messages are a
+# separate table rather than a JSON column because the streaming route appends
+# one at a time and rewriting a growing blob per token is how that goes wrong.
+#
+# Keyed by `file_path` alongside `book_id` for the same reason `user_data` and
+# `annotations` are: a rebuild reassigns book ids and must not orphan anything
+# a human typed.
+LLM_THREADS_SQL = """
+CREATE TABLE IF NOT EXISTS llm_threads (
+    id          TEXT PRIMARY KEY,
+    book_id     TEXT NOT NULL,
+    file_path   TEXT,
+    title       TEXT DEFAULT '',
+    passage     TEXT DEFAULT '',     -- the pinned selection
+    surrounding TEXT DEFAULT '',     -- prose around it, as sent by the reader
+    context     TEXT DEFAULT '',     -- the retrieved, citable block
+    page        INTEGER,
+    cfi         TEXT DEFAULT '',
+    created_at  TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_threads_book ON llm_threads(book_id);
+CREATE INDEX IF NOT EXISTS idx_llm_threads_path ON llm_threads(file_path);
+
+CREATE TABLE IF NOT EXISTS llm_messages (
+    id         TEXT PRIMARY KEY,
+    thread_id  TEXT NOT NULL REFERENCES llm_threads(id) ON DELETE CASCADE,
+    role       TEXT NOT NULL DEFAULT 'user',   -- user | assistant
+    content    TEXT DEFAULT '',
+    action     TEXT DEFAULT '',                -- explain | compare | ... | ask
+    created_at TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_llm_messages_thread ON llm_messages(thread_id, created_at);
+"""
+
+# ── Reading sessions (Part 5) ────────────────────────────────────────────────
+#
+# `progress_percent` records *where* the reader is; nothing recorded *when* or
+# for how long, so pages/week, streaks and time-to-finish were all unanswerable.
+# A session is opened when the reader mounts and closed by heartbeat, so a
+# closed browser tab leaves a session with the last heartbeat as its end rather
+# than an open row that grows forever.
+READING_SESSIONS_SQL = """
+CREATE TABLE IF NOT EXISTS reading_sessions (
+    id           TEXT PRIMARY KEY,
+    book_id      TEXT NOT NULL,
+    file_path    TEXT,
+    started_at   TEXT DEFAULT '',
+    ended_at     TEXT DEFAULT '',
+    seconds      INTEGER DEFAULT 0,
+    start_page   INTEGER,
+    end_page     INTEGER,
+    pages        INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_reading_sessions_book ON reading_sessions(book_id);
+CREATE INDEX IF NOT EXISTS idx_reading_sessions_started ON reading_sessions(started_at);
+"""
+
+# ── EPUB locations (§2.1) ────────────────────────────────────────────────────
+#
+# `book.locations.generate()` walks the whole book and costs seconds on a large
+# EPUB — far too slow to run on every open, which is why progress was an
+# approximate spine ratio. Generated once and cached here, it becomes an exact
+# "page X of Y".
+EPUB_LOCATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS epub_locations (
+    book_id    TEXT PRIMARY KEY,
+    locations  TEXT DEFAULT '',   -- book.locations.save(), an opaque JSON string
+    total      INTEGER DEFAULT 0,
+    chars      INTEGER DEFAULT 0, -- the break interval it was generated at
+    created_at TEXT DEFAULT ''
+);
+"""
+
 EMBEDDINGS_SQL = """
 CREATE TABLE IF NOT EXISTS embeddings (
     book_id            TEXT PRIMARY KEY,
     content_embedding  BLOB,
-    metadata_embedding BLOB
+    metadata_embedding BLOB,
+    model_id           TEXT DEFAULT ''
 );
 """
+
+# `model_id` records which model produced the blob. Vectors from two models
+# share a dtype and a dimension and mean nothing together — their cosine is
+# noise, and the failure is silent: search keeps returning results, they are
+# just wrong. Stamping the model makes a swap a detectable re-index, and
+# `SimilarityEngine` drops rows that do not match the configured model rather
+# than mixing two vector spaces in one matrix.
+EMBEDDINGS_ADDED_COLUMNS = [
+    ("model_id", "TEXT DEFAULT ''"),
+]
 
 
 def _fts_ddl(table: str, columns: list[str], trigger_prefix: str) -> str:
@@ -262,12 +466,25 @@ def ensure_schema(conn: sqlite3.Connection):
     conn.executescript(_fts_ddl("book_text_fts", TEXT_FTS_COLUMNS, "books_text"))
     conn.executescript(USER_DATA_SQL)
     conn.executescript(EMBEDDINGS_SQL)
+    conn.executescript(ANNOTATIONS_SQL)
+    conn.executescript(CHUNKS_SQL)
+    conn.executescript(CHUNK_INDEX_META_SQL)
+    conn.executescript(CHUNKS_FTS_SQL)
+    conn.executescript(LLM_THREADS_SQL)
+    conn.executescript(READING_SESSIONS_SQL)
+    conn.executescript(EPUB_LOCATIONS_SQL)
 
     if _table_exists(conn, "user_data"):
         have_user = set(_existing_columns(conn, "user_data"))
         for name, decl in USER_DATA_ADDED_COLUMNS:
             if name not in have_user:
                 conn.execute(f"ALTER TABLE user_data ADD COLUMN {name} {decl}")
+
+    if _table_exists(conn, "embeddings"):
+        have_emb = set(_existing_columns(conn, "embeddings"))
+        for name, decl in EMBEDDINGS_ADDED_COLUMNS:
+            if name not in have_emb:
+                conn.execute(f"ALTER TABLE embeddings ADD COLUMN {name} {decl}")
 
     for table, needed in (("books_fts", rebuild_meta), ("book_text_fts", rebuild_text)):
         if not needed:

@@ -172,3 +172,40 @@ body, header, aside, main {
 .react-pdf__Page__annotations {
   pointer-events: auto;
 }
+
+/* ==========================================================================
+   READER MARKS
+
+   pdf.js's text layer is invisible positioned text laid over the canvas so
+   the page can be selected. Marking a run inside it is how a highlight or a
+   search hit becomes visible over a bitmap that has no styleable text.
+
+   `color: transparent` matters: the text layer's job is still to be
+   invisible — the ink the reader sees is the canvas underneath. A `<mark>`
+   that painted its own text would double-strike every highlighted word.
+   ========================================================================== */
+
+.react-pdf__Page__textContent mark {
+  color: transparent !important;
+  background-color: transparent;
+  border-radius: 2px;
+  /* Multiply keeps the canvas ink readable through the tint instead of
+     laying an opaque block over it. */
+  mix-blend-mode: multiply;
+}
+
+.react-pdf__Page__textContent mark.pdf-search {
+  background-color: rgba(250, 204, 21, 0.55);
+  box-shadow: 0 0 0 1px rgba(202, 138, 4, 0.5);
+}
+
+.react-pdf__Page__textContent mark.pdf-hl-yellow { background-color: rgba(253, 230, 138, 0.72); }
+.react-pdf__Page__textContent mark.pdf-hl-green  { background-color: rgba(187, 247, 208, 0.72); }
+.react-pdf__Page__textContent mark.pdf-hl-blue   { background-color: rgba(191, 219, 254, 0.72); }
+.react-pdf__Page__textContent mark.pdf-hl-pink   { background-color: rgba(251, 207, 232, 0.72); }
+
+/* epub.js paints its highlights as SVG rects in an overlay above the text,
+   so they need the same blend treatment to keep the words underneath legible. */
+.epub-highlight {
+  mix-blend-mode: multiply;
+}

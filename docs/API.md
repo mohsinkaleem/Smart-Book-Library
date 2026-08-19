@@ -159,7 +159,7 @@ Full-text and/or semantic search across the library.
   extracted prose (`text_excerpt`, `front_matter`, `content_sample`). A book
   matching both is scored on both, with the text side weighted at 0.35 so a
   title match still outranks a passing mention in a 5 000-character excerpt.
-- **`semantic`** — Encodes the query with `all-MiniLM-L6-v2` and ranks the whole
+- **`semantic`** — Encodes the query with `BAAI/bge-small-en-v1.5` and ranks the whole
   catalog by cosine similarity. Requires embeddings. Results must clear a
   relevance floor — an absolute 0.28 and 55% of the best score — because
   otherwise every book in the library scores above zero against every query
@@ -368,9 +368,22 @@ Stream LLM analysis of selected text via Server-Sent Events (SSE).
 {
   "text": "Text to analyze...",
   "book_id": "abc123",       // optional — provides book context
-  "action": "summarize"      // explain | summarize | compare | critique | related
+  "action": "summarize",     // explain | summarize | compare | critique | related
+  "surrounding": "…"         // optional — prose around the selection
 }
 ```
+
+`surrounding` is the enclosing block of the selection, sent by the reader. A
+paragraph read in isolation loses the argument it belongs to, so it is passed
+to the model as background and clipped server-side.
+
+For `compare` and `related` the server also retrieves the closest passages
+from the rest of the library and interpolates them into the prompt, numbered
+and attributed so the model can cite them. This used to be missing: the
+`compare` template has always interpolated a `context` argument, and the route
+never supplied one — so every Compare request sent a prompt ending in a bare
+`Related:` with nothing after it. When nothing is retrieved the prompt now
+degrades to a self-contained question rather than a dangling heading.
 
 **Response:** `text/event-stream` with chunked tokens:
 
@@ -380,6 +393,92 @@ data: {"token": "passage "}
 data: {"token": "discusses..."}
 data: [DONE]
 ```
+
+---
+
+## Annotations
+
+Highlights, bookmarks and margin notes — the only data in the catalog a human
+authors directly. Stored keyed by book id *and* file path, so a full catalog
+rebuild cannot orphan them: book ids are content hashes, so re-encoding a file
+changes its id, and the server relinks annotations by path at startup.
+
+Anchoring is per format and deliberately approximate:
+
+| Format | Anchor | Fallback |
+|---|---|---|
+| PDF | `page` | `anchor_text` |
+| EPUB | `cfi` | `anchor_text` |
+
+`anchor_text` is the first ~60 characters of the selection, whitespace
+collapsed — the needle used to relocate a mark when its page or CFI no longer
+resolves. It is set from `text` when not supplied.
+
+### `GET /api/annotations`
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `book_id` | string | — | Scope to one book |
+| `kind` | string | — | `highlight`, `bookmark` or `note` |
+| `limit` | int | 500 | 1–2000 |
+
+Returned in reading order: by page where there is one, then by CFI.
+
+```json
+{
+  "annotations": [
+    {
+      "id": "ab2fe8f083df4711a161d830ec0e6b49",
+      "book_id": "abc123",
+      "file_path": "pdfs/example.pdf",
+      "kind": "highlight",
+      "text": "The religious and the scientific process…",
+      "note": "Iqbal on the unity of method",
+      "color": "yellow",
+      "page": 12,
+      "cfi": "",
+      "anchor_text": "The religious and the scientific process, though invol",
+      "created_at": "2026-08-19T13:39:05",
+      "updated_at": "2026-08-19T13:39:05"
+    }
+  ],
+  "total": 1
+}
+```
+
+### `POST /api/annotations`
+
+Creates one annotation. `book_id` is required and must resolve; everything
+else is optional. Returns `201` with the stored row.
+
+```json
+{
+  "book_id": "abc123",
+  "kind": "highlight",
+  "text": "The selected passage",
+  "note": "",
+  "color": "yellow",
+  "page": 12,
+  "cfi": "",
+  "anchor_text": ""
+}
+```
+
+`text` and `note` are capped at 8000 characters and truncated rather than
+rejected. `page` is 1-indexed. An unknown `kind` is `422`; an unknown
+`book_id` is `404`.
+
+### `PATCH /api/annotations/{annotation_id}`
+
+Patches `kind`, `text`, `note`, `color`, `page`, `cfi` or `anchor_text`.
+`id` and `book_id` are fixed at creation — an annotation cannot be moved to a
+different book. Returns the updated row, or `404`.
+
+### `DELETE /api/annotations/{annotation_id}`
+
+`204` on success, `404` if it does not exist.
 
 ---
 

@@ -11,7 +11,12 @@ an order of magnitude faster than one call per record.
 import logging
 from typing import Iterable
 
-from .config import EMBEDDING_BATCH_SIZE, EMBEDDING_MAX_INPUT_CHARS, EMBEDDING_MODEL
+from .config import (
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_MAX_INPUT_CHARS,
+    EMBEDDING_MODEL,
+    EMBEDDING_QUERY_PREFIX,
+)
 from .models import BookRecord
 from .text_utils import is_mostly_boilerplate
 
@@ -40,6 +45,65 @@ def _get_model():
             logger.error(f"Failed to load embedding model: {e}")
             return None
     return _model
+
+
+def model_id() -> str:
+    """The model these vectors were produced with. Stored beside them so a
+    swap is a detectable re-index rather than a silent corruption — vectors
+    from two different models share a shape and mean nothing together."""
+    return EMBEDDING_MODEL
+
+
+def encode_query(text: str):
+    """
+    Encode a short search-box query.
+
+    bge is asymmetric and wants its instruction prefix here — and *only*
+    here. See `EMBEDDING_QUERY_PREFIX`.
+    """
+    model = _get_model()
+    if model is None or not text:
+        return None
+    prefix = EMBEDDING_QUERY_PREFIX if _is_bge(EMBEDDING_MODEL) else ""
+    return model.encode(f"{prefix}{text}", normalize_embeddings=True)
+
+
+def encode_passage(text: str):
+    """
+    Encode a passage of prose for passage-to-passage comparison.
+
+    Symmetric use: no query prefix, ever. This is what "find books whose
+    prose resembles this paragraph" runs on.
+    """
+    model = _get_model()
+    if model is None or not text:
+        return None
+    return model.encode(text[:EMBEDDING_MAX_INPUT_CHARS], normalize_embeddings=True)
+
+
+def encode_passages(texts: list[str], batch_size: int = EMBEDDING_BATCH_SIZE):
+    """
+    Encode many passages at once, for the chunk index.
+
+    Same symmetric contract as `encode_passage` — no query prefix, ever — but
+    batched, because encoding 272,000 chunks one call at a time is 10-50x
+    slower than feeding them to the model in batches. Returns `None` when the
+    model is unavailable so callers can degrade rather than crash.
+    """
+    model = _get_model()
+    if model is None or not texts:
+        return None
+    return model.encode(
+        [t[:EMBEDDING_MAX_INPUT_CHARS] for t in texts],
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+
+def _is_bge(name: str) -> bool:
+    """Whether the configured model wants the retrieval instruction prefix."""
+    return "bge" in (name or "").lower()
 
 
 def _content_text(record: BookRecord) -> str:

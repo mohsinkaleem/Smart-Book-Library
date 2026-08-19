@@ -71,8 +71,17 @@ ENRICHMENT_CACHE_FILE = DATA_DIR / "api_cache.json"
 PROCESSING_LOG_FILE = DATA_DIR / "processing_log.json"
 REPORT_FILE = DATA_DIR / "enrichment_report.json"
 
+# ── Passage index (Part 1) ──
+# Full extracted text lives on disk, not in a `books` column: 340 MB of prose
+# in a row that every list query reads would make the catalog unusable.
+TEXT_DIR = DATA_DIR / "text"
+# One vector per chunk, float16 on disk (half the file), upcast to float32
+# once at load. Never matmul in float16 — NumPy has no float16 BLAS path and
+# upcasts elementwise on every query, which measures 32x *slower*.
+CHUNK_VECTORS_FILE = DATA_DIR / "chunk_vectors.npy"
+
 # Ensure directories exist
-for _d in [DATA_DIR, COVERS_DIR]:
+for _d in [DATA_DIR, COVERS_DIR, TEXT_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 # ─── Supported File Types ───────────────────────────────────────────────────────
@@ -136,9 +145,57 @@ MIN_TITLE_EVIDENCE_TOKENS = _env_int("MIN_TITLE_EVIDENCE_TOKENS", 2)
 MIN_TITLE_EVIDENCE_CHARS = _env_int("MIN_TITLE_EVIDENCE_CHARS", 8)
 
 # ─── Embedding Configuration ────────────────────────────────────────────────────
-EMBEDDING_MODEL = _env_str("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+# `bge-small-en-v1.5` over `all-MiniLM-L6-v2`: same 384 dimensions, so every
+# stored blob and every matmul is unchanged in shape, but a 512-token sequence
+# limit instead of 256 — MiniLM truncated a 4 000-character content sample at
+# roughly its halfway mark and embedded only the first half.
+#
+# English-only is deliberate. 575 of 618 books are English and 4 are Arabic; a
+# multilingual model would cost quality on 93% of the library to serve 0.6%.
+EMBEDDING_MODEL = _env_str("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+# bge is an *asymmetric* retrieval model: it wants this instruction on short
+# search queries and on nothing else. Passage-to-passage similarity — "find
+# books whose prose resembles this paragraph" — is symmetric and must be
+# encoded without it. Applying it in both directions quietly degrades results
+# rather than failing, which is why the two paths are separate functions in
+# `catalog.embeddings` instead of a boolean argument.
+EMBEDDING_QUERY_PREFIX = _env_str(
+    "EMBEDDING_QUERY_PREFIX",
+    "Represent this sentence for searching relevant passages: ",
+)
 EMBEDDING_MAX_INPUT_CHARS = _env_int("EMBEDDING_MAX_INPUT_CHARS", 4000)
 EMBEDDING_BATCH_SIZE = _env_int("EMBEDDING_BATCH_SIZE", 32)
+
+# ─── Passage Index / Chunking ───────────────────────────────────────────────────
+# Sized to sit under bge's 512-token limit (~375 tokens at 4 chars/token) while
+# still holding a complete argument. The overlap keeps a thought that straddles
+# a chunk boundary retrievable from both sides; the stride is the difference.
+CHUNK_TARGET_CHARS = _env_int("CHUNK_TARGET_CHARS", 1500)
+CHUNK_OVERLAP_CHARS = _env_int("CHUNK_OVERLAP_CHARS", 250)
+# Below this a chunk is a stray heading or a page number, not a passage.
+CHUNK_MIN_CHARS = _env_int("CHUNK_MIN_CHARS", 200)
+# The needle stored with an EPUB chunk so the reader can locate it in a
+# re-rendered document. Same role as `annotations.anchor_text`.
+CHUNK_ANCHOR_CHARS = _env_int("CHUNK_ANCHOR_CHARS", 60)
+
+# Full-text extraction for the passage index lifts `MAX_PAGES_TO_EXTRACT` — that
+# cap exists for the *metadata* pipeline, which only ever wanted the front of
+# the book. 0 means no cap.
+FULL_TEXT_MAX_PAGES = _env_int("FULL_TEXT_MAX_PAGES", 0)
+
+# Reciprocal Rank Fusion constant. RRF needs no score normalisation between the
+# dense and BM25 rankings, which is the usual source of hybrid-search bugs.
+RRF_K = _env_int("RRF_K", 60)
+
+# Cross-encoder reranking of the fused top-N (§1.11 phase 2). Off by default:
+# it is a large precision gain for ~50 ms, but the model is an ~80 MB download
+# on first use, so opting in is the user's call rather than a surprise at the
+# first query. When the model will not load, search falls back to the fused
+# ranking rather than failing.
+PASSAGE_RERANK = _env_bool("PASSAGE_RERANK", False)
+PASSAGE_RERANK_MODEL = _env_str("PASSAGE_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+PASSAGE_RERANK_CANDIDATES = _env_int("PASSAGE_RERANK_CANDIDATES", 50)
 
 # ─── OCR Configuration ──────────────────────────────────────────────────────────
 OCR_DPI = _env_int("OCR_DPI", 300)
@@ -185,7 +242,8 @@ STAGE_VERSIONS = {
     "enrich": 3,       # evidence → candidates → verify → merge
     "analyze": 2,      # controlled vocabulary + normalised scoring
     "llm": 2,
-    "embed": 2,        # embeds content_sample rather than front matter
+    "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable
+    "chunk": 1,        # full-text extraction + passage chunking (Part 1)
 }
 
 # ─── Logging ────────────────────────────────────────────────────────────────────

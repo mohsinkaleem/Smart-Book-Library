@@ -8,6 +8,37 @@ Every number in this document was measured on this machine against this
 library on 2026-08-19, not estimated. Measurement commands are in
 [Appendix A](#appendix-a--how-the-numbers-were-measured).
 
+## Status
+
+Implemented on 2026-08-19: the quick wins, all of Part 3, and the embedding
+model switch from §1.4. Sections that have shipped are marked **✅ Shipped**
+and rewritten in the past tense; everything unmarked is still a plan.
+
+| Part | State |
+|---|---|
+| **1 — Passage index** | Not started. §1.4's model switch shipped ahead of it (below); the rest stands as designed. |
+| **2 — Reading experience** | Most of §2.1 and all of §2.2 shipped. Page thumbnails and the EPUB locations index remain. |
+| **3 — Annotations** | ✅ Shipped in full. |
+| **4 — LLM layer** | §4.1 fixed. §4.2 partly done: context and retrieval grounding shipped; threads and persistence remain. |
+| **5 — Other** | Not started. |
+
+The build is at 199 backend tests and 45 frontend tests (`pytest` and
+`npm test --prefix frontend`), up from 145 and none.
+
+### What the implementation changed about the plan
+
+Four things were only visible once the code ran, and are recorded where they
+belong rather than here:
+
+* Highlight anchoring needs *positional* matching, not text containment —
+  §3 and `pdfHighlight.ts`.
+* The relevance floors in `similarity.py` are model-specific and had to be
+  re-measured for bge — §1.4.
+* EPUB navigation has exactly one owner, or it renders blank pages — §2.2.
+* `is_mostly_boilerplate` gating (§1.5) is still the right call, but the
+  measured book-level retrieval it produces is noticeably topical rather than
+  textual, which is the case for Part 1 restated in evidence — §1.9.2.
+
 **Library baseline**
 
 | | |
@@ -38,18 +69,22 @@ Three consequences:
 
 1. **Cross-book comparison scores prose against introductions.** When a reader
    selects a paragraph on page 340, `POST /api/reading/compare`
-   (`server/routes/reading.py:52`) scores it against 618 vectors that each
-   represent a different book's *front matter and first chapter*.
+   (`server/routes/reading.py`) scores it against 618 vectors that each
+   represent a different book's *front matter and first chapter*. Still true;
+   measured output in §1.9.2.
 
-2. **The match card shows the wrong text.** The endpoint returns
+2. **The match card shows the wrong text.** The endpoint returned
    `excerpt: text_excerpt[:300]` — the first 300 characters of the matched
-   book — displayed under a similarity badge as though it were the matching
-   passage. There is no matching passage in the system to return.
+   book — under a similarity badge as though it were the matching passage.
+   *Partly addressed:* it now returns `content_sample`, which is at least prose
+   past the front matter rather than the title page. It is still not the
+   matching passage, because there is no matching passage in the system to
+   return. Only the chunk index fixes this.
 
 3. **"Elsewhere in this book" is structurally excluded.** The endpoint skips
-   the current book outright (`if book_id == body.book_id: continue`), and even
+   the current book outright (`if match_id == book_id: continue`), and even
    without that skip there is only one vector for the whole book to match
-   against.
+   against. Unchanged.
 
 Full-text search has the same ceiling: `book_text_fts` indexes
 `text_excerpt`, `front_matter`, and `content_sample` — the same first 14 pages.
@@ -98,10 +133,11 @@ Filtered searches — one book, one author, one category — are effectively fre
 at 0.003 ms, because they slice the matrix before the matmul. This is what
 makes "elsewhere in this book" and "only in books I've finished" cheap.
 
-### 1.4 Embedding model
+### 1.4 Embedding model — ✅ Shipped
 
-Switching from `all-MiniLM-L6-v2` to **`BAAI/bge-small-en-v1.5`**. Verified on
-this machine:
+Switched from `all-MiniLM-L6-v2` to **`BAAI/bge-small-en-v1.5`**. This landed
+ahead of the rest of Part 1, because it is a prerequisite for it and improves
+book-level search on its own. Verified on this machine:
 
 | | all-MiniLM-L6-v2 | bge-small-en-v1.5 |
 |---|---|---|
@@ -136,6 +172,50 @@ Arabic. A multilingual model would cost quality on 93% of the library to serve
 Store the model id alongside the vectors (§1.6) so a future swap is a
 detectable re-index rather than a silent corruption.
 
+**What shipped**
+
+* `EMBEDDING_MODEL` defaults to `BAAI/bge-small-en-v1.5`; `EMBEDDING_QUERY_PREFIX`
+  holds the instruction string.
+* The two uses are separate functions rather than a boolean argument, because
+  getting them the wrong way round fails silently:
+  `catalog.embeddings.encode_query` applies the prefix,
+  `encode_passage` never does. `SimilarityEngine` exposes both;
+  `/api/reading/compare` runs on the symmetric one.
+* `embeddings.model_id` stamps every row, `ensure_schema` adds the column, and
+  `SimilarityEngine.load_embeddings` **skips rows built by another model** and
+  says so in the log, rather than mixing two vector spaces in one matrix — a
+  failure that does not raise, it just returns confident nonsense.
+* `scripts/reembed.py` re-embeds the catalog. All 618 books, 21 s.
+* `STAGE_VERSIONS["embed"]` bumped to 3, and the gap-filling embed task now
+  tests for a *current* embedding rather than any embedding — otherwise a model
+  switch looks like "everything is already done".
+
+**The trap that was not in the plan: the relevance floors are model-specific.**
+
+`MIN_SEMANTIC_SCORE` and `SEMANTIC_RELATIVE_FLOOR` in `server/similarity.py`
+were calibrated against MiniLM's score distribution and carried over unchanged.
+bge packs every score into a high, narrow band, so the old values sat below its
+*noise* floor and semantic search returned the entire library for any input.
+Re-measured on this catalog:
+
+| | top score |
+|---|---|
+| Six real queries | 0.655 – 0.834 |
+| Four nonsense queries | 0.564 – 0.621 |
+
+The gap is 0.03 wide, where under MiniLM it was around 0.2. Floors moved to
+**0.63** absolute and **0.84** relative — the 50th result of a real query
+scores ~0.84 of the best one, while for nonsense the ranking is flat at ~0.91
+because nothing is genuinely more relevant than anything else. After the
+change, nonsense returns 0 books and a query on the catalog's dominant subject
+returns 129.
+
+`tests/test_similarity_floors.py` pins the invariant so a future model change
+fails a test instead of quietly returning everything.
+
+> **Re-measure these after any model change.** They are the one part of the
+> switch that does not announce itself when it breaks.
+
 ### 1.5 Chunking strategy
 
 **Target 1,500 characters (~375 tokens), 250-character overlap, 1,250 stride.**
@@ -154,7 +234,7 @@ into the document:
 
 - **PDF** — straightforward. Extract per page and record `page_start` /
   `page_end`. The reader already navigates by page number
-  (`goToPage` in `BookReader.tsx`), so a deep link is
+  (`goToPage` in `PdfReader.tsx`), so a deep link is
   `/read/{id}?page=212&highlight=<hash>`.
 - **EPUB** — harder, and worth being honest about. Generating a true CFI
   offline is painful. Store `spine_index` + `char_offset` + a short
@@ -297,6 +377,16 @@ system. Ship this first — it is the smallest thing that proves the index.
 The actual matching paragraph, its page number, and a deep link. This is the
 existing feature finally telling the truth.
 
+**Now with evidence.** `/api/reading/compare` was reimplemented on the current
+book-level vectors (§4.1), which is as far as it can go before this lands, and
+the ceiling is visible in the output. Comparing a passage on the state's
+production of the category of religion returns books that are *topically*
+right — Islam & Politics, and so on — scored 0.58–0.61, with an excerpt taken
+from each book's opening pages rather than from anything resembling the
+selection. The card is honest about what it has, but what it has is a book
+recommendation, not a passage match. Everything in §1.9 stays blocked on the
+chunk index.
+
 #### 1.9.3 Agreement vs. disagreement
 Retrieve top-k passages across the catalog, then ask the LLM to sort them into
 **supports / complicates / contradicts** with a one-line justification each.
@@ -318,9 +408,11 @@ by-product of the same build.
 | Risk | Mitigation |
 |---|---|
 | float16 matmul is 32× slower | Upcast at load. Documented in §1.3. |
-| Mixing MiniLM and bge vectors | Re-embed book-level vectors; store `model_id`; refuse to load on mismatch. |
-| bge query prefix used symmetrically | Prefix only short search-box queries, never passage-to-passage. |
-| 19 OCR-required books silently absent | Surface them in the UI as "not indexed", don't fail quietly. |
+| Mixing MiniLM and bge vectors | ✅ Handled. Book-level vectors re-embedded; `embeddings.model_id` stamped per row; `load_embeddings` skips non-matching rows and logs it. |
+| bge query prefix used symmetrically | ✅ Handled. Two functions rather than a flag: `encode_query` prefixes, `encode_passage` never does. |
+| 19 OCR-required books silently absent | Still open, and now wider than retrieval: with no text layer, selection, highlighting and in-document search are all inert in the reader too. Surface them as "not indexed". |
+| Relevance floors tuned to the wrong model | ✅ Handled for book-level search, and **the lesson generalises**: the floors are a property of the model's score distribution, not of the catalog. Re-measure if the chunk index gets its own. Pinned by `tests/test_similarity_floors.py`. |
+| Anchors matched by containment rather than position | ✅ Learned the hard way in Part 3. Chunk anchoring must be positional for the same reason — see "The anchoring lesson". |
 | Boilerplate polluting the index | Gate on `is_mostly_boilerplate`, skip front matter. |
 | EPUB anchors are approximate | `anchor_text` fallback search; accept imprecision. |
 | 418 MB resident | int8 + rescore if it becomes a problem. |
@@ -341,59 +433,167 @@ by-product of the same build.
 
 ### 2.1 Missing features
 
-| Feature | Notes | Effort |
-|---|---|---|
-| **In-document search** | Neither reader has it. PDF: `page.getTextContent()`. EPUB: `book.search()` across the spine. Table stakes for a 600-page PDF. | M |
-| **PDF outline / TOC** | EPUB has one, PDF doesn't. `pdfjs.getOutline()` — most of the technical PDFs carry one. | S |
-| **Reading themes** | The PDF canvas is white-on-white in dark mode. CSS filter on the canvas for sepia/dark. | S |
-| **EPUB typography** | `handleRendition` hardcodes `Georgia, serif`. Expose font family, line height, margin width, theme. | S |
-| **Bookmarks** | One position per book is saved; you cannot mark "come back to this." | S |
-| **Page thumbnails** | Sidebar strip for PDF navigation. | M |
-| **EPUB locations index** | The code comment is right that generating it on open is too slow — but generate once in a worker and cache `book.locations.save()` in the DB. Turns approximate spine-ratio progress into exact "page X of Y". | M |
-| **Fit width / fit page** | Zoom is manual only. | S |
+| Feature | State |
+|---|---|
+| **In-document search** | ✅ Shipped, both formats. |
+| **PDF outline / TOC** | ✅ Shipped. |
+| **Reading themes** | ✅ Shipped — five, incl. `auto`. |
+| **EPUB typography** | ✅ Shipped — face, line height, margins. |
+| **Bookmarks** | ✅ Shipped, as an annotation kind (Part 3). |
+| **Fit width / fit page** | ✅ Shipped. |
+| **Page thumbnails** | Still open. Sidebar strip for PDF navigation. |
+| **EPUB locations index** | Still open. Generate once in a worker and cache `book.locations.save()` in the DB; turns approximate spine-ratio progress into exact "page X of Y". |
 
-### 2.2 Defects in what exists
+**In-document search.** PDF scans every page's `getTextContent()`, yielding
+every 10 pages so a 1,454-page book does not freeze the frame, and reports
+progress while it runs. Matches are marked in the live text layer, not just
+listed. EPUB has no `book.search()` despite the plan saying so — searching is
+per *spine item*, and each has to be `load`ed before `find` sees its text and
+`unload`ed afterwards or the whole book stays resident. Both cap at 300 hits
+and debounce, so typing a word is one scan rather than one per keystroke.
 
-- **Continuous-mode memory leak.** `renderedRange` only ever grows —
-  `BookReader.tsx:120` takes `Math.min`/`Math.max` against the previous range
-  and never shrinks it. Scrolling a 600-page PDF accumulates every visited page
-  as a live canvas. Evict pages outside a window.
-- **Selection threshold duplicated three times.** `length > 10` appears in
-  `PdfReader`, `EpubReader`, and the iframe fallback listener. Hoist it.
-- **The sidebar yanks itself open** on any selection ≥ 10 characters, including
-  accidental double-clicks. A floating selection toolbar — Highlight · Ask ·
-  Compare · Copy — is the better interaction and becomes the natural home for
-  the passage features in Part 1.
+**PDF outline.** `getOutline()` resolves each entry's destination to a page —
+named destinations need a `getDestination` lookup first, and an entry whose
+destination will not resolve still belongs in the tree, just without a link.
+Renders nested and collapsible with the current page marked. The empty state
+says the PDF carries no table of contents rather than showing nothing.
+
+**Reading themes.** `invert(1) hue-rotate(180deg)` for Night — the rotation is
+what stops figures and syntax-highlighted code becoming colour negatives. Paper
+and Sepia are a sepia/brightness pair rather than a colour overlay, so the ink
+stays black. The filter goes on the *wrapper*, not the canvas: on the canvas
+alone it would invert the ink but not the highlights sitting over it. EPUBs get
+real CSS through epub.js themes instead, since they have real text.
+
+`auto` is the default and follows the app's existing four themes, which is the
+actual complaint the row above encodes — a white page in a dark app.
+
+**EPUB typography.** Applied through an effect on the live rendition, so a
+change takes effect immediately. `handleRendition` reads current values through
+refs; it is handed to the reader once and would otherwise apply whatever the
+render that created it happened to see.
+
+### 2.2 Defects in what exists — ✅ All fixed
+
+* **Continuous-mode memory leak.** `renderedRange` took `Math.min`/`Math.max`
+  against its previous value and so only ever grew — scrolling a 600-page PDF
+  end to end left every visited page as a live canvas. It is recomputed as a
+  window around the visible page now (`WINDOW_BEFORE` / `WINDOW_AFTER`), so
+  pages behind you unmount and their canvases are freed.
+
+  Fixing this exposed a second bug it had been masking: jumping from page 3 to
+  page 400 scrolled to nothing, because the target slot does not exist until
+  the window moves. The jump is recorded and replayed when the slot mounts.
+
+* **Selection threshold duplicated three times.** Hoisted to
+  `MIN_SELECTION_CHARS` in `selection.ts`, along with the separate
+  `MIN_COMPARE_CHARS` — there is less text needed to act on a selection than
+  to retrieve against it, and conflating the two was part of why the numbers
+  drifted apart.
+
+* **The sidebar yanking itself open** is replaced by the floating toolbar the
+  row proposed: Highlight · Note · Ask · Compare · Copy, positioned over the
+  selection and clamped to the viewport. The reader opens the sidebar; it no
+  longer happens to them.
+
+**Two bugs found while testing, not in the original list:**
+
+* **EPUB navigation must have exactly one owner.** `goToCfi` called
+  `rendition.display(cfi)` *and* set the `location` prop that react-reader
+  turns into its own `display` for the same target. epub.js rendered the
+  section but left the paginated column offset pointing at the other call's
+  result, so every search hit and every bookmark navigated to a **blank page**
+  with the text sitting off-screen in a 10,000px-wide strip. Navigation now
+  goes through `location` and nowhere else.
+
+* **EPUB selections outside epub.js's own event had no anchor.** The fallback
+  iframe `mouseup` listener — which exists because epub.js's `selected` misses
+  selections in scrolled-doc mode — passed no CFI, so a highlight made through
+  it was stored with an empty anchor and could never be repainted or navigated
+  back to. The CFI is derived from the range via the `Contents` that owns the
+  iframe window.
+
+**File layout.** The 928-line `BookReader.tsx` held both readers and was the
+wrong unit to keep adding to. Split into `PdfReader.tsx` and `EpubReader.tsx`,
+with `selection.ts`, `readingTheme.ts` and `pdfHighlight.ts` holding the parts
+that are pure — which is what let the last of those get unit tests after it
+turned out to be wrong (Part 3).
 
 ---
 
-## Part 3 — Annotations
+## Part 3 — Annotations — ✅ Shipped
 
-**There is no annotation storage anywhere in the schema.** No highlights, no
-bookmarks, no margin notes. This is the largest gap for a "smart" library and
-is independent of Part 1 — it can ship in parallel.
+There was no annotation storage anywhere in the schema — no highlights, no
+bookmarks, no margin notes. It was the largest gap for a "smart" library, and
+being independent of Part 1, it shipped first.
 
-Store alongside `user_data`, keyed by book id *and* file path, so annotations
-survive a full catalog rebuild the way ratings and tags already do:
+The table is as designed, with `kind` constrained to
+`highlight | bookmark | note` and every column defaulted:
 
 ```sql
 CREATE TABLE annotations (
     id          TEXT PRIMARY KEY,
     book_id     TEXT NOT NULL,
     file_path   TEXT,               -- survives rebuilds, as user_data does
-    kind        TEXT,               -- highlight | bookmark | note
-    text        TEXT,               -- the selected passage
-    note        TEXT,               -- user commentary
-    color       TEXT,
+    kind        TEXT NOT NULL DEFAULT 'highlight',
+    text        TEXT DEFAULT '',    -- the selected passage
+    note        TEXT DEFAULT '',    -- user commentary
+    color       TEXT DEFAULT 'yellow',
     page        INTEGER,            -- PDF
-    cfi         TEXT,               -- EPUB
-    anchor_text TEXT,               -- relocation fallback
-    created_at  TEXT,
-    updated_at  TEXT
+    cfi         TEXT DEFAULT '',    -- EPUB
+    anchor_text TEXT DEFAULT '',    -- relocation fallback
+    created_at  TEXT DEFAULT '',
+    updated_at  TEXT DEFAULT ''
 );
 ```
 
-Anchoring shares its design with §1.5 — build both against the same helper.
+**Layout.** `catalog/annotations.py` owns the SQL, so the pipeline store and
+the web server share one write path, as `user_data` already does.
+`server/routes/annotations.py` is the HTTP surface —
+`GET/POST /api/annotations`, `PATCH`/`DELETE /api/annotations/{id}`, documented
+in `docs/API.md`. `id` and `book_id` are fixed at creation: an update that
+could move an annotation to a different book is a bug surface with no feature
+behind it.
+
+**Rebuild survival is active, not just recorded.** Storing `file_path` is only
+half of it — `relink_orphans` runs at startup and re-points annotations whose
+`book_id` no longer exists at whatever book now holds their path. Book ids are
+content hashes, so re-encoding a PDF gives it a new id and would otherwise
+orphan every highlight in it.
+
+**UI.** Highlights in four colours and notes are created from the §2.2
+selection toolbar; `B` bookmarks the current spot. A Marks tab in the reader
+sidebar filters by kind, navigates to each anchor, and edits notes inline.
+Highlights are repainted in the document: through the text layer for PDF, and
+`rendition.annotations.add` for EPUB.
+
+### The anchoring lesson: containment is not enough
+
+§1.5 says anchoring should share a helper with the chunk index. It should — but
+the first implementation here was wrong in a way worth recording before Part 1
+inherits it.
+
+A PDF text run is a *positioning artefact*, not a word. One highlighted
+sentence is spread across dozens of runs and a run can end mid-word. The
+obvious rule — mark any run whose text appears inside the highlighted passage —
+is wrong, and visibly so: highlighting a sentence containing `namedtuple` lit
+up **every other occurrence of `namedtuple` on the page**, because each is its
+own short run and each is genuinely a substring of the passage.
+
+The fix is positional. Join the page's runs back into one string, locate the
+passage *in that string*, and mark only the runs covering that span. Offsets
+survive normalisation by carrying a parallel index table, so whitespace and
+case can be collapsed for matching without losing the ability to say *where*
+the match sits. Resolved once per page from react-pdf's `onGetTextSuccess`,
+not per run.
+
+Measured on the page that exposed it: 4 runs read `namedtuple`, 1 is inside the
+highlight, 1 is marked.
+
+`pdfHighlight.ts` is pure and has 20 unit tests, including that case by name.
+**Part 1 should build chunk anchoring on the same positional approach** — a
+chunk index anchored by containment would mislocate for exactly the same
+reason, and far less visibly.
 
 Once annotations and the passage index coexist, a highlight becomes a query:
 *"show me everything in the library related to what I just highlighted."*
@@ -402,31 +602,63 @@ Once annotations and the passage index coexist, a highlight becomes a query:
 
 ## Part 4 — LLM layer
 
-### 4.1 Live bug
+### 4.1 Live bug — ✅ Fixed
 
-`_build_prompt` accepts a `context` argument and the `"compare"` template
-interpolates it — but `server/routes/reading.py:96` calls
-`analyze_text_stream(body.text, body.action, book_title)` with no context.
-**Every "Compare" request currently sends a prompt ending in `Related:`
-followed by nothing.** Feeding retrieved chunks into that slot is both the fix
-and the feature.
+`_build_prompt` accepted a `context` argument that only the `"compare"`
+template interpolated, and the route called it without one. **Every Compare
+request sent a prompt ending in a bare `Related:` with nothing after it.**
+
+Fixed as the plan proposed — by filling the slot rather than removing it.
+`/api/reading/analyze` now retrieves for `compare` and `related` (the two
+actions whose prompts are grounded in other material; retrieval for `explain`
+would cost a matmul and dilute the prompt), and passes the results in numbered
+and attributed so the model can cite them.
+
+Two details that were not in the plan:
+
+* **The empty case.** When nothing is retrieved, the prompt degrades to a
+  self-contained question instead of rendering the heading with no body under
+  it. Every optional block is omitted entirely rather than emitted empty —
+  which is the general form of the original bug.
+* **A prompt budget.** A 4B model with a 4k window truncates from the *front*,
+  which drops the instruction and keeps the retrieved noise. Retrieved and
+  surrounding blocks are capped before assembly and the whole prompt after it,
+  so the passage and the instruction always survive.
+
+Measured on the real catalog: a Compare prompt is ~3,400 characters carrying 4
+cited sources. `tests/test_reading_prompt.py` covers it, including a test that
+asserts the prompt does not end in a dangling heading.
 
 ### 4.2 Improvements
 
-- **The model sees the selection and nothing else.** Send surrounding page
-  text, the chapter title, and the book's themes/author/year. A paragraph read
-  in isolation loses the argument it belongs to.
-- **No follow-up.** Five one-shot buttons, no conversation. A thread scoped to
-  the passage — with the passage and retrieved context pinned — matches how
-  people actually interrogate a text.
-- **Nothing is saved.** Every analysis evaporates on close. Persist against the
-  passage; combined with Part 3 that yields a per-book notebook.
-- **Ground every citation.** When the model references other books it should be
-  quoting retrieved chunks with page anchors, not free-associating. Part 1 is
-  the retrieval corpus.
-- **Model capability.** `OLLAMA_MODEL` defaults to `qwen3.5:4b`. Critique and
-  stance-grouping are the two tasks that most reward a larger model; worth
-  evaluating before building §1.9.3 on top of a 4B.
+- **The model sees the selection and nothing else.** ✅ Partly done. The
+  request now carries `surrounding` — the prose around the selection, taken
+  from its enclosing block — plus the book's author, year, categories and
+  themes. Measured live: a 150-character selection ships with 1,100 characters
+  of surrounding page text.
+
+  The climb to find that block is the whole job, and got it wrong once:
+  stopping at the first enclosing element returns the *selected paragraph*,
+  which is nothing the model does not already have, because selecting a whole
+  paragraph is the common case. It now climbs until an ancestor carries
+  meaningfully more text than the selection — and stops at `body`, since
+  walking past it reaches the Document node, whose `textContent` is null and
+  wiped the result. Chapter title is still not sent; there is no reliable
+  source for it in either reader yet.
+- **No follow-up.** Still open. Five one-shot buttons, no conversation. A
+  thread scoped to the passage — with the passage and retrieved context pinned
+  — matches how people actually interrogate a text.
+- **Nothing is saved.** Still open. Every analysis evaporates on close. Persist
+  against the passage; with Part 3 now in place, the `annotations` table is the
+  obvious home and a `note` on a highlight is most of the shape already.
+- **Ground every citation.** ✅ For books, not yet for passages. The model is
+  told not to invent sources beyond those listed, and the listed ones are real
+  retrieved excerpts. But retrieval is still book-level — the excerpt is the
+  book's opening pages, not the matching passage, and there is no page anchor
+  to cite. That is Part 1's job and does not get better until it lands.
+- **Model capability.** Still open. `OLLAMA_MODEL` defaults to `qwen3.5:4b`.
+  Critique and stance-grouping most reward a larger model; worth evaluating
+  before building §1.9.3 on top of a 4B.
 
 ---
 
@@ -436,26 +668,47 @@ and the feature.
   `reading_sessions` table (book, start, end, pages) unlocks pages/week,
   streaks, and time-to-finish — real substance for the Dashboard.
 - **Export** highlights, notes, and LLM threads to Markdown. A local-first
-  library should have portable notes.
+  library should have portable notes. Cheaper now than when this was written:
+  `GET /api/annotations` already returns everything but the LLM threads, in
+  reading order.
 - **Duplicate resolution in the UI.** `catalog/duplicate_detector.py` and the
   `duplicate_of` column exist but nothing surfaces them. There are at least two
   literal duplicates in `epubs/` (Chip Huyen, Henrich).
 - **OCR the 19 image-only books** so they stop being invisible to search,
-  similarity, and the passage index.
+  similarity, and the passage index. Now also invisible to the two features
+  added in Part 2: with no text layer there is nothing to select, highlight or
+  search within — the reader renders the page and every text affordance is
+  inert. Worth surfacing in the UI as "not indexed" (§1.10) rather than
+  letting it read as a broken reader.
 
 ---
 
 ## Roadmap
 
-**Quick wins** — days, no migration:
-pass `context` into the compare prompt (§4.1) · PDF outline · in-document
-search · reading themes · fix the `renderedRange` leak · selection toolbar.
+**Quick wins** — ✅ done. `context` into the compare prompt (§4.1) · PDF
+outline · in-document search · reading themes · the `renderedRange` leak ·
+selection toolbar. Plus fit-width/fit-page and EPUB typography, which were
+adjacent enough to be cheaper together than separately.
 
-**Then annotations** (Part 3) — self-contained, no dependency on Part 1, and
-the single feature most likely to change daily use.
+**Annotations** (Part 3) — ✅ done, storage through to UI.
 
-**Then the passage index** (Part 1), phased per §1.11. It is the expensive one,
-but every interesting passage ↔ book ↔ catalog feature is downstream of it.
+**Next: the passage index** (Part 1), phased per §1.11. Nothing about the
+design changed; the work above only sharpened three inputs to it:
+
+1. **The model switch (§1.4) is already done**, so Phase 0 starts at chunking
+   rather than at a re-embed — and the book and passage spaces will match by
+   construction. Remember the query prefix is asymmetric.
+2. **Anchor positionally, not by containment** (Part 3). The failure mode is
+   the same for chunks as for highlights, but far less visible: a chunk
+   anchored to the wrong occurrence of a word still returns text, just from
+   the wrong place on the page.
+3. **Re-measure the relevance floors** if the chunk index gets its own (§1.4).
+   The ones in `similarity.py` are calibrated for book-level metadata vectors
+   and will not transfer to chunk scores unchanged.
+
+**Then** the rest of §4.2 — passage-scoped threads and persistence — which
+Part 1 makes worth doing, since that is when the retrieved context is actually
+citable.
 
 ---
 
@@ -470,5 +723,17 @@ but every interesting passage ↔ book ↔ catalog feature is downstream of it.
 | 4.8 ms / 154.6 ms / 0.003 ms search | NumPy matmul + `argpartition`, N=340k × 384, 10 iterations |
 | bge dim 384, max_seq 512 | `SentenceTransformer("BAAI/bge-small-en-v1.5").max_seq_length` |
 
+Added 2026-08-19, during implementation:
+
+| Number | Method |
+|---|---|
+| Re-embed 618 books in 21 s | `python scripts/reembed.py`, batch 32, MPS, model cached |
+| bge score band: real 0.655–0.834, nonsense 0.564–0.621 | Top `metadata_matrix @ encode_query(q)` over 6 real and 4 nonsense queries, 618 books |
+| 50th result ≈ 0.84 of best (real), ≈ 0.91 (nonsense) | Same runs, `np.sort(scores)[::-1][49] / [0]` |
+| Compare prompt ≈ 3,400 chars, 4 cited sources | `_build_prompt` on a real selection against the live catalog |
+| Surrounding context 1,100 chars for a 150-char selection | Intercepted `POST /api/reading/analyze` body in the browser |
+| 4 runs read `namedtuple`, 1 marked | `document.querySelectorAll` over the rendered text layer, p130 of the Python 3 Standard Library |
+
 Re-measure after any model or hardware change; the float16 result in
-particular is BLAS-dependent.
+particular is BLAS-dependent, and the **score band and relevance floors are
+model-specific** — see §1.4.

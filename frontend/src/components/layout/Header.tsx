@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { BookOpen, BarChart3, Settings, LayoutGrid, List, PanelLeftClose, PanelLeft, Keyboard, ClipboardCheck } from 'lucide-react';
+import { BookOpen, BarChart3, Settings, LayoutGrid, List, PanelLeftClose, PanelLeft, Keyboard, ClipboardCheck, Sparkles, CopyCheck } from 'lucide-react';
 import clsx from 'clsx';
 import { ThemePicker } from './ThemePicker';
 
@@ -58,6 +58,18 @@ export function Header({ view, onViewChange, sidebarOpen, onToggleSidebar, child
             </button>
           </div>
         )}
+        <Link to="/passages" title="Passage search" aria-label="Passage search" className={clsx(
+          'rounded-lg p-2 transition-colors',
+          location.pathname === '/passages' ? 'bg-primary-50 text-primary-600 dark:bg-primary-900/30' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700',
+        )}>
+          <Sparkles size={18} />
+        </Link>
+        <Link to="/duplicates" title="Duplicates" aria-label="Duplicates" className={clsx(
+          'rounded-lg p-2 transition-colors',
+          location.pathname === '/duplicates' ? 'bg-primary-50 text-primary-600 dark:bg-primary-900/30' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700',
+        )}>
+          <CopyCheck size={18} />
+        </Link>
         <Link to="/review" title="Review queue (g r)" aria-label="Review queue" className={clsx(
           'rounded-lg p-2 transition-colors',
           location.pathname === '/review' ? 'bg-primary-50 text-primary-600 dark:bg-primary-900/30' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700',

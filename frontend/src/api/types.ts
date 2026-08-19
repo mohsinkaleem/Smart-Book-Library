@@ -101,10 +101,140 @@ export interface CompareMatch {
   excerpt: string;
   similarity: number;
   cover_url: string | null;
+  /**
+   * True when `excerpt` is the passage that actually matched, from the chunk
+   * index. False when it is the book's opening prose, which is all the
+   * book-level fallback can offer for a book the index has not reached.
+   * The card says which, rather than presenting both as the same thing.
+   */
+  is_passage?: boolean;
+  chunk_id?: number;
+  page_start?: number | null;
+  page_end?: number | null;
+  spine_index?: number | null;
+  section?: string;
+  deep_link?: string;
+}
+
+/** One retrieved passage from the chunk index (Part 1). */
+export interface Passage {
+  chunk_id: number;
+  book_id: string;
+  chunk_idx: number;
+  text: string;
+  /** Cosine against the query — comparable between queries. */
+  score: number;
+  /** Reciprocal Rank Fusion value; decides ordering and nothing else. */
+  rrf: number;
+  page_start: number | null;
+  page_end: number | null;
+  spine_index: number | null;
+  anchor_text: string;
+  section: string;
+  /** Which retrieval system proposed it. */
+  matched: 'both' | 'semantic' | 'keyword';
+  title: string;
+  author: string;
+  year: number | null;
+  cover_url: string | null;
+  file_type: string;
+  deep_link: string;
+}
+
+export interface PassageIndexStatus {
+  available: boolean;
+  built?: boolean;
+  count?: number;
+  book_count?: number;
+  model_id?: string;
+  built_at?: string;
+  chunk_chars?: number;
+  chunk_overlap?: number;
+}
+
+export interface ConceptThread {
+  strength: number;
+  section: string;
+  passages: (Passage & { is_match?: boolean })[];
+}
+
+export interface StanceGroups {
+  supports: (Passage & { why: string })[];
+  complicates: (Passage & { why: string })[];
+  contradicts: (Passage & { why: string })[];
+  unsorted: (Passage & { why: string })[];
+}
+
+/** A passage-scoped LLM conversation (§4.2). */
+export interface LLMThread {
+  id: string;
+  book_id: string;
+  title: string;
+  passage: string;
+  surrounding: string;
+  context: string;
+  page: number | null;
+  cfi: string;
+  created_at: string;
+  updated_at: string;
+  message_count?: number;
+  messages?: LLMMessage[];
+}
+
+export interface LLMMessage {
+  id: string;
+  thread_id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  action: string;
+  created_at: string;
+}
+
+export interface ReadingSessionStats {
+  total_seconds: number;
+  total_pages: number;
+  sessions: number;
+  window_days: number;
+  window_seconds: number;
+  window_pages: number;
+  window_books: number;
+  pages_per_week: number;
+  current_streak: number;
+  longest_streak: number;
+  daily: { date: string; seconds: number; pages: number; books: number }[];
+}
+
+export interface DuplicateGroup {
+  canonical_id: string;
+  canonical: Book | null;
+  orphaned: boolean;
+  copies: Book[];
 }
 
 export interface Suggestion {
   id: string;
   title: string;
   author: string;
+}
+
+export type AnnotationKind = 'highlight' | 'bookmark' | 'note';
+
+export interface Annotation {
+  id: string;
+  book_id: string;
+  file_path: string | null;
+  kind: AnnotationKind;
+  /** The selected passage. */
+  text: string;
+  /** The reader's own commentary on it. */
+  note: string;
+  color: string;
+  /** PDF anchor. Null for EPUBs. */
+  page: number | null;
+  /** EPUB anchor. Empty for PDFs. */
+  cfi: string;
+  /** Short needle used to relocate the highlight when the anchor drifts. */
+  anchor_text: string;
+  created_at: string;
+  updated_at: string;
 }

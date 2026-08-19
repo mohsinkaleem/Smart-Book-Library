@@ -12,7 +12,11 @@ import { Dashboard } from './components/stats/Dashboard';
 import { ReadingView } from './components/reading/ReadingView';
 import { KeyboardShortcutsDialog } from './components/common/KeyboardShortcutsDialog';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
-import { EpubReader, PdfReader } from './components/reading/BookReader';
+import { EpubReader } from './components/reading/EpubReader';
+import { PdfReader } from './components/reading/PdfReader';
+import { ReaderRoute } from './components/reading/ReaderRoute';
+import { DuplicatesPage } from './pages/DuplicatesPage';
+import { PassageSearchPage } from './pages/PassageSearchPage';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useScrollToTop } from './hooks/useScrollToTop';
@@ -63,7 +67,8 @@ function AppShell() {
   // global handler live meant Escape fired twice (history went somewhere
   // unpredictable), `t` toggled both the library sidebar and the EPUB TOC,
   // and `d`/`1`/`2` fired inside a reader where they mean nothing.
-  const inReader = location.pathname.startsWith('/reader/');
+  const inReader =
+    location.pathname.startsWith('/reader/') || location.pathname.startsWith('/read/');
 
   useKeyboardShortcuts({
     onToggleView: setView,
@@ -139,6 +144,11 @@ function AppShell() {
           <Route path="/reading/:id" element={<Page className="flex-1 overflow-hidden"><ReadingView /></Page>} />
           <Route path="/reader/epub/:id" element={<Page className="flex-1 overflow-hidden"><EpubReader /></Page>} />
           <Route path="/reader/pdf/:id" element={<Page className="flex-1 overflow-hidden"><PdfReader /></Page>} />
+          {/* Deep links from passage cards. The server emits `/read/{id}?page=…`
+              because the reader route is not something the API should know. */}
+          <Route path="/read/:id" element={<Page className="flex-1 overflow-hidden"><ReaderRoute /></Page>} />
+          <Route path="/passages" element={<Page className="flex-1 overflow-y-auto"><PassageSearchPage /></Page>} />
+          <Route path="/duplicates" element={<Page className="flex-1 overflow-y-auto"><DuplicatesPage /></Page>} />
           <Route path="/stats" element={<Page className="flex-1 overflow-y-auto"><Dashboard /></Page>} />
           <Route path="/review" element={<Page className="flex-1 overflow-y-auto"><ReviewPage /></Page>} />
           <Route path="/settings" element={<Page className="flex-1 overflow-y-auto"><SettingsPage /></Page>} />

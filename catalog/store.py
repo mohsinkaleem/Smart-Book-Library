@@ -260,23 +260,48 @@ class CatalogStore:
 
     # ── embeddings ───────────────────────────────────────────────────────────
 
-    def store_embedding(self, book_id: str, content: Optional[bytes], metadata: Optional[bytes]):
+    def store_embedding(
+        self,
+        book_id: str,
+        content: Optional[bytes],
+        metadata: Optional[bytes],
+        model: Optional[str] = None,
+    ):
+        """Store embedding blobs, stamped with the model that produced them."""
+        from .embeddings import model_id
         with self._lock:
             self.conn.execute(
-                """INSERT INTO embeddings (book_id, content_embedding, metadata_embedding)
-                   VALUES (?, ?, ?)
+                """INSERT INTO embeddings (book_id, content_embedding, metadata_embedding, model_id)
+                   VALUES (?, ?, ?, ?)
                    ON CONFLICT(book_id) DO UPDATE SET
                        content_embedding = COALESCE(excluded.content_embedding, embeddings.content_embedding),
-                       metadata_embedding = COALESCE(excluded.metadata_embedding, embeddings.metadata_embedding)""",
-                (book_id, content, metadata),
+                       metadata_embedding = COALESCE(excluded.metadata_embedding, embeddings.metadata_embedding),
+                       model_id = excluded.model_id""",
+                (book_id, content, metadata, model or model_id()),
             )
             self.conn.commit()
 
-    def has_embedding(self, book_id: str) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM embeddings WHERE book_id = ? AND content_embedding IS NOT NULL",
+    def has_embedding(self, book_id: str, model: Optional[str] = None) -> bool:
+        """
+        Whether a usable content embedding is stored for this book.
+
+        Pass `model` to also require that it was built by that model. Without
+        it a model switch looks like "everything is already embedded", so the
+        gap-filling embed task skips all 618 books and leaves the catalog on
+        vectors that no longer match the query encoder.
+        """
+        row = self.conn.execute(
+            "SELECT model_id FROM embeddings "
+            "WHERE book_id = ? AND content_embedding IS NOT NULL",
             (book_id,),
-        ).fetchone() is not None
+        ).fetchone()
+        if row is None:
+            return False
+        if model is None:
+            return True
+        stored = row[0] or ""
+        # A blank stamp predates `model_id` and cannot be trusted to match.
+        return stored == model
 
     # ── search / stats / export ──────────────────────────────────────────────
 

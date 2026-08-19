@@ -5,6 +5,7 @@ import { useTheme } from '../../hooks/useTheme';
 import { Spinner } from '../common/Spinner';
 import { ErrorState } from '../common/ErrorBoundary';
 import { formatBytes } from '../../utils/format';
+import { ReadingActivity } from './ReadingActivity';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
 /**
@@ -80,6 +81,16 @@ export function Dashboard() {
     <div className="space-y-6 p-6">
       <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Library Statistics</h1>
 
+      {/* Reading activity (Part 5). Above the library counts deliberately:
+          "what have I actually been reading" is the question a dashboard is
+          opened to answer, and it was the one thing this page could not say. */}
+      <section>
+        <h2 className="mb-3 text-sm font-bold text-slate-700 dark:text-slate-300">
+          Reading activity
+        </h2>
+        <ReadingActivity colors={colors} tooltipStyle={tooltipStyle} />
+      </section>
+
       {/* Summary cards */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
         <StatCard label="Books" value={String(stats.total_books)} />
@@ -91,7 +102,7 @@ export function Dashboard() {
         <StatCard
           label="Possible duplicates"
           value={String(stats.duplicates)}
-          to={stats.duplicates > 0 ? '/review' : undefined}
+          to={stats.duplicates > 0 ? '/duplicates' : undefined}
         />
       </div>
 

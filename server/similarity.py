@@ -13,25 +13,40 @@ EMBEDDING_DIM = 384
 
 # Relevance floor for semantic ranking.
 #
-# Every book gets a cosine score against every query, and on a 544-book
-# catalog almost all of them are positive: a nonsense query ("zebra
-# husbandry") still scores 306 books above zero. Ranking the whole matrix is
-# right — it is what makes `total` honest instead of the size of an arbitrary
-# 200-row cap — but "honest" cannot mean reporting the entire library as
-# matching. Two floors, and a book must clear both:
+# Every book gets a cosine score against every query, and almost all of them
+# are positive, so ranking the whole matrix — which is what makes `total`
+# honest rather than the size of an arbitrary cap — cannot mean reporting the
+# entire library as matching. Two floors, and a book must clear both:
 #
-# * `MIN_SEMANTIC_SCORE` is absolute, and set from the measured distribution:
-#   a query with nothing to match tops out around 0.17, while real matches
-#   start around 0.35. It is what makes "no results" possible at all.
-# * `SEMANTIC_RELATIVE_FLOOR` is proportional to the best hit, and handles
-#   the opposite case — a query on this catalog's dominant subject where
-#   hundreds of books clear the absolute floor and only the top of the
-#   ranking is worth showing.
+# * `MIN_SEMANTIC_SCORE` is absolute, and is what makes "no results" possible
+#   at all.
+# * `SEMANTIC_RELATIVE_FLOOR` is proportional to the best hit, and handles the
+#   opposite case — a query on this catalog's dominant subject, where hundreds
+#   of books clear the absolute floor and only the top of the ranking is worth
+#   showing.
 #
-# Neither can drop an exact keyword match: in hybrid mode the FTS side is
-# unioned in after this runs.
-MIN_SEMANTIC_SCORE = 0.28
-SEMANTIC_RELATIVE_FLOOR = 0.55
+# ── These are model-specific, and must be re-measured after a model change ──
+#
+# Calibrated for `BAAI/bge-small-en-v1.5` on 2026-08-19 over this 618-book
+# catalog, from the top-score distribution of six real queries against four
+# nonsense ones:
+#
+#     real queries   top score 0.655 – 0.834
+#     nonsense       top score 0.564 – 0.621
+#
+# bge packs everything into a high, narrow band, so the gap between "relevant"
+# and "nothing to match" is 0.03 wide rather than the 0.2 it was under
+# `all-MiniLM-L6-v2`. The previous values (0.28 / 0.55) were tuned to MiniLM's
+# much wider spread and, carried over unchanged, sat below bge's *noise* floor:
+# "zebra husbandry in antarctica" returned all 618 books.
+#
+# The relative floor moved for the same reason. Measured against real queries,
+# the 50th result scores ~0.84 of the best one (for nonsense it is ~0.91 — the
+# ranking is flat because nothing is genuinely more relevant than anything
+# else), so 0.84 keeps roughly the top 50 of a strong query and more than that
+# on a subject the library is deep in.
+MIN_SEMANTIC_SCORE = 0.63
+SEMANTIC_RELATIVE_FLOOR = 0.84
 
 
 class SimilarityEngine:
@@ -64,19 +79,47 @@ class SimilarityEngine:
         return vec
 
     def load_embeddings(self):
-        """Load all embeddings into NumPy matrices."""
+        """
+        Load all embeddings into NumPy matrices.
+
+        Rows stamped with a model other than the configured one are skipped.
+        Two models produce vectors of the same shape whose cosine is noise, so
+        mixing them does not raise — it just returns confident nonsense. A
+        blank stamp is grandfathered in: it predates `model_id` and belongs to
+        whatever model was configured when it was written.
+        """
         rows = self.db.get_all_embeddings()
         if not rows:
             logger.info("No embeddings found in database")
             return
 
+        try:
+            from catalog.embeddings import model_id
+            expected = model_id()
+        except Exception:
+            expected = ""
+
         ids = []
         content_vecs = []
         metadata_vecs = []
-        for book_id, content_blob, metadata_blob in rows:
+        skipped: dict[str, int] = {}
+        for book_id, content_blob, metadata_blob, row_model in rows:
+            if expected and row_model and row_model != expected:
+                skipped[row_model] = skipped.get(row_model, 0) + 1
+                continue
             ids.append(book_id)
             content_vecs.append(self._to_vector(content_blob, book_id, "content"))
             metadata_vecs.append(self._to_vector(metadata_blob, book_id, "metadata"))
+
+        for stale_model, count in skipped.items():
+            logger.warning(
+                f"Skipped {count} embeddings built with {stale_model!r}; the catalog "
+                f"is configured for {expected!r}. Re-run the embed stage to restore them."
+            )
+
+        if not ids:
+            logger.warning("No embeddings matched the configured model; similarity is disabled")
+            return
 
         self.book_ids = ids
         self._id_to_idx = {bid: i for i, bid in enumerate(ids)}
@@ -270,12 +313,31 @@ class SimilarityEngine:
         return self._rank(self.content_matrix, query_embedding, limit, allowed_ids)
 
     def encode_query(self, text: str) -> Optional[np.ndarray]:
-        """Encode a text query using sentence-transformers."""
+        """
+        Encode a short search-box query.
+
+        Asymmetric: `catalog.embeddings.encode_query` applies the retrieval
+        instruction prefix bge expects on queries. Use `encode_passage` for
+        prose — see `EMBEDDING_QUERY_PREFIX`.
+        """
         try:
-            from catalog.embeddings import _get_model
-            model = _get_model()
-            if model:
-                return model.encode(text, normalize_embeddings=True)
+            from catalog.embeddings import encode_query
+            return encode_query(text)
         except Exception as e:
             logger.warning(f"Failed to encode query: {e}")
+        return None
+
+    def encode_passage(self, text: str) -> Optional[np.ndarray]:
+        """
+        Encode a passage of prose for comparison against other prose.
+
+        Symmetric, so no query prefix. `/api/reading/compare` runs on this:
+        the selected paragraph and the stored `content_sample` must be
+        embedded the same way for their cosine to mean anything.
+        """
+        try:
+            from catalog.embeddings import encode_passage
+            return encode_passage(text)
+        except Exception as e:
+            logger.warning(f"Failed to encode passage: {e}")
         return None

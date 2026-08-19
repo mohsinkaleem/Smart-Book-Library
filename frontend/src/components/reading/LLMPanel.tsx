@@ -8,6 +8,11 @@ interface LLMPanelProps {
   bookId: string;
   /** Kept for callers; the server looks the title up from `bookId`. */
   bookTitle?: string;
+  /**
+   * Prose around the selection. The model used to see the passage and
+   * nothing else, which loses the argument the passage belongs to.
+   */
+  surrounding?: string;
 }
 
 const actions = [
@@ -18,7 +23,7 @@ const actions = [
   { id: 'related', label: 'Related', icon: Link2 },
 ];
 
-export function LLMPanel({ selectedText, bookId }: LLMPanelProps) {
+export function LLMPanel({ selectedText, bookId, surrounding }: LLMPanelProps) {
   const [response, setResponse] = useState('');
   const [loading, setLoading] = useState(false);
   // `GET /api/reading/llm-status` existed and nothing called it: the buttons
@@ -36,7 +41,7 @@ export function LLMPanel({ selectedText, bookId }: LLMPanelProps) {
       const res = await fetch('/api/reading/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: selectedText, book_id: bookId, action }),
+        body: JSON.stringify({ text: selectedText, book_id: bookId, action, surrounding }),
       });
 
       const reader = res.body?.getReader();
@@ -70,7 +75,7 @@ export function LLMPanel({ selectedText, bookId }: LLMPanelProps) {
     } finally {
       setLoading(false);
     }
-  }, [selectedText, bookId]);
+  }, [selectedText, bookId, surrounding]);
 
   return (
     <div>

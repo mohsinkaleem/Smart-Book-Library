@@ -14,8 +14,12 @@ from .config import DB_PATH, COVERS_DIR, FRONTEND_DIST
 from .db import BookDatabase
 from .similarity import SimilarityEngine
 from .search import SearchEngine
+from .passages import PassageIndex
 
-from .routes import books, search, filters, stats, reading, pipeline, review
+from .routes import (
+    books, search, filters, stats, reading, pipeline, review, annotations,
+    passages, threads, sessions, export, duplicates,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,10 +56,29 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     logger.info(f"Database opened: {db.get_book_count()} books")
 
+    # A rebuild derives book ids from file content, so re-encoding a file
+    # gives it a new id and orphans every highlight in it. The file path
+    # survived; re-point them at whatever now holds it.
+    for label, relink in (
+        ("annotations", db.relink_annotations),
+        ("threads", db.relink_threads),
+        ("reading sessions", db.relink_sessions),
+    ):
+        relinked = relink()
+        if relinked:
+            logger.info(f"Relinked {relinked} {label} to rebuilt book ids")
+
     # Similarity engine
     similarity = SimilarityEngine(db)
     similarity.load_embeddings()
     app.state.similarity = similarity
+
+    # Passage index (Part 1). Absent until `scripts/build_passage_index.py`
+    # has run, and every passage endpoint answers 503 with that instruction
+    # rather than pretending it found nothing.
+    passage_index = PassageIndex(db)
+    passage_index.load()
+    app.state.passages = passage_index
 
     # Search engine
     app.state.search_engine = SearchEngine(db, similarity)
@@ -98,6 +121,11 @@ def create_app() -> FastAPI:
             "version": VERSION,
             "books": db.get_book_count(),
             "embeddings_loaded": bool(similarity.has_embeddings),
+            "passage_index": {
+                "available": bool(request.app.state.passages.available),
+                "chunks": request.app.state.passages.meta.get("count", 0),
+                "books": request.app.state.passages.meta.get("book_count", 0),
+            },
             "database": str(DB_PATH),
         }
 
@@ -109,6 +137,12 @@ def create_app() -> FastAPI:
     app.include_router(reading.router)
     app.include_router(pipeline.router)
     app.include_router(review.router)
+    app.include_router(annotations.router)
+    app.include_router(passages.router)
+    app.include_router(threads.router)
+    app.include_router(sessions.router)
+    app.include_router(export.router)
+    app.include_router(duplicates.router)
 
     @app.exception_handler(Exception)
     async def unhandled_exception(request: Request, exc: Exception):

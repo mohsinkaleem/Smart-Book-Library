@@ -1,10 +1,11 @@
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, BookMarked, Copy, FileText } from 'lucide-react';
+import { ArrowLeft, BookMarked, Copy, Download, FileText, ScanText } from 'lucide-react';
 import { useBook, useSimilarBooks, useUpdateBook } from '../api/books';
 import { BookHeader } from '../components/detail/BookHeader';
 import { SimilarBooks } from '../components/detail/SimilarBooks';
 import { TagEditor } from '../components/detail/TagEditor';
 import { Spinner } from '../components/common/Spinner';
+import { usePassageIndexStatus } from '../api/passages';
 import { ErrorState } from '../components/common/ErrorBoundary';
 
 
@@ -12,6 +13,7 @@ export function BookPage() {
   const { id } = useParams<{ id: string }>();
   const { data: book, isLoading, isError, error, refetch } = useBook(id || '');
   const { data: similar } = useSimilarBooks(id || '');
+  const { data: passageStatus } = usePassageIndexStatus();
   const updateBook = useUpdateBook();
 
   if (isLoading) return <div className="flex h-full items-center justify-center"><Spinner /></div>;
@@ -43,6 +45,39 @@ export function BookPage() {
       </Link>
 
       <BookHeader book={book} onRate={handleRate} onFavorite={handleFavorite} onStatusChange={handleStatus} />
+
+      {/* The 19 books with no text layer (§1.10).
+
+          Saying so is the whole fix. Without it the reader renders the page
+          and every text affordance — selection, highlighting, in-document
+          search, passage matching — is silently inert, which reads as a broken
+          reader rather than as a scanned book. */}
+      {book.ocr_required && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg bg-amber-50 px-4 py-2.5 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+          <ScanText size={15} className="shrink-0" />
+          <span>
+            <strong className="font-semibold">No text layer.</strong> This is a
+            scanned book, so search, highlighting and passage matching will not
+            work in it until it is run through OCR.
+          </span>
+          <code className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-[11px] dark:bg-amber-900/40">
+            python scripts/ocr_books.py --book {book.id}
+          </code>
+        </div>
+      )}
+
+      {/* Indexed for passage search, or not yet. Same principle as the banner
+          above: an un-indexed book quietly returns nothing. */}
+      {!book.ocr_required && passageStatus?.available === false && (
+        <div className="rounded-lg bg-slate-100 px-4 py-2.5 text-sm text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+          Passage search is not built yet, so &ldquo;similar passages&rdquo; in the
+          reader will be empty. Run{' '}
+          <code className="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-[11px] dark:bg-slate-700">
+            python scripts/build_passage_index.py
+          </code>
+          .
+        </div>
+      )}
 
       {/* `duplicate_of` was computed by the pipeline, stored, indexed and
           present in the TS type — and rendered nowhere, so the detection did
@@ -109,6 +144,17 @@ export function BookPage() {
             <FileText size={16} /> View Text Excerpt
           </Link>
         )}
+
+        {/* Part 5: portable notes. A plain anchor rather than a fetch-and-blob,
+            because the endpoint already sets `Content-Disposition` and the
+            browser's own download is better than one reimplemented in JS. */}
+        <a
+          href={`/api/export/markdown?book_id=${encodeURIComponent(book.id)}`}
+          download
+          className="flex items-center gap-2 rounded-lg bg-slate-100 px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600"
+        >
+          <Download size={16} /> Export notes
+        </a>
       </div>
 
       {/* Similar Books */}

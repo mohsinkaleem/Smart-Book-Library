@@ -30,7 +30,7 @@ A local-first web application for managing, cataloging, and exploring your perso
 | State      | TanStack Query v5; UI state in the URL + localStorage |
 | Charts     | Recharts                                              |
 | Icons      | Lucide React                                          |
-| Embeddings | sentence-transformers (`all-MiniLM-L6-v2`)            |
+| Embeddings | sentence-transformers (`BAAI/bge-small-en-v1.5`)      |
 | LLM        | Ollama (local, optional)                              |
 | OCR        | Tesseract + pdf2image (optional)                      |
 
@@ -154,7 +154,18 @@ For semantic search and "similar books" features:
 curl -X POST http://127.0.0.1:8000/api/pipeline/generate-embeddings
 ```
 
-This uses `all-MiniLM-L6-v2` to generate 384-dimensional embeddings for each book's text.
+This uses `BAAI/bge-small-en-v1.5` to generate 384-dimensional embeddings for each
+book's text. It replaced `all-MiniLM-L6-v2`: same dimensions, so nothing about the
+storage or the search changes, but a 512-token sequence limit instead of 256 — the
+old model truncated a 4,000-character content sample around its halfway mark.
+
+Vectors from two models share a shape and mean nothing together, so each row is
+stamped with the model that produced it and the server refuses to load rows that
+do not match. After changing `EMBEDDING_MODEL`, re-embed the whole catalog:
+
+```bash
+python scripts/reembed.py
+```
 
 ## Project Structure
 

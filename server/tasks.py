@@ -130,13 +130,19 @@ def run_pipeline_background(
     threading.Thread(target=_run, daemon=True).start()
 
 
-def run_embedding_generation(db, similarity_engine):
-    """Generate embeddings for records that lack them."""
+def run_embedding_generation(db, similarity_engine, force: bool = False):
+    """
+    Generate embeddings for records that lack a *current* one.
+
+    "Current" means built by the configured model. This used to test only for
+    presence, so switching `EMBEDDING_MODEL` left every book looking done
+    while its vectors belonged to the previous model's space.
+    """
 
     def _run():
         try:
             import numpy as np
-            from catalog.embeddings import generate_embeddings
+            from catalog.embeddings import generate_embeddings, model_id
             from catalog.store import CatalogStore
 
             task_tracker.start_task("embeddings", message="Generating embeddings...")
@@ -145,16 +151,17 @@ def run_embedding_generation(db, similarity_engine):
                 records = store.all_records()
                 task_tracker.update_progress("embeddings", 0, "Loading model...", total=len(records))
 
+                model = model_id()
                 count = 0
                 for i, record in enumerate(records):
-                    if not store.has_embedding(record.id):
-                        generate_embeddings(record)
+                    if force or not store.has_embedding(record.id, model=model):
+                        generate_embeddings(record, force=force)
                         if record.embedding or record.metadata_embedding:
                             content = (np.array(record.embedding, dtype=np.float32).tobytes()
                                        if record.embedding else None)
                             meta = (np.array(record.metadata_embedding, dtype=np.float32).tobytes()
                                     if record.metadata_embedding else None)
-                            store.store_embedding(record.id, content, meta)
+                            store.store_embedding(record.id, content, meta, model=model)
                             count += 1
                     task_tracker.update_progress(
                         "embeddings", i + 1, f"Processing {i + 1}/{len(records)}"
@@ -163,7 +170,7 @@ def run_embedding_generation(db, similarity_engine):
                 store.close()
 
             similarity_engine.load_embeddings()
-            task_tracker.complete_task("embeddings", f"Generated {count} new embeddings")
+            task_tracker.complete_task("embeddings", f"Generated {count} embeddings")
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}", exc_info=True)
             task_tracker.fail_task("embeddings", str(e))

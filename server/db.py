@@ -899,19 +899,167 @@ class BookDatabase:
 
     # ── Embedding Storage ────────────────────────────────────────────────
 
-    def store_embedding(self, book_id: str, content_emb: Optional[bytes], metadata_emb: Optional[bytes]):
-        """Store embedding blobs."""
+    def store_embedding(
+        self,
+        book_id: str,
+        content_emb: Optional[bytes],
+        metadata_emb: Optional[bytes],
+        model: Optional[str] = None,
+    ):
+        """Store embedding blobs, stamped with the model that produced them."""
+        if model is None:
+            from catalog.embeddings import model_id
+            model = model_id()
         with self._lock:
             self.conn.execute("""
-                INSERT OR REPLACE INTO embeddings (book_id, content_embedding, metadata_embedding)
-                VALUES (?, ?, ?)
-            """, (book_id, content_emb, metadata_emb))
+                INSERT OR REPLACE INTO embeddings
+                    (book_id, content_embedding, metadata_embedding, model_id)
+                VALUES (?, ?, ?, ?)
+            """, (book_id, content_emb, metadata_emb, model))
             self.conn.commit()
 
-    def get_all_embeddings(self) -> list[tuple[str, Optional[bytes], Optional[bytes]]]:
-        """Get all embeddings for loading into memory."""
-        rows = self.query("SELECT book_id, content_embedding, metadata_embedding FROM embeddings")
-        return [(r["book_id"], r["content_embedding"], r["metadata_embedding"]) for r in rows]
+    def get_all_embeddings(self) -> list[tuple[str, Optional[bytes], Optional[bytes], str]]:
+        """Every stored embedding, with the model that produced it."""
+        rows = self.query(
+            "SELECT book_id, content_embedding, metadata_embedding, model_id FROM embeddings"
+        )
+        return [
+            (r["book_id"], r["content_embedding"], r["metadata_embedding"], r["model_id"] or "")
+            for r in rows
+        ]
+
+    # ── Annotations ──────────────────────────────────────────────────────
+    #
+    # Thin, locked wrappers over `catalog.annotations`, which owns the SQL.
+    # Every statement goes through `self._lock` for the reason given on the
+    # class: FastAPI runs these handlers in a threadpool against one shared
+    # connection.
+
+    def list_annotations(self, book_id=None, kind=None, limit=None) -> list[dict]:
+        from catalog.annotations import list_annotations
+        with self._lock:
+            return list_annotations(self.conn, book_id=book_id, kind=kind, limit=limit)
+
+    def get_annotation(self, ann_id: str) -> Optional[dict]:
+        from catalog.annotations import get_annotation
+        with self._lock:
+            return get_annotation(self.conn, ann_id)
+
+    def create_annotation(self, book_id: str, **fields) -> Optional[dict]:
+        from catalog.annotations import create_annotation
+        with self._lock:
+            return create_annotation(self.conn, book_id, **fields)
+
+    def update_annotation(self, ann_id: str, fields: dict) -> Optional[dict]:
+        from catalog.annotations import update_annotation
+        with self._lock:
+            return update_annotation(self.conn, ann_id, fields)
+
+    def delete_annotation(self, ann_id: str) -> bool:
+        from catalog.annotations import delete_annotation
+        with self._lock:
+            return delete_annotation(self.conn, ann_id)
+
+    def relink_annotations(self) -> int:
+        from catalog.annotations import relink_orphans
+        with self._lock:
+            return relink_orphans(self.conn)
+
+    def annotation_counts(self) -> dict[str, int]:
+        from catalog.annotations import counts_by_book
+        with self._lock:
+            return counts_by_book(self.conn)
+
+    # ── LLM threads (§4.2) ───────────────────────────────────────────────
+
+    def list_threads(self, book_id=None, limit=None) -> list[dict]:
+        from catalog.threads import list_threads
+        with self._lock:
+            return list_threads(self.conn, book_id=book_id, limit=limit)
+
+    def get_thread(self, thread_id: str) -> Optional[dict]:
+        from catalog.threads import get_thread
+        with self._lock:
+            return get_thread(self.conn, thread_id)
+
+    def create_thread(self, book_id: str, **fields) -> Optional[dict]:
+        from catalog.threads import create_thread
+        with self._lock:
+            return create_thread(self.conn, book_id, **fields)
+
+    def update_thread(self, thread_id: str, fields: dict) -> Optional[dict]:
+        from catalog.threads import update_thread
+        with self._lock:
+            return update_thread(self.conn, thread_id, fields)
+
+    def delete_thread(self, thread_id: str) -> bool:
+        from catalog.threads import delete_thread
+        with self._lock:
+            return delete_thread(self.conn, thread_id)
+
+    def add_message(self, thread_id: str, role: str, content: str, action: str = "") -> Optional[dict]:
+        from catalog.threads import add_message
+        with self._lock:
+            return add_message(self.conn, thread_id, role, content, action)
+
+    def relink_threads(self) -> int:
+        from catalog.threads import relink_orphans
+        with self._lock:
+            return relink_orphans(self.conn)
+
+    # ── Reading sessions (Part 5) ────────────────────────────────────────
+
+    def session_heartbeat(self, book_id: str, page=None) -> Optional[dict]:
+        from catalog.reading_sessions import heartbeat
+        with self._lock:
+            return heartbeat(self.conn, book_id, page)
+
+    def list_sessions(self, book_id=None, limit: int = 200) -> list[dict]:
+        from catalog.reading_sessions import list_sessions
+        with self._lock:
+            return list_sessions(self.conn, book_id=book_id, limit=limit)
+
+    def session_stats(self, days: int = 30) -> dict:
+        from catalog.reading_sessions import stats
+        with self._lock:
+            return stats(self.conn, days=days)
+
+    def book_reading_time(self) -> dict[str, int]:
+        from catalog.reading_sessions import book_time
+        with self._lock:
+            return book_time(self.conn)
+
+    def relink_sessions(self) -> int:
+        from catalog.reading_sessions import relink_orphans
+        with self._lock:
+            return relink_orphans(self.conn)
+
+    # ── EPUB locations (§2.1) ────────────────────────────────────────────
+
+    def get_epub_locations(self, book_id: str) -> Optional[dict]:
+        row = self.query_one(
+            "SELECT locations, total, chars, created_at FROM epub_locations WHERE book_id = ?",
+            (book_id,),
+        )
+        if row is None:
+            return None
+        return {
+            "locations": row["locations"], "total": row["total"],
+            "chars": row["chars"], "created_at": row["created_at"],
+        }
+
+    def store_epub_locations(self, book_id: str, locations: str, total: int, chars: int) -> None:
+        from datetime import datetime
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO epub_locations (book_id, locations, total, chars, created_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET "
+                "  locations = excluded.locations, total = excluded.total, "
+                "  chars = excluded.chars, created_at = excluded.created_at",
+                (book_id, locations, total, chars,
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+            self.conn.commit()
 
     def get_book_count(self) -> int:
         return self.query_one("SELECT COUNT(*) as cnt FROM books WHERE status != 'missing'")["cnt"]
