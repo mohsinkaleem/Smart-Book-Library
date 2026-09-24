@@ -132,6 +132,63 @@ class TestInvalidation(StageTestCase):
         self.assertFalse(record.needs_review)
         self.assertEqual(record.review_reasons, [])
 
+    def test_shared_lists_reset_only_when_every_writer_reruns(self):
+        record = enriched_record(source_ids=["2015-12-24T14:22:40+00:00"],
+                                 subjects_raw=["From an API"])
+        self.invalidate(record, {"parse", "extract", "ocr", "identify"})   # --no-api
+        self.assertEqual(record.subjects_raw, ["From an API"])
+        self.assertEqual(record.source_ids, ["2015-12-24T14:22:40+00:00"])
+
+        self.invalidate(record, set(pipeline_mod.METADATA_COHORT))
+        self.assertEqual(record.subjects_raw, [])
+        self.assertEqual(record.source_ids, [])
+
+
+class TestDeferredStages(StageTestCase):
+    """A stage that could not do its job must stay stale so the next run retries it."""
+
+    def run_stages(self, pipeline, record, stages):
+        pipeline._run_book_stages(record, Path(record.file_path), set(stages))
+        return record
+
+    def test_enrich_with_provider_errors_is_retried(self):
+        record = enriched_record()
+        del record.stage_versions["enrich"]
+        pipeline = self.pipeline()
+        with unittest.mock.patch.object(
+            pipeline_mod, "enrich_from_apis",
+            return_value={"verdict": "reject", "incomplete": True, "reason": ""},
+        ):
+            self.run_stages(pipeline, record, {"enrich"})
+        self.assertNotIn("enrich", record.stage_versions)
+        self.assertEqual(pipeline.stats["api_deferred"], 1)
+        self.assertEqual(pipeline.stats["errors"], 0)
+
+    def test_an_accepted_match_is_final_despite_provider_errors(self):
+        record = enriched_record()
+        del record.stage_versions["enrich"]
+        with unittest.mock.patch.object(
+            pipeline_mod, "enrich_from_apis",
+            return_value={"verdict": "accept", "incomplete": True, "reason": "isbn match"},
+        ):
+            self.run_stages(self.pipeline(), record, {"enrich"})
+        self.assertEqual(record.stage_versions["enrich"], STAGE_VERSIONS["enrich"])
+
+    def test_llm_stage_waits_for_ollama(self):
+        record = enriched_record()
+        del record.stage_versions["llm"]
+        pipeline = self.pipeline(llm_enrich=True)
+        pipeline._llm_ready = False
+        self.run_stages(pipeline, record, {"llm"})
+        self.assertNotIn("llm", record.stage_versions)
+
+    def test_ocr_stage_waits_for_tesseract(self):
+        record = enriched_record(ocr_required=True)
+        del record.stage_versions["ocr"]
+        with unittest.mock.patch("catalog.ocr_extractor.is_available", return_value=False):
+            self.run_stages(self.pipeline(), record, {"ocr"})
+        self.assertNotIn("ocr", record.stage_versions)
+
 
 class TestStoreUserData(StageTestCase):
     def test_rating_and_tags_survive_a_content_change(self):

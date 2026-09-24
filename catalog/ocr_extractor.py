@@ -140,7 +140,7 @@ def _clean_ocr_text(text: str) -> str:
 def _save_ocr_cover(image, file_path: Path, record: BookRecord):
     try:
         from PIL import Image
-        cover_path = COVERS_DIR / f"{file_path.stem}_cover.jpg"
+        cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
         img = image.copy()
         if img.mode in ("RGBA", "P", "LA"):
             img = img.convert("RGB")

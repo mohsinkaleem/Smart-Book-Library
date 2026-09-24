@@ -38,6 +38,19 @@ _availability: Optional[bool] = None
 _availability_lock = threading.Lock()
 
 
+class LLMNoResponse(Exception):
+    """Ollama returned nothing usable (timeout, error, unparseable output)."""
+
+
+def _str_list(value) -> list[str]:
+    """Model output is JSON-shaped, not schema-checked: a bare string or nested list happens."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+
+
 def is_available(refresh: bool = False) -> bool:
     """True when Ollama is running and the configured model is installed."""
     global _availability
@@ -139,18 +152,18 @@ Book information:
     raw = _generate(prompt)
     result = _parse_llm_json(raw)
     if not result:
-        return record
+        raise LLMNoResponse(f"no usable summary for {record.file_name}")
 
-    summary = (result.get("summary") or "").strip()
+    summary = " ".join(_str_list(result.get("summary")))
     if summary and len(summary) > 40:
         record.set_field("summary", summary[:600], "llm", 0.6)
 
-    themes = [t.strip() for t in result.get("themes", []) if isinstance(t, str) and t.strip()]
+    themes = _str_list(result.get("themes"))
     if themes:
         merged = list(dict.fromkeys([*record.themes, *themes]))[:8]
         record.set_field("themes", merged, "llm", 0.5, allow_equal=True)
 
-    categories = constrain_categories(result.get("categories", []))
+    categories = constrain_categories(_str_list(result.get("categories")))
     if categories:
         merged = list(dict.fromkeys([*record.categories, *categories]))[:5]
         record.set_field("categories", merged, "llm", 0.5, allow_equal=True)
@@ -176,7 +189,9 @@ Book information:
 {context}"""
 
     response = _generate(prompt, temperature=0.4)
-    if response and len(response.strip()) > 60:
+    if response is None:
+        raise LLMNoResponse(f"no description for {record.file_name}")
+    if len(response.strip()) > 60:
         record.set_field("description", response.strip()[:2000], "llm", 0.45)
         logger.info(f"   🤖 Generated LLM description for {record.file_name}")
     return record
@@ -219,12 +234,15 @@ Answer with JSON only: {{"same_book": true|false, "confidence": 0.0-1.0, "why": 
         return None
 
     decision = parsed.get("same_book")
-    confidence = float(parsed.get("confidence") or 0.0)
+    try:
+        confidence = float(parsed.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return None
     if not isinstance(decision, bool) or confidence < 0.6:
         return None
     logger.info(
         f"   🤖 LLM adjudication for {record.file_name}: "
-        f"{'match' if decision else 'mismatch'} ({parsed.get('why', '')[:80]})"
+        f"{'match' if decision else 'mismatch'} ({str(parsed.get('why', ''))[:80]})"
     )
     return decision
 

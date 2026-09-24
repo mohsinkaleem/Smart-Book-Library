@@ -60,7 +60,10 @@ A stage (`parse`, `extract`, `ocr`, `identify`, `enrich`, `analyze`, `llm`,
 - the book has no record yet,
 - its file content changed since last time, or
 - the stage's version in `catalog/config.py` (`STAGE_VERSIONS`) is newer than
-  what's recorded.
+  what's recorded, or
+- the stage was *deferred* last time: a provider errored or throttled us and no
+  match was accepted, OCR tools were missing, or Ollama was down / returned
+  nothing. The run summary reports these as `deferred`.
 
 So re-running the same command after a Ctrl+C, crash, or network timeout just
 picks up the remaining/failed books — already-enriched ones are skipped. Use

@@ -28,12 +28,15 @@ from .evidence import (
     REJECT,
     Candidate,
     Evidence,
+    _ratio,
     best_candidate,
     collect_evidence,
 )
+from .languages import UNKNOWN, normalise_language
 from .models import BookRecord
 from .names import clean_authors
 from .providers import (
+    failed_lookups,
     get_metrics,
     google_books_by_isbn,
     google_books_search,
@@ -41,21 +44,18 @@ from .providers import (
     openlibrary_search,
     openlibrary_work_details,
     probe_sources,
+    reset_failed_lookups,
     save_cache,
 )
 
 logger = logging.getLogger(__name__)
-
-# Fields a borderline match is allowed to contribute. Identity fields (title,
-# authors, ISBNs, year, publisher) are deliberately excluded.
-_DESCRIPTIVE_FIELDS = {"description", "page_count", "language", "cover_path"}
 
 
 def gather_candidates(evidence: Evidence, max_isbns: int = 2) -> list[Candidate]:
     """Query both providers: ISBN lookups first, then field-scoped searches."""
     candidates: list[Candidate] = []
 
-    for isbn in sorted(evidence.isbns, key=len, reverse=True)[:max_isbns]:
+    for isbn in evidence.ordered_isbns()[:max_isbns]:
         candidates.extend(openlibrary_by_isbn(isbn))
         candidates.extend(google_books_by_isbn(isbn))
 
@@ -81,6 +81,7 @@ def enrich_from_apis(
     the pipeline folds into its run report.
     """
     evidence = collect_evidence(record)
+    reset_failed_lookups()
     result = {
         "verdict": REJECT,
         "score": 0.0,
@@ -96,10 +97,17 @@ def enrich_from_apis(
         return result
 
     candidates = gather_candidates(evidence)
+    # A throttled or failed provider call means the answer below may be missing
+    # the right candidate; the pipeline then retries on the next run.
+    result["incomplete"] = failed_lookups() > 0
     result["candidates"] = len(candidates)
     if not candidates:
-        record.flag_review("no provider returned a match")
-        result["reason"] = "no candidates returned"
+        if result["incomplete"]:
+            record.flag_review("metadata lookup incomplete (provider errors) — will retry")
+            result["reason"] = "no candidates (provider errors)"
+        else:
+            record.flag_review("no provider returned a match")
+            result["reason"] = "no candidates returned"
         return result
 
     best, verdict, rejections = best_candidate(candidates, evidence)
@@ -190,9 +198,15 @@ def _apply_candidate(
 ):
     """Merge a candidate into the record, field by field, with provenance."""
     if identity:
-        if cand.title and not _is_truncation_of(cand.title, record.title):
+        # "OneWorld" / "Misquoting Muhammad: …" matched on its subtitle; its bare
+        # title is an imprint, and writing it would replace a correct title.
+        subtitle_borne = bool(cand.subtitle) and (
+            _ratio(cand.full_title, record.title) - _ratio(cand.title, record.title) > 0.4
+        )
+        if cand.title and not subtitle_borne and not _is_truncation_of(cand.title, record.title):
             record.set_field("title", cand.title.strip(), source, confidence)
-        if cand.subtitle:
+        if (cand.subtitle and not subtitle_borne
+                and cand.subtitle.strip().lower() not in (record.title or "").lower()):
             record.set_field("subtitle", cand.subtitle.strip(), source, confidence)
         authors = clean_authors(cand.authors)
         if authors:
@@ -201,16 +215,21 @@ def _apply_candidate(
             record.set_field("publisher", cand.publisher.strip(), source, confidence)
         if cand.year:
             record.set_field("publication_year", cand.year, source, confidence)
-        # Identifiers only ever come from a verified match.
-        if cand.isbn_13:
-            record.set_field("isbn_13", cand.isbn_13, source, confidence)
-        if cand.isbn_10:
-            record.set_field("isbn_10", cand.isbn_10, source, confidence)
+        # A title match names the *work*, not this file's edition: its ISBN may
+        # fill a gap but must not replace one printed in the file itself.
+        if source == "isbn_match" or not (record.isbn_13 or record.isbn_10):
+            if cand.isbn_13:
+                record.set_field("isbn_13", cand.isbn_13, source, confidence)
+            if cand.isbn_10:
+                record.set_field("isbn_10", cand.isbn_10, source, confidence)
 
-    if cand.page_count:
+    # A PDF's own page count is exact; the provider's is some print edition's.
+    if cand.page_count and not (record.file_type == "pdf" and record.page_count):
         record.set_field("page_count", cand.page_count, source, confidence * 0.9)
-    if cand.language:
-        record.set_field("language", cand.language[:2], source, confidence * 0.9)
+    # Likewise the file's language is this file's; the provider's only fills a gap.
+    language = normalise_language(cand.language)
+    if language != UNKNOWN and not record.language:
+        record.set_field("language", language, source, confidence * 0.9)
 
     description = cand.description
     subjects = list(cand.subjects or [])

@@ -74,6 +74,16 @@ def looks_like_tool(s: str) -> bool:
     return bool(_NOT_A_PERSON.search(s or ""))
 
 
+def is_tool_title(s: str) -> bool:
+    """
+    A title that *is* a tool string ("Microsoft Word", "Adobe InDesign CS5.5"),
+    not a real title that merely contains a flagged word ("Man, the Unknown").
+    """
+    if not looks_like_tool(s):
+        return False
+    return len((s or "").split()) <= 2 or bool(re.search(r"\d+\.\d+", s))
+
+
 def is_person_name(s: str) -> bool:
     """
     Conservative test for "this string is a human name".

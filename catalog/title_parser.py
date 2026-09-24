@@ -29,7 +29,7 @@ STRIP_PATTERNS = [
     r"^toaz\.info-",
     r"^noor-book\.com\s+",
     r"^annas-archive\S*_",
-    r"^\[\s*\]\s*",
+    r"^\[[^\]]*\]\s*(?=\S)",          # "[]", "[undefined series …]" — never the whole name
     r"\s*[-_]\s*libgen(?:\.li|\.rs|\.is)?\s*$",
     r"\s*\(\s*z-lib\.org\s*\)\s*$",
     r"\s*\(\s*PDFDrive(?:\.com)?\s*\)\s*$",
@@ -42,10 +42,13 @@ STRIP_PATTERNS = [
     r"^[0-9a-f]{20,}[_-]",             # hash-like prefix
     r"^\d{8,}[_-]",                    # download-site numeric id prefix
     r"^\d{1,3}\.\s+",                  # "10. " list prefix (never a bare "80-")
-    r"[-_\s]+(?:pdf|epub|mobi|ebook|e-book|book)$",
+    # Not a bare "book": "Text Book.pdf" and "The Jungle Book" end in one.
+    r"[-_\s.]+(?:pdf|epub|mobi|ebook|e-book)$",
+    r"[-_\s.]+pdf[-_\s.]+free$",
+    r"[-_\s]+[a-z0-9-]+\.(?:com|org|net|info)$",   # "… booksfree.org"
     r"^(?:en|ar|ur|fr|de|es)[-_](?=[a-z])",   # locale prefix
     r"[-_](?:en|eng|ar|ara|urd|ur)$",         # locale suffix
-    r"[-_\s]+(?:final|draft|v\d+|rev\d*|ocr|scan(?:ned)?|compressed|merged)$",
+    r"[-_\s.]+(?:final|draft|v\d+|rev\d*|ocr|scan(?:ned)?|compressed|merged)$",
 ]
 
 PUBLISHER_PATTERNS = [
@@ -130,10 +133,16 @@ def _normalise_separators(name: str) -> str:
 
     if _SPACED_DASH.search(name):
         return name
+    # "Computer.Science.Distilled" uses dots the way others use hyphens.
+    if " " not in name and name.count(".") >= 2:
+        name = name.replace(".", " ")
     hyphens = name.count("-")
     spaces = name.count(" ")
     if (hyphens >= 2 and hyphens >= spaces) or (hyphens >= 1 and spaces == 0):
         name = name.replace("-", " ")
+    # "HowToLieWithStatistics": a single CamelCase token is a spaced title.
+    if " " not in name.strip():
+        name = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", name)
     return re.sub(r"\s{2,}", " ", name).strip()
 
 
@@ -194,6 +203,8 @@ def tidy_title(name: str) -> str:
     name = name.strip(" -–—_.,;:")
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"\s+([:,;])", r"\1", name)
+    if name.startswith("[") and name.endswith("]") and name.count("[") == 1:
+        name = name[1:-1].strip()
     if not name:
         return ""
     if name == name.lower() or name == name.upper():
@@ -228,12 +239,19 @@ def parse_filename(filename: str) -> dict:
     publisher = extract_publisher_from_filename(stem)
 
     name = _strip_identifiers(stem)
+    # z-lib style "[Andriy_Burkov]_The_Hundred-Page_…": the bracket is the author.
+    bracket_authors = []
+    m = re.match(r"^\[([^\]]+)\][\s_]*(?=\S)", name)
+    if m and is_person_name(m.group(1).replace("_", " ")):
+        bracket_authors = [normalize_author(m.group(1).replace("_", " "))]
+        name = name[m.end():]
     name = _clean_markers(name)
     name = _remove_metadata_parens(name)
     name = _normalise_separators(name)
     name = _clean_markers(name)
 
     title, authors = split_author_title(name)
+    authors = authors or bracket_authors
     title = tidy_title(title)
 
     # A title with no letters at all (bare digits, punctuation) says nothing.

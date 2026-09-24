@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .config import COVERS_DIR, MAX_PAGES_TO_EXTRACT, MIN_TEXT_CHARS_FOR_HAS_TEXT
 from .models import BookRecord
-from .names import clean_authors, is_person_name, looks_like_tool
+from .names import clean_authors, is_person_name, is_tool_title
 from .text_utils import detect_language, detect_script, partition_pages
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def clean_meta_title(raw: str) -> str:
         r"(?:^|\s)(final|draft|copy|new|edit(?:ed)?|rev\d*|v\d+|test)$", title, flags=re.I
     ):
         return ""
-    if len(title) < 3 or _JUNK_TITLE.match(title) or looks_like_tool(title):
+    if len(title) < 3 or _JUNK_TITLE.match(title) or is_tool_title(title):
         return ""
     if not re.search(r"[^\W\d_]", title, re.UNICODE):
         return ""
@@ -168,7 +168,7 @@ def _extract_pdf_cover(reader, file_path: Path, record: BookRecord):
                 continue
 
         if largest_img and largest_size > 1000:
-            cover_path = COVERS_DIR / f"{file_path.stem}_cover.jpg"
+            cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
             image = Image.open(io.BytesIO(largest_img))
             if image.mode in ("RGBA", "P", "LA"):
                 image = image.convert("RGB")

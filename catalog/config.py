@@ -235,11 +235,11 @@ SCHEMA_VERSION = "2.0"
 # recorded on that record, or when the file's content hash changed. Bump a
 # version after changing that stage's logic to re-run it on the next pass.
 STAGE_VERSIONS = {
-    "parse": 2,
-    "extract": 2,
+    "parse": 3,        # download artefacts, dotted/CamelCase names, [Author]_ prefixes
+    "extract": 3,      # EPUB spine order, cover-image, identifier/language hygiene
     "ocr": 1,
     "identify": 2,     # ISBN harvesting from filename / front matter / text
-    "enrich": 3,       # evidence → candidates → verify → merge
+    "enrich": 4,       # file-exact fields no longer overwritten; work-level OL fields dropped
     "analyze": 2,      # controlled vocabulary + normalised scoring
     "llm": 2,
     "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable

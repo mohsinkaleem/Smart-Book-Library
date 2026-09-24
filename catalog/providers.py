@@ -16,6 +16,7 @@ Fixes the reliability half of the review:
 Queries are field-scoped (`intitle:` / `title=`). A flat concatenated string is
 what let "aisha adobe indesign cs5.5" return an InDesign manual.
 """
+import hashlib
 import json
 import logging
 import re
@@ -241,6 +242,24 @@ def _record_metric(source: str, outcome: str):
         _metrics[source][outcome] += 1
 
 
+# Each book is enriched on a single worker thread, so a thread-local count tells
+# the caller whether *its* lookup was complete.
+_local = threading.local()
+
+
+def reset_failed_lookups():
+    _local.failures = 0
+
+
+def failed_lookups() -> int:
+    """Provider calls on this thread that errored or were throttled since the last reset."""
+    return getattr(_local, "failures", 0)
+
+
+def _note_failure():
+    _local.failures = failed_lookups() + 1
+
+
 def get_metrics() -> dict:
     with _metrics_lock:
         return {source: dict(counts) for source, counts in _metrics.items()}
@@ -274,6 +293,7 @@ def _fetch_json(source: str, cache_key: str, url: str, params: dict = None) -> t
         # Our own throttle, not the provider's answer: counted separately so it
         # does not distort the error rate, and never cached.
         _record_metric(source, "cooldown")
+        _note_failure()
         return ERROR, {}
 
     _record_metric(source, "attempted")
@@ -287,6 +307,7 @@ def _fetch_json(source: str, cache_key: str, url: str, params: dict = None) -> t
         if resp.status_code == 429:
             _start_cooldown(url)
             _record_metric(source, "error")
+            _note_failure()
             return ERROR, {}
         resp.raise_for_status()
         payload = resp.json()
@@ -297,6 +318,7 @@ def _fetch_json(source: str, cache_key: str, url: str, params: dict = None) -> t
         # An error is cached as an error, and errors are never reused.
         _cache.set(cache_key, ERROR, {"error": str(e)[:300]})
         _record_metric(source, "error")
+        _note_failure()
         logger.warning(f"{source} request failed ({url}): {e}")
         return ERROR, {}
 
@@ -349,9 +371,24 @@ def _pick_isbns(values) -> tuple[str, str]:
     return isbn13, isbn10
 
 
+def _valid_isbns(values, limit: int = 200) -> set[str]:
+    out = set()
+    for value in list(values)[:limit]:
+        clean = normalize_isbn(str(value))
+        if (len(clean) == 13 and validate_isbn13(clean)) or (len(clean) == 10 and validate_isbn10(clean)):
+            out.add(clean)
+    return out
+
+
 def _query_key(*parts: str) -> str:
     joined = "_".join(p for p in parts if p)
-    return re.sub(r"[^a-z0-9]+", "_", joined.lower()).strip("_")[:120]
+    slug = re.sub(r"[^a-z0-9]+", "_", joined.lower()).strip("_")
+    # The bare slug collides for non-Latin titles (they all fold to "") and past
+    # 120 chars (title+author vs title-only), so those get a hash suffix.
+    if joined.isascii() and len(slug) < 120:
+        return slug
+    digest = hashlib.sha1(joined.lower().encode("utf-8")).hexdigest()[:12]
+    return f"{slug[:100]}_{digest}"
 
 
 # ── OpenLibrary ─────────────────────────────────────────────────────────────────
@@ -406,31 +443,31 @@ def openlibrary_search(title: str, author: str = "", limit: int = 3) -> list[Can
     if author:
         params["author"] = author
 
-    status, data = _fetch_json(
-        "openlibrary",
-        f"ol_search_{_query_key(title, author)}",
-        OPENLIBRARY_SEARCH_URL,
-        params,
-    )
+    cache_key = f"ol_search_{_query_key(title, author)}"
+    status, data = _fetch_json("openlibrary", cache_key, OPENLIBRARY_SEARCH_URL, params)
     if status != OK:
         return []
 
     docs = (data or {}).get("docs", []) or []
+    if not docs:
+        _cache.set(cache_key, NOT_FOUND, {})      # so an empty answer expires
+        return []
     candidates = []
     for doc in docs[:limit]:
-        isbn13, isbn10 = _pick_isbns(doc.get("isbn") or [])
+        # A search doc is a *work*: its ISBN, publisher and language lists span
+        # every edition and translation, so no single entry describes this
+        # file. ISBNs are kept for matching only.
+        languages = doc.get("language") or []
         candidates.append(Candidate(
             provider="openlibrary",
             strategy="title_author" if author else "title",
             title=doc.get("title", ""),
             subtitle=doc.get("subtitle", ""),
             authors=(doc.get("author_name") or [])[:5],
-            publisher=(doc.get("publisher") or [""])[0],
             year=doc.get("first_publish_year"),
-            isbn_13=isbn13,
-            isbn_10=isbn10,
+            alt_isbns=_valid_isbns(doc.get("isbn") or []),
             page_count=doc.get("number_of_pages_median"),
-            language=(doc.get("language") or [""])[0][:3],
+            language=languages[0] if len(languages) == 1 else "",
             subjects=(doc.get("subject") or [])[:15],
             cover_url=(f"{OPENLIBRARY_COVERS_URL}/id/{doc['cover_i']}-L.jpg"
                        if doc.get("cover_i") else ""),
@@ -468,6 +505,9 @@ def _google_books(query: str, cache_key: str, strategy: str, limit: int = 3) -> 
         return []
 
     items = (data or {}).get("items", []) or []
+    if not items:
+        _cache.set(cache_key, NOT_FOUND, {})      # so an empty answer expires
+        return []
     candidates = []
     for item in items[:limit]:
         vol = item.get("volumeInfo", {}) or {}

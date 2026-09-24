@@ -85,10 +85,23 @@ STAGE_SOURCES = {
 # stage -> fields it owns outright, written without provenance.
 STAGE_FIELDS = {
     "extract": ("text_excerpt", "front_matter", "content_sample", "has_text",
-                "ocr_required", "page_count"),
+                "ocr_required", "page_count", "original_title_meta"),
     "enrich": ("api_sources", "match_score", "rejected_candidates"),
     "embed": ("embedding", "metadata_embedding"),
 }
+
+# Merged lists several stages append to without provenance. One is withdrawn
+# only when *every* writer is about to re-run, or a partial run (`--no-api`)
+# would drop the part nobody rewrites; left alone, junk from an old extractor
+# stayed forever.
+SHARED_FIELDS = {
+    "subjects_raw": ("extract", "enrich"),
+    "source_ids": ("parse", "extract", "identify", "enrich"),
+}
+
+class StageDeferred(Exception):
+    """The stage could not do its job this run (tool missing, provider down); retry next run."""
+
 
 _STAGE_FLAGS = {
     "parse": "parse",
@@ -158,6 +171,8 @@ class Pipeline:
             "api_partial": 0,
             "api_rejected": 0,
             "api_no_evidence": 0,
+            "api_deferred": 0,
+            "stages_deferred": 0,
             "ocr_processed": 0,
             "isbn_extracted": 0,
             "llm_enriched": 0,
@@ -451,6 +466,9 @@ class Pipeline:
             record.reset_fields_from(STAGE_SOURCES.get(stage, ()))
             for name in STAGE_FIELDS.get(stage, ()):
                 record.reset_field(name)
+        for name, writers in SHARED_FIELDS.items():
+            if set(writers) <= outdated:
+                record.reset_field(name)
         # `enrich` owns the review queue; clearing it there meant a --no-api run
         # could never retire a stale flag.
         if outdated & set(METADATA_COHORT):
@@ -465,6 +483,10 @@ class Pipeline:
                 handler(record, file_path)
                 if name != "embed":      # marked by the deferred batch instead
                     record.mark_stage(name, STAGE_VERSIONS[name])
+            except StageDeferred as e:
+                logger.debug(f"   stage '{name}' deferred for {file_path.name}: {e}")
+                with self._lock:
+                    self.stats["stages_deferred"] += 1
             except Exception as e:
                 logger.debug(f"   stage '{name}' failed for {file_path.name}: {e}")
                 record.processing_errors.append(f"{name} failed: {e}")
@@ -503,8 +525,7 @@ class Pipeline:
             return
         from .ocr_extractor import is_available as ocr_available, ocr_pdf
         if not ocr_available():
-            logger.debug("OCR not available (tesseract/poppler not installed)")
-            return
+            raise StageDeferred("OCR not available (tesseract/poppler not installed)")
         ocr_pdf(file_path, record)
         with self._lock:
             self.stats["ocr_processed"] += 1
@@ -545,11 +566,16 @@ class Pipeline:
             adjudicator = adjudicate_match
 
         result = enrich_from_apis(record, adjudicator=adjudicator)
+        verdict = result.get("verdict")
+        # A throttled or failing provider is not an answer: leave the stage
+        # stale so the next run asks again instead of settling for less.
+        deferred = bool(result.get("incomplete")) and verdict != "accept"
         with self._lock:
             if record.api_sources:
                 self.stats["api_enriched"] += 1
-            verdict = result.get("verdict")
-            if verdict == "accept":
+            if deferred:
+                self.stats["api_deferred"] += 1
+            elif verdict == "accept":
                 self.stats["api_accepted"] += 1
             elif verdict == "partial":
                 self.stats["api_partial"] += 1
@@ -560,17 +586,22 @@ class Pipeline:
 
         if not record.title:
             record.flag_review("no title could be established")
+        if deferred:
+            raise StageDeferred("provider errors during lookup")
 
     def _stage_analyze(self, record: BookRecord, file_path: Path):
         analyze_themes(record)
 
     def _stage_llm(self, record: BookRecord, file_path: Path):
         if not self._llm_available():
-            return
-        from .llm_enricher import generate_llm_description, generate_llm_summary
-        generate_llm_summary(record)
-        if not record.description or len(record.description) < 50:
-            generate_llm_description(record)
+            raise StageDeferred("Ollama not reachable")
+        from .llm_enricher import LLMNoResponse, generate_llm_description, generate_llm_summary
+        try:
+            generate_llm_summary(record)
+            if not record.description or len(record.description) < 50:
+                generate_llm_description(record)
+        except LLMNoResponse as e:
+            raise StageDeferred(str(e)) from e
         with self._lock:
             self.stats["llm_enriched"] += 1
 
@@ -752,12 +783,14 @@ class Pipeline:
         logger.info(f"  Duplicates found: {s['duplicates_found']}")
         logger.info(f"  Missing files:    {s['missing_files']}")
         logger.info(f"  Errors:           {s['errors']}")
+        logger.info(f"  Stages deferred:  {s['stages_deferred']} (tool/provider unavailable)")
         logger.info("")
         logger.info("  Verification gate:")
         logger.info(f"    accepted:       {s['api_accepted']}")
         logger.info(f"    borderline:     {s['api_partial']} (descriptive fields only)")
         logger.info(f"    rejected:       {s['api_rejected']}")
         logger.info(f"    no evidence:    {s['api_no_evidence']} (no ISBN, unusable title)")
+        logger.info(f"    deferred:       {s['api_deferred']} (provider errors — retried next run)")
         logger.info(f"    needs review:   {s['needs_review']}")
         logger.info("")
         logger.info("  Provider health:")

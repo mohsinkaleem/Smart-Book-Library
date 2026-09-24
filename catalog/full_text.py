@@ -179,7 +179,6 @@ def extract_epub_full_text(file_path: Path) -> DocumentText:
     `spine_index` would not address anything the reader can navigate to.
     """
     try:
-        import ebooklib
         from ebooklib import epub
     except ImportError:  # pragma: no cover
         logger.error("ebooklib not installed. Run: pip install ebooklib")
@@ -191,32 +190,16 @@ def extract_epub_full_text(file_path: Path) -> DocumentText:
         logger.warning(f"ebooklib could not open {file_path.name}: {e}")
         return DocumentText(kind="epub")
 
-    from .epub_extractor import _extract_text_from_html
+    from .epub_extractor import _extract_text_from_html, spine_documents
 
     items: list[tuple[str, str]] = []
-    for entry in book.spine or []:
-        item_id = entry[0] if isinstance(entry, (tuple, list)) else entry
-        item = book.get_item_with_id(item_id)
-        if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT:
-            continue
+    for item in spine_documents(book):
         try:
             text = _clean_page(_extract_text_from_html(item.get_content() or b""))
         except Exception as e:
-            logger.debug(f"Spine item {item_id} of {file_path.name} failed: {e}")
+            logger.debug(f"Spine item {item.get_id()} of {file_path.name} failed: {e}")
             text = ""
         items.append((text, item.get_name() or ""))
-
-    if not items:
-        # Some EPUBs carry a broken or empty spine. Manifest order is worse
-        # than spine order but much better than no text at all.
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            try:
-                items.append(
-                    (_clean_page(_extract_text_from_html(item.get_content() or b"")),
-                     item.get_name() or "")
-                )
-            except Exception:
-                continue
 
     return _assemble([t for t, _ in items], "epub", [h for _, h in items])
 

@@ -68,6 +68,21 @@ GOLDEN: list[tuple[str, dict]] = [
       "publication_year": 2022}),
     ("Yasir Qadhi - Understanding Salafism (Oneworld Academic) - libgen.li.epub",
      {"title": "Understanding Salafism", "authors": ["Yasir Qadhi"]}),
+
+    # ── Download-site artefacts and run-together names ───────────────────────
+    ("Text Book.pdf", {"title": "Text Book"}),
+    ("muslims-in-india-abul-hasan-ali-nadwi-pdf-pdf-free.pdf",
+     {"title": "Muslims in India Abul Hasan Ali Nadwi"}),
+    ("So-good-they-cant-ignore-you-booksfree.org_.pdf", {"title": "So good they cant ignore you"}),
+    ("financial_modeling.compressed.pdf", {"title": "Financial Modeling"}),
+    ("Aldous Huxley - Brave New World.pdf ( PDFDrive ).pdf",
+     {"title": "Brave New World", "authors": ["Aldous Huxley"]}),
+    ("HowToLieWithStatistics.pdf", {"title": "How To Lie With Statistics"}),
+    ("Computer.Science.Distilled.Learn.the.Art.pdf", {"title": "Computer Science Distilled Learn the Art"}),
+    ("[Andriy_Burkov]_The_Hundred-Page_Machine_Learning_(z-lib.org).pdf",
+     {"title": "The Hundred-Page Machine Learning", "authors": ["Andriy Burkov"]}),
+    ("[ALGO-TRADING][Algorithmic Trading & DMA- An introduction].pdf",
+     {"title": "Algorithmic Trading & DMA- An introduction"}),
 ]
 
 

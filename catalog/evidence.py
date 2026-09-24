@@ -28,7 +28,7 @@ from .config import (
     MIN_TITLE_EVIDENCE_CHARS,
     MIN_TITLE_EVIDENCE_TOKENS,
 )
-from .isbn_extractor import all_local_isbns
+from .isbn_extractor import all_local_isbns, isbn10_to_isbn13
 from .models import BookRecord
 from .names import clean_authors
 from .text_utils import parse_front_matter
@@ -71,6 +71,7 @@ class Candidate:
     subjects: list = field(default_factory=list)
     cover_url: str = ""
     work_key: str = ""
+    alt_isbns: set = field(default_factory=set)   # other editions' ISBNs: match on, never write
     raw: dict = field(default_factory=dict)
 
     @property
@@ -78,7 +79,7 @@ class Candidate:
         return f"{self.title}: {self.subtitle}".strip(": ") if self.subtitle else self.title
 
     def isbns(self) -> set[str]:
-        return {i for i in (self.isbn_13, self.isbn_10) if i}
+        return {i for i in (self.isbn_13, self.isbn_10) if i} | set(self.alt_isbns)
 
 
 # ── Evidence ────────────────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ class TitleClue:
 @dataclass
 class Evidence:
     isbns: set = field(default_factory=set)
+    primary_isbns: list = field(default_factory=list)  # the record's own; queried first
     titles: list = field(default_factory=list)     # list[TitleClue]
     authors: list = field(default_factory=list)
     year: Optional[int] = None
@@ -99,6 +101,21 @@ class Evidence:
     language: str = ""
 
     # ── queries ──────────────────────────────────────────────────────────────
+
+    def ordered_isbns(self) -> list[str]:
+        """
+        ISBNs in query order, one per book: the record's own first, then the
+        rest sorted. Iterating the bare set made *which* two of several ISBNs
+        got looked up depend on the interpreter's hash seed.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for isbn in [*self.primary_isbns, *sorted(self.isbns, key=lambda i: (-len(i), i))]:
+            canonical = isbn if len(isbn) == 13 else isbn10_to_isbn13(isbn)
+            if isbn in self.isbns and canonical not in seen:
+                seen.add(canonical)
+                out.append(isbn)
+        return out
 
     def best_title(self) -> str:
         """Strongest title clue: title page > embedded metadata > filename."""
@@ -127,16 +144,19 @@ class Evidence:
             # must not crowd out the embedded metadata title.
             if clue.source in used_sources:
                 continue
-            key = _normalise(clue.text)
-            if not key or key in seen:
-                continue
-            tokens = [t for t in re.findall(r"[^\W\d_]+", clue.text, re.UNICODE)
-                      if t.lower() not in _STOP_TOKENS]
-            if len(tokens) < MIN_TITLE_EVIDENCE_TOKENS or len(clue.text) < MIN_TITLE_EVIDENCE_CHARS:
+            text = clue.text
+            if self.authors:
+                # Paired with an author the main title is specific enough, and a
+                # subtitle or "(Early Release)" note makes phrase searches miss.
+                main = _main_title(text)
+                if _searchable(main):
+                    text = main
+            key = _normalise(text)
+            if not key or key in seen or not _searchable(text):
                 continue
             seen.add(key)
             used_sources.add(clue.source)
-            out.append(clue.text)
+            out.append(text)
             if len(out) >= limit:
                 break
         return out
@@ -152,12 +172,7 @@ class Evidence:
         correct behaviour for them is to stay unenriched rather than to accept
         whatever a search engine returns for a one-word query (§A1).
         """
-        for clue in self.titles:
-            tokens = [t for t in re.findall(r"[^\W\d_]+", clue.text, re.UNICODE)
-                      if t.lower() not in _STOP_TOKENS]
-            if len(tokens) >= MIN_TITLE_EVIDENCE_TOKENS and len(clue.text) >= MIN_TITLE_EVIDENCE_CHARS:
-                return True
-        return False
+        return any(_searchable(clue.text) for clue in self.titles)
 
     def dimensions(self) -> set[str]:
         dims = set()
@@ -182,6 +197,7 @@ def collect_evidence(record: BookRecord) -> Evidence:
     """Gather every local signal about what this file actually is."""
     ev = Evidence()
     ev.isbns = all_local_isbns(record)
+    ev.primary_isbns = [i for i in (record.isbn_13, record.isbn_10) if i]
 
     seen: set[str] = set()
 
@@ -202,6 +218,10 @@ def collect_evidence(record: BookRecord) -> Evidence:
         _add_title(record.title, record.field_source("title") or "file_meta")
     _add_title(record.original_title_meta, "file_meta")
 
+    # The record's authors (embedded metadata, filename) lead: `authors[0]` is
+    # the one searched on, and a title-page guess is the least reliable source.
+    ev.authors = clean_authors(record.authors)
+
     front = (
         parse_front_matter(record.front_matter, hint=record.title)
         if record.front_matter else {}
@@ -215,10 +235,6 @@ def collect_evidence(record: BookRecord) -> Evidence:
                 ev.authors.append(author)
         if front.get("publisher"):
             ev.publishers.append(front["publisher"])
-
-    for author in clean_authors(record.authors):
-        if author not in ev.authors:
-            ev.authors.append(author)
 
     ev.year = record.publication_year
     if record.publisher:
@@ -234,6 +250,18 @@ def _normalise(text: str) -> str:
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     tokens = [t for t in text.split() if t not in _STOP_TOKENS]
     return " ".join(tokens)
+
+
+def _searchable(text: str) -> bool:
+    tokens = [t for t in re.findall(r"[^\W\d_]+", text or "", re.UNICODE)
+              if t.lower() not in _STOP_TOKENS]
+    return len(tokens) >= MIN_TITLE_EVIDENCE_TOKENS and len(text) >= MIN_TITLE_EVIDENCE_CHARS
+
+
+def _main_title(title: str) -> str:
+    """The title without its subtitle or bracketed notes."""
+    main = re.sub(r"\s*[\(\[][^)\]]*[\)\]]", " ", title or "")
+    return re.split(r"\s*:\s*", main, maxsplit=1)[0].strip()
 
 
 def _ratio(a: str, b: str) -> float:
@@ -381,7 +409,12 @@ def best_candidate(candidates: list[Candidate], evidence: Evidence) -> tuple[Opt
     if not scored:
         return None, {"score": 0.0, "verdict": REJECT, "reason": "no candidates"}, []
 
-    scored.sort(key=lambda pair: pair[1]["score"], reverse=True)
+    # Equal scores are common (every ISBN hit is 1.0 — including one for a
+    # book advertised in the front matter), so the title breaks the tie.
+    scored.sort(
+        key=lambda pair: (pair[1]["score"], title_similarity(pair[0], evidence)),
+        reverse=True,
+    )
     best, verdict = scored[0]
     rejections = [
         {

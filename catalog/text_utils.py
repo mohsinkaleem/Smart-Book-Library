@@ -24,7 +24,7 @@ from .config import (
     FRONT_MATTER_PAGES,
     MAX_TEXT_EXCERPT_CHARS,
 )
-from .names import is_person_name, looks_like_tool, normalize_author
+from .names import is_person_name, is_tool_title, looks_like_tool, normalize_author
 
 # Dot leaders ("Chapter 3 .......... 42") mark a table of contents.
 _DOT_LEADER = re.compile(r"\.{4,}\s*\d+|\·{4,}\s*\d+|_{4,}\s*\d+")
@@ -244,7 +244,7 @@ def parse_front_matter(front_matter: str, hint: str = "") -> dict:
 
     plausible: list[tuple[int, str]] = []
     for i, line in enumerate(lines[:12]):
-        if _BOILERPLATE.search(line) or looks_like_tool(line):
+        if _BOILERPLATE.search(line) or is_tool_title(line):
             continue
         if _BY_LINE.match(line):
             continue

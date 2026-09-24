@@ -13,17 +13,33 @@ from typing import Optional
 
 from .config import COVERS_DIR
 from .isbn_extractor import normalize_isbn, validate_isbn10, validate_isbn13
+from .languages import UNKNOWN, normalise_language
 from .models import BookRecord
 from .names import clean_authors
 from .text_utils import detect_language, detect_script, partition_pages
 
 logger = logging.getLogger(__name__)
 
+# `scheme:value` identifiers worth keeping (google:…, amazon:…, doi:…).
+_SOURCE_ID = re.compile(r"^[a-z][\w.+-]*:\S+$", re.IGNORECASE)
+_UUID = re.compile(r"(?:urn:)?(?:uuid:)?[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def spine_documents(book) -> list:
+    """Document items in reading (spine) order; manifest order only when the spine is empty."""
+    import ebooklib
+    items = []
+    for entry in book.spine or []:
+        item_id = entry[0] if isinstance(entry, (tuple, list)) else entry
+        item = book.get_item_with_id(item_id)
+        if item is not None and item.get_type() == ebooklib.ITEM_DOCUMENT:
+            items.append(item)
+    return items or list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+
 
 def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
     """Extract metadata and text from an EPUB. Mutates and returns the record."""
     try:
-        import ebooklib
         from ebooklib import epub
     except ImportError:
         logger.error("ebooklib not installed. Run: pip install ebooklib")
@@ -35,9 +51,12 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
 
         titles = book.get_metadata("DC", "title")
         if titles and titles[0] and titles[0][0]:
-            title = re.sub(r"\s+", " ", titles[0][0]).strip()
-            record.original_title_meta = title
-            record.set_field("title", title, "file_meta", 0.7)
+            # Same artefacts as PDF /Title: "Microsoft Word - Catcher on Rye.docx".
+            from .pdf_extractor import clean_meta_title
+            title = clean_meta_title(titles[0][0])
+            if title:
+                record.original_title_meta = title
+                record.set_field("title", title, "file_meta", 0.7)
 
         creators = book.get_metadata("DC", "creator")
         authors = clean_authors([c[0] for c in creators if c and c[0]]) if creators else []
@@ -50,7 +69,9 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
 
         languages = book.get_metadata("DC", "language")
         if languages and languages[0] and languages[0][0]:
-            record.set_field("language", languages[0][0][:2].lower(), "file_meta", 0.75)
+            language = normalise_language(languages[0][0])
+            if language != UNKNOWN:
+                record.set_field("language", language, "file_meta", 0.75)
 
         dates = book.get_metadata("DC", "date")
         if dates and dates[0] and dates[0][0]:
@@ -73,9 +94,11 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
         _harvest_identifiers(book, record)
 
         # ── Text ─────────────────────────────────────────────────────────────
+        # Spine order: the front matter must be the front of the book, and the
+        # manifest lists items in whatever order the authoring tool chose.
         pages: list[str] = []
         total_chars = 0
-        items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+        items = spine_documents(book)
         for item in items:
             if total_chars >= 20000:
                 break
@@ -121,34 +144,39 @@ def extract_epub_metadata(file_path: Path, record: BookRecord) -> BookRecord:
 
 
 def _harvest_identifiers(book, record: BookRecord):
-    """Pull ISBNs and stable ids out of dc:identifier, calibre:isbn, dc:source."""
-    candidates: list[str] = []
-    for ident in book.get_metadata("DC", "identifier") or []:
-        if ident and ident[0]:
-            candidates.append(str(ident[0]))
-    for source in book.get_metadata("DC", "source") or []:
-        if source and source[0]:
-            candidates.append(str(source[0]))
-    for meta in book.get_metadata("OPF", "meta") or []:
-        attrs = meta[1] if len(meta) > 1 else {}
-        name = (attrs.get("name") or "").lower()
-        if "isbn" in name or "calibre" in name:
-            value = attrs.get("content") or (meta[0] or "")
-            if value:
-                candidates.append(str(value))
-
-    for raw in candidates:
+    """Pull ISBNs and stable ids out of dc:identifier, dc:source and ISBN-named OPF meta."""
+    def _set_isbn(raw: str) -> bool:
         clean = normalize_isbn(raw)
         if len(clean) == 13 and validate_isbn13(clean):
             record.set_field("isbn_13", clean, "file_meta", 0.85)
-        elif len(clean) == 10 and validate_isbn10(clean):
+            return True
+        if len(clean) == 10 and validate_isbn10(clean):
             record.set_field("isbn_10", clean, "file_meta", 0.85)
-        elif raw.lower().startswith(("urn:uuid", "uuid:")):
+            return True
+        return False
+
+    candidates: list[str] = []
+    for ident in book.get_metadata("DC", "identifier") or []:
+        if ident and ident[0]:
+            candidates.append(str(ident[0]).strip())
+    for source in book.get_metadata("DC", "source") or []:
+        if source and source[0]:
+            candidates.append(str(source[0]).strip())
+
+    for raw in candidates:
+        if _UUID.match(raw) or _set_isbn(raw):
             continue
-        elif ":" in raw and len(raw) < 80:
-            tag = raw.strip()
-            if tag not in record.source_ids:
-                record.source_ids.append(tag)
+        if len(raw) < 80 and _SOURCE_ID.match(raw) and raw not in record.source_ids:
+            record.source_ids.append(raw)
+
+    # OPF <meta> is only mined for ISBNs: calibre's timestamps, series and
+    # title_sort entries used to land in `source_ids`.
+    for meta in book.get_metadata("OPF", "meta") or []:
+        attrs = meta[1] if len(meta) > 1 else {}
+        if "isbn" in (attrs.get("name") or "").lower():
+            value = attrs.get("content") or (meta[0] or "")
+            if value:
+                _set_isbn(str(value))
 
 
 def _extract_epub_cover(book, file_path: Path, record: BookRecord):
@@ -161,9 +189,9 @@ def _extract_epub_cover(book, file_path: Path, record: BookRecord):
         return
 
     try:
-        cover_items = []
+        cover_items = list(book.get_items_of_type(ebooklib.ITEM_COVER))[:1]  # EPUB3 cover-image
         cover_meta = book.get_metadata("OPF", "cover")
-        if cover_meta and cover_meta[0]:
+        if not cover_items and cover_meta and cover_meta[0]:
             cover_id = cover_meta[0][1].get("content", "")
             if cover_id:
                 for item in book.get_items():
@@ -186,7 +214,7 @@ def _extract_epub_cover(book, file_path: Path, record: BookRecord):
         if not data or len(data) <= 1000:
             return
 
-        cover_path = COVERS_DIR / f"{file_path.stem}_cover.jpg"
+        cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
         image = Image.open(io.BytesIO(data))
         if image.mode in ("RGBA", "P", "LA"):
             image = image.convert("RGB")
