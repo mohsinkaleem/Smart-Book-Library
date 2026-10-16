@@ -5,13 +5,12 @@ EPUBs carry the richest metadata of any format here: `dc:identifier`,
 `calibre:isbn`, `dc:source` and `dc:subject` are all worth harvesting
 for the verification gate.
 """
-import io
 import logging
 import re
 from pathlib import Path
 from typing import Optional
 
-from .config import COVERS_DIR
+from .covers import save_cover
 from .isbn_extractor import normalize_isbn, validate_isbn10, validate_isbn13
 from .languages import UNKNOWN, normalise_language
 from .models import BookRecord
@@ -180,51 +179,40 @@ def _harvest_identifiers(book, record: BookRecord):
 
 
 def _extract_epub_cover(book, file_path: Path, record: BookRecord):
+    """
+    Save the EPUB's cover image, trying the four places publishers put it.
+
+    EPUB3 `ITEM_COVER` first, then the EPUB2 `<meta name="cover">` pointer,
+    then an image whose name says "cover", and only then the first image in
+    the book.
+    """
     if record.cover_path:
         return
     try:
-        from PIL import Image
         import ebooklib
     except ImportError:
         return
 
     try:
-        cover_items = list(book.get_items_of_type(ebooklib.ITEM_COVER))[:1]  # EPUB3 cover-image
-        cover_meta = book.get_metadata("OPF", "cover")
-        if not cover_items and cover_meta and cover_meta[0]:
-            cover_id = cover_meta[0][1].get("content", "")
+        items = list(book.get_items_of_type(ebooklib.ITEM_COVER))[:1]
+
+        if not items:
+            meta = book.get_metadata("OPF", "cover")
+            cover_id = meta[0][1].get("content", "") if meta and meta[0] else ""
             if cover_id:
-                for item in book.get_items():
-                    if item.get_id() == cover_id:
-                        cover_items.append(item)
-                        break
-        if not cover_items:
-            for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                if "cover" in (item.get_name() or "").lower():
-                    cover_items.append(item)
-                    break
-        if not cover_items:
-            images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
-            if images:
-                cover_items.append(images[0])
+                items = [i for i in book.get_items() if i.get_id() == cover_id][:1]
 
-        if not cover_items:
-            return
-        data = cover_items[0].get_content()
-        if not data or len(data) <= 1000:
-            return
+        if not items:
+            items = [
+                i for i in book.get_items_of_type(ebooklib.ITEM_IMAGE)
+                if "cover" in (i.get_name() or "").lower()
+            ][:1]
 
-        cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
-        image = Image.open(io.BytesIO(data))
-        if image.mode in ("RGBA", "P", "LA"):
-            image = image.convert("RGB")
-        if image.width > 800 or image.height > 1200:
-            image.thumbnail((800, 1200), Image.LANCZOS)
-        image.save(str(cover_path), "JPEG", quality=85)
-        record.set_field(
-            "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
-            "file_meta", 0.7,
-        )
+        if not items:
+            items = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))[:1]
+
+        if items:
+            save_cover(record, items[0].get_content() or b"", "file_meta", 0.7)
     except Exception as e:
         logger.debug(f"EPUB cover extraction failed for {file_path.name}: {e}")
 

@@ -15,7 +15,21 @@ Two tables own book data:
                   corrections. Keyed by book id *and* file path so the data
                   survives a full catalog rebuild.
 """
+import logging
+import random
 import sqlite3
+
+from .config import TEXT_DIR
+from .enrichment_status import (
+    BORDERLINE,
+    DEFERRED,
+    NO_EVIDENCE,
+    REJECTED,
+    UNMATCHED,
+    VERIFIED,
+)
+
+logger = logging.getLogger(__name__)
 
 # Columns owned by the pipeline; user-owned columns are listed separately so the
 # upsert can never clobber them.
@@ -51,6 +65,13 @@ BOOK_COLUMNS: list[tuple[str, str]] = [
     ("front_matter", "TEXT DEFAULT ''"),
     ("content_sample", "TEXT DEFAULT ''"),
     ("field_sources", "TEXT DEFAULT '{}'"),
+    # Why the enrichment stage ended where it did: verified | borderline |
+    # rejected | unmatched | no_evidence | deferred, or '' when it never ran.
+    # Separate from `needs_review`, which means "a human's judgement would
+    # change something". Conflating them put 153 books that simply are not in
+    # OpenLibrary or Google Books into a queue a human cannot action, and
+    # buried the handful that genuinely need a decision.
+    ("enrichment_status", "TEXT DEFAULT ''"),
     ("needs_review", "INTEGER DEFAULT 0"),
     ("review_reasons", "TEXT DEFAULT '[]'"),
     ("match_score", "REAL"),
@@ -126,6 +147,7 @@ _INDEXES = [
     ("idx_books_user_rating", "books(user_rating)"),
     ("idx_books_duplicate", "books(duplicate_of)"),
     ("idx_books_needs_review", "books(needs_review)"),
+    ("idx_books_enrichment_status", "books(enrichment_status)"),
     ("idx_books_status", "books(status)"),
     ("idx_books_content_sha1", "books(content_sha1)"),
     ("idx_books_title", "books(title COLLATE NOCASE)"),
@@ -212,18 +234,23 @@ CREATE TABLE IF NOT EXISTS chunks (
     id          INTEGER PRIMARY KEY,   -- row index into the vector file
     book_id     TEXT NOT NULL,
     chunk_idx   INTEGER NOT NULL,      -- ordinal within the book
-    text        TEXT NOT NULL,
     char_start  INTEGER,               -- offset into data/text/{book_id}.txt
     char_end    INTEGER,
     page_start  INTEGER,               -- PDF
     page_end    INTEGER,               -- PDF
     spine_index INTEGER,               -- EPUB
-    anchor_text TEXT DEFAULT '',       -- EPUB: first ~60 chars, for locating
     section     TEXT DEFAULT '',       -- chapter/heading if detectable
     UNIQUE(book_id, chunk_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_book ON chunks(book_id);
 """
+
+#: The columns a chunk row carries, in order. Named once so the builder, the
+#: reader and the migration cannot disagree about it.
+CHUNK_COLUMNS = [
+    "id", "book_id", "chunk_idx", "char_start", "char_end",
+    "page_start", "page_end", "spine_index", "section",
+]
 
 # One row. Stamped at build time so a model or chunking change is a detectable
 # re-index rather than a silent corruption — the same lesson as
@@ -242,33 +269,28 @@ CREATE TABLE IF NOT EXISTS chunk_index_meta (
 );
 """
 
-# External content: indexes chunk text without a second copy of it, exactly as
-# `books_fts` does for `books`. This is also §1.9.5 — library-wide full-text
-# search falls out of the same build for free.
+# Contentless, and populated by the builder rather than by triggers.
+#
+# It used to be an external-content index over `chunks.text`, which meant the
+# database held every passage twice: once as a row and once as 317 MB of the
+# same prose already sitting in `data/text`. The chunk overlap made it worse
+# than a straight copy. Now a chunk row carries only its character span and
+# `full_text.read_span` reads the words back, so `chunks.text` does not exist
+# for an external-content index to point at.
+#
+# What this costs: `snippet()` over `chunks_fts` returns empty strings. Only
+# `books_fts` and `book_text_fts` use `snippet()`, and both keep their
+# external content, so nothing in the application notices.
 CHUNKS_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text,
-    content='chunks',
-    content_rowid='id',
+    content='',
     tokenize='porter unicode61'
 );
 
 DROP TRIGGER IF EXISTS chunks_ai;
 DROP TRIGGER IF EXISTS chunks_ad;
 DROP TRIGGER IF EXISTS chunks_au;
-
-CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
-CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-
-CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-    INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
 """
 
 # ── LLM threads (§4.2) ───────────────────────────────────────────────────────
@@ -410,6 +432,154 @@ END;
 """
 
 
+# ── One-time migration: review reasons become an enrichment status ─────────
+
+# The reason strings the pipeline wrote before `enrichment_status` existed,
+# mapped to the status it would write now. The first match wins, so the more
+# specific needle has to come first: "llm rejected the borderline match"
+# *contains* "borderline match", and reading it as one would file 54
+# rejections as records waiting on a decision they have already had.
+_REASON_STATUS = [
+    ("llm rejected the borderline match", REJECTED),
+    ("no candidate passed verification", REJECTED),
+    ("metadata lookup incomplete", DEFERRED),
+    ("borderline match", BORDERLINE),
+    ("insufficient evidence", NO_EVIDENCE),
+    ("no ISBN and no usable title", NO_EVIDENCE),
+    ("no provider returned a match", UNMATCHED),
+]
+
+#: The only pre-existing reason that still asks for a person.
+_STILL_NEEDS_REVIEW = "no title could be established"
+
+
+def _backfill_enrichment_status(conn: sqlite3.Connection) -> None:
+    """
+    Derive `enrichment_status` for records written before the column existed.
+
+    Without this the split only takes effect after a full pipeline run, and
+    until then every one of those records stays in a review queue it does not
+    belong in. The reason strings are the pipeline's own output, so the
+    mapping is a rename, not a guess.
+    """
+    rows = conn.execute(
+        "SELECT id, review_reasons, api_sources, match_score, needs_review FROM books"
+    ).fetchall()
+    updates = []
+    for book_id, raw_reasons, raw_sources, match_score, needs_review in rows:
+        reasons = raw_reasons or ""
+        status = ""
+        for needle, value in _REASON_STATUS:
+            if needle in reasons:
+                status = value
+                break
+        if not status and match_score is not None and (raw_sources or "") not in ("", "[]"):
+            status = VERIFIED
+
+        keep_review = status == BORDERLINE or _STILL_NEEDS_REVIEW in reasons
+        flag = 1 if keep_review else 0
+        if status or flag != needs_review:
+            updates.append((status, flag, book_id))
+
+    if not updates:
+        return
+    conn.executemany(
+        "UPDATE books SET enrichment_status = ?, needs_review = ? WHERE id = ?", updates
+    )
+    logger.info(
+        f"Derived an enrichment status for {len(updates)} records from their "
+        "recorded reasons; the review queue now holds only what a person can settle."
+    )
+
+
+# ── One-time migration: chunk text moves out of the database ────────────────
+
+def _chunk_text_is_recoverable(conn: sqlite3.Connection, sample: int = 25) -> bool:
+    """
+    Whether every stored chunk can be read back from `data/text` by offset.
+
+    Checked before the text column is dropped, because the offsets are only
+    an index into a file that has to still be there. Every indexed book must
+    have its text file, and a sampled chunk from each of `sample` books must
+    slice back to exactly what the row holds.
+    """
+    book_ids = [r[0] for r in conn.execute("SELECT DISTINCT book_id FROM chunks")]
+    missing = [b for b in book_ids if not (TEXT_DIR / f"{b}.txt").exists()]
+    if missing:
+        logger.error(
+            f"{len(missing)} indexed book(s) have no file in {TEXT_DIR}; leaving "
+            "`chunks.text` in place. Rebuild the passage index with "
+            "`python scripts/build_passage_index.py --force --force-text` to fix it."
+        )
+        return False
+
+    for book_id in random.Random(0).sample(book_ids, min(sample, len(book_ids))):
+        row = conn.execute(
+            "SELECT text, char_start, char_end FROM chunks "
+            "WHERE book_id = ? AND char_start IS NOT NULL LIMIT 1",
+            (book_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        try:
+            text = (TEXT_DIR / f"{book_id}.txt").read_text(encoding="utf-8")
+        except OSError as e:
+            logger.error(f"Cannot read cached text for {book_id}: {e}")
+            return False
+        if text[row[1]:row[2]].strip() != row[0]:
+            logger.error(
+                f"Chunk offsets for {book_id} do not match its cached text; "
+                "leaving `chunks.text` in place and rebuilding is required."
+            )
+            return False
+    return True
+
+
+def _migrate_chunk_text_out(conn: sqlite3.Connection) -> bool:
+    """
+    Drop `chunks.text` / `chunks.anchor_text` and make `chunks_fts` contentless.
+
+    The database held every passage twice — once as a row, once as the file in
+    `data/text` it was cut from — which was 329 MB of a 670 MB catalog before
+    the FTS index on top. A chunk row now carries only the span it occupies.
+
+    The FTS index is filled from the column *before* it is dropped, so this is
+    pure SQL: no file is read and nothing is re-tokenised. Returns True when
+    the migration ran. Run VACUUM afterwards to hand the pages back.
+    """
+    if not _chunk_text_is_recoverable(conn):
+        return False
+
+    rows = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    logger.info(f"Moving {rows} chunks' text out of the database (one-time)…")
+
+    columns = ", ".join(CHUNK_COLUMNS)
+    with conn:
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS chunks_ai;
+            DROP TRIGGER IF EXISTS chunks_ad;
+            DROP TRIGGER IF EXISTS chunks_au;
+            DROP TABLE IF EXISTS chunks_fts;
+            """
+        )
+        conn.executescript(CHUNKS_FTS_SQL)
+        conn.execute("INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks")
+        conn.executescript(CHUNKS_SQL.replace("chunks", "chunks_migrated"))
+        conn.execute(
+            f"INSERT INTO chunks_migrated ({columns}) SELECT {columns} FROM chunks"
+        )
+        conn.execute("DROP TABLE chunks")
+        conn.execute("ALTER TABLE chunks_migrated RENAME TO chunks")
+        conn.executescript(CHUNKS_SQL)
+
+    logger.info(
+        "Chunk text now lives only in data/text. Run `VACUUM` (or "
+        "`python scripts/build_passage_index.py --vacuum`) to reclaim the space."
+    )
+    return True
+
+
 def _existing_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return [r[1] for r in rows]
@@ -446,6 +616,7 @@ def ensure_schema(conn: sqlite3.Connection):
         conn.execute(f"CREATE TABLE books (\n    {cols}\n)")
     else:
         have = set(_existing_columns(conn, "books"))
+        backfill_status = "enrichment_status" not in have
         for name, decl in BOOK_COLUMNS:
             if name not in have:
                 # PRIMARY KEY / UNIQUE / NOT NULL cannot be added by ALTER.
@@ -455,6 +626,8 @@ def ensure_schema(conn: sqlite3.Connection):
                     .replace(" NOT NULL", "")
                 )
                 conn.execute(f"ALTER TABLE books ADD COLUMN {name} {simple}")
+        if backfill_status:
+            _backfill_enrichment_status(conn)
 
     for idx_name, target in _INDEXES:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {target}")
@@ -467,9 +640,17 @@ def ensure_schema(conn: sqlite3.Connection):
     conn.executescript(USER_DATA_SQL)
     conn.executescript(EMBEDDINGS_SQL)
     conn.executescript(ANNOTATIONS_SQL)
-    conn.executescript(CHUNKS_SQL)
+    # A `chunks` table that still has its `text` column is the pre-migration
+    # shape. Migrate it if the text can be read back from disk; if it cannot,
+    # leave the whole chunk schema — table, index and triggers — exactly as it
+    # is, so the existing index keeps working until it is rebuilt.
+    legacy_chunk_text = (
+        _table_exists(conn, "chunks") and "text" in _existing_columns(conn, "chunks")
+    )
+    if not legacy_chunk_text or _migrate_chunk_text_out(conn):
+        conn.executescript(CHUNKS_SQL)
+        conn.executescript(CHUNKS_FTS_SQL)
     conn.executescript(CHUNK_INDEX_META_SQL)
-    conn.executescript(CHUNKS_FTS_SQL)
     conn.executescript(LLM_THREADS_SQL)
     conn.executescript(READING_SESSIONS_SQL)
     conn.executescript(EPUB_LOCATIONS_SQL)

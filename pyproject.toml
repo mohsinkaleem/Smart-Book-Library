@@ -22,12 +22,18 @@ dependencies = [
 
 [project.optional-dependencies]
 embed = ["sentence-transformers>=2.2"]
+# The passage index needs both an encoder and a fast full-document PDF reader.
+# PyMuPDF is AGPL; it is kept out of the core set so the base install is not
+# bound by that licence, and `catalog.full_text` degrades to an empty
+# extraction with a clear message when it is absent.
+passages = ["sentence-transformers>=2.2", "pymupdf>=1.24"]
 ocr = ["pytesseract>=0.3.10", "pdf2image>=1.16"]
 covers = ["playwright>=1.40"]
 watch = ["watchdog>=4.0"]
 dev = ["pytest>=8.0"]
 all = [
     "sentence-transformers>=2.2",
+    "pymupdf>=1.24",
     "pytesseract>=0.3.10",
     "pdf2image>=1.16",
     "playwright>=1.40",

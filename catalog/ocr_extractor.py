@@ -15,7 +15,6 @@ import re
 from pathlib import Path
 
 from .config import (
-    COVERS_DIR,
     MAX_PAGES_TO_EXTRACT,
     MIN_TEXT_CHARS_FOR_HAS_TEXT,
     OCR_DPI,
@@ -23,8 +22,9 @@ from .config import (
     OCR_LANGUAGE_BY_SCRIPT,
     OCR_MAX_PAGES,
 )
+from .covers import save_cover
 from .models import BookRecord
-from .text_utils import detect_language, detect_script, partition_pages
+from .text_utils import clean_page, detect_language, detect_script, partition_pages
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,9 @@ def ocr_pdf(file_path: Path, record: BookRecord) -> BookRecord:
         total_chars = 0
         for i, img in enumerate(images):
             try:
-                page_text = _clean_ocr_text(pytesseract.image_to_string(img, lang=language))
+                page_text = clean_page(
+                    pytesseract.image_to_string(img, lang=language), keep_blank_lines=True
+                )
                 if page_text and len(page_text.strip()) > 10:
                     pages.append(page_text.strip())
                     total_chars += len(page_text)
@@ -114,42 +116,13 @@ def ocr_pdf(file_path: Path, record: BookRecord) -> BookRecord:
         else:
             logger.warning(f"   ⚠️  OCR produced only {total_chars} chars for {file_path.name}")
 
-        if not record.cover_path and images:
-            _save_ocr_cover(images[0], file_path, record)
+        if images:
+            # The rendered first page: the weakest cover there is, but better
+            # than the blank card a scanned book would otherwise show.
+            save_cover(record, images[0], "file_meta", 0.5)
 
     except Exception as e:
         logger.error(f"OCR failed for {file_path.name}: {e}")
         record.processing_errors.append(f"OCR failed: {e}")
 
     return record
-
-
-def _clean_ocr_text(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"[\x0c\x00-\x08\x0e-\x1f]", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if len(stripped) > 2 or stripped == "":
-            lines.append(stripped)
-    return "\n".join(lines)
-
-
-def _save_ocr_cover(image, file_path: Path, record: BookRecord):
-    try:
-        from PIL import Image
-        cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
-        img = image.copy()
-        if img.mode in ("RGBA", "P", "LA"):
-            img = img.convert("RGB")
-        if img.width > 800 or img.height > 1200:
-            img.thumbnail((800, 1200), Image.LANCZOS)
-        img.save(str(cover_path), "JPEG", quality=85)
-        record.set_field(
-            "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
-            "file_meta", 0.5,
-        )
-    except Exception as e:
-        logger.debug(f"Failed to save OCR cover for {file_path.name}: {e}")

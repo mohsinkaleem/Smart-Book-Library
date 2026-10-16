@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from catalog.fts import fts_query  # noqa: E402
 from catalog.languages import UNKNOWN as LANG_UNKNOWN  # noqa: E402
 from catalog.languages import normalise_language  # noqa: E402
+from catalog.enrichment_status import UNIDENTIFIED  # noqa: E402
 from catalog.models import identity_confidence as _identity_confidence  # noqa: E402
 from catalog.schema import PIPELINE_COLUMNS, ensure_schema  # noqa: E402
 from catalog.user_data import clear_review as _clear_review  # noqa: E402
@@ -56,6 +57,64 @@ MATCHING_ROWIDS_SQL = (
     "SELECT rowid FROM books_fts WHERE books_fts MATCH ? "
     "UNION SELECT rowid FROM book_text_fts WHERE book_text_fts MATCH ?"
 )
+
+# What a book row needs to be *listed*, as opposed to opened.
+#
+# `SELECT *` was handing every list endpoint all 57 columns, and three of them
+# are whole book text: a 48-book page of `/api/books` was 716 KB, of which
+# `text_excerpt` + `content_sample` + `front_matter` were 550 KB that no grid
+# or list cell renders. The same rows go through `search_fts`, which
+# `_hybrid_search` calls with `per_page=10_000` purely to collect ids and
+# snippets — so the default search mode was materialising the entire library's
+# prose on every keystroke.
+#
+# `description` and `summary` are out too: only the detail page shows them, and
+# it fetches one book through `get_book`, which still selects everything.
+# `has_description` is therefore computed in SQL below rather than from the
+# column.
+LIST_COLUMNS = (
+    "id", "file_path", "file_name", "file_type", "size",
+    "title", "subtitle", "authors", "author_primary",
+    "publication_year", "language", "page_count",
+    "categories", "themes", "keywords", "cover_path",
+    "has_text", "ocr_required", "needs_review", "enrichment_status",
+    "duplicate_of",
+    "date_added", "last_opened", "reading_status", "progress_percent",
+    "reader_position", "user_rating", "user_tags", "favorite",
+)
+
+#: The list projection, qualified for queries that join `books` to the FTS
+#: CTEs. `has_description` keeps the flag the sidebar filters on without
+#: carrying the text it is derived from.
+def list_select(prefix: str = "books") -> str:
+    cols = ", ".join(f"{prefix}.{c}" for c in LIST_COLUMNS)
+    return (
+        f"{cols}, "
+        f"({prefix}.description IS NOT NULL AND {prefix}.description != '') "
+        f"AS has_description"
+    )
+
+
+# One copy of a book, not two.
+#
+# `duplicate_of` has been computed and stored by the pipeline since it shipped
+# and no query ever read it, so both copies of every detected duplicate showed
+# up in the grid, in search, in the facet counts and in passage results.
+# `routes/duplicates.py` already promised the user that resolving a group
+# "hides a copy from the library view"; this predicate is what makes that
+# true, and it is shared so the dashboard's "618 books" and the library's
+# "618 books" cannot come to mean different things.
+#
+# A copy whose canonical record is gone stays visible: hiding it would leave
+# it listed nowhere but the Duplicates page, which is the only screen that
+# can unmark it.
+NOT_A_HIDDEN_DUPLICATE = (
+    "({p}.duplicate_of IS NULL OR {p}.duplicate_of = '' "
+    " OR NOT EXISTS (SELECT 1 FROM books AS canon "
+    "                WHERE canon.id = {p}.duplicate_of "
+    "                  AND canon.status != 'missing'))"
+)
+
 
 def _parse_field_sources(val: Any) -> dict:
     """Provenance is an object, not an array — and never `None`."""
@@ -204,14 +263,24 @@ class BookDatabase:
         d["ocr_required"] = bool(d.get("ocr_required", 0))
         d["favorite"] = bool(d.get("favorite", 0))
         d["needs_review"] = bool(d.get("needs_review", 0))
+        d["enrichment_status"] = d.get("enrichment_status") or ""
         # Add computed fields
         d["has_cover"] = bool(d.get("cover_path"))
-        d["has_description"] = bool(d.get("description"))
-        d["title_source"] = (d.get("field_sources") or {}).get("title", {}).get("source", "")
-        d["title_verified"] = d["title_source"] in ("user", "isbn_match", "api_verified")
-        # How sure we are *which book this is*, as opposed to how well it is
-        # described. Derived, never stored — see `catalog.models`.
-        d["identity_confidence"] = _identity_confidence(d)
+        # The list projection selects this as a SQL expression and leaves
+        # `description` behind; a full row has the column and not the flag.
+        d["has_description"] = bool(
+            d["has_description"] if "has_description" in d else d.get("description")
+        )
+        # Provenance-derived, so only meaningful on a row that carries
+        # `field_sources`. On the list projection they are omitted rather than
+        # emitted as a confident-looking 0.0 / "" / False — the review queue,
+        # the only consumer, selects the full row.
+        if "field_sources" in d:
+            d["title_source"] = (d["field_sources"] or {}).get("title", {}).get("source", "")
+            d["title_verified"] = d["title_source"] in ("user", "isbn_match", "api_verified")
+            # How sure we are *which book this is*, as opposed to how well it
+            # is described. Derived, never stored — see `catalog.models`.
+            d["identity_confidence"] = _identity_confidence(d)
         # Cover URL
         if d.get("cover_path"):
             cover_name = Path(d["cover_path"]).name
@@ -239,7 +308,9 @@ class BookDatabase:
         for start in range(0, len(book_ids), 500):
             chunk = book_ids[start:start + 500]
             placeholders = ", ".join("?" for _ in chunk)
-            rows = self.query(f"SELECT * FROM books WHERE id IN ({placeholders})", chunk)
+            rows = self.query(
+                f"SELECT {list_select()} FROM books WHERE id IN ({placeholders})", chunk
+            )
             for row in rows:
                 book = self._row_to_dict(row)
                 out[book["id"]] = book
@@ -317,7 +388,8 @@ class BookDatabase:
         # Fetch page
         offset = (page - 1) * per_page
         rows = self.query(
-            f"SELECT * FROM books WHERE {where_sql} ORDER BY {sort_col} {sort_dir} LIMIT ? OFFSET ?",
+            f"SELECT {list_select()} FROM books WHERE {where_sql} "
+            f"ORDER BY {sort_col} {sort_dir} LIMIT ? OFFSET ?",
             params + [per_page, offset],
         )
 
@@ -344,7 +416,7 @@ class BookDatabase:
         not have existed. The readers stamp them now.
         """
         rows = self.query(
-            """SELECT * FROM books
+            f"""SELECT {list_select()} FROM books
                WHERE status != 'missing'
                  AND last_opened IS NOT NULL AND last_opened != ''
                  AND reading_status != 'finished'
@@ -353,6 +425,25 @@ class BookDatabase:
             (limit,),
         )
         return [self._row_to_dict(r) for r in rows]
+
+    def duplicate_book_ids(self) -> set[str]:
+        """
+        Books the library hides because another id is the canonical copy.
+
+        `_apply_filters` drops them from every SQL-side listing, but the
+        passage index is a NumPy matrix keyed by book id and never goes
+        through a `WHERE` clause — so it needs the set itself. Same predicate,
+        including the orphan exemption: a copy whose canonical is gone is
+        still shown, so its passages still count.
+        """
+        rows = self.query(
+            "SELECT b.id FROM books b "
+            "WHERE b.duplicate_of IS NOT NULL AND b.duplicate_of != '' "
+            "  AND b.status != 'missing' "
+            "  AND EXISTS (SELECT 1 FROM books c "
+            "              WHERE c.id = b.duplicate_of AND c.status != 'missing')"
+        )
+        return {r["id"] for r in rows}
 
     def filtered_ids(self, **filters) -> set[str]:
         """
@@ -391,9 +482,40 @@ class BookDatabase:
 
     # ── Review queue (M2) ────────────────────────────────────────────────
 
-    def get_review_queue(self, page: int = 1, per_page: int = 25) -> dict:
+    #: Which rows each review bucket holds. `review` is what a human can
+    #: settle; `unidentified` is what no provider could name. They were one
+    #: queue, and the 153 books that are simply not in OpenLibrary or Google
+    #: Books buried the handful that needed a decision.
+    REVIEW_BUCKETS = {
+        "review": "needs_review = 1",
+        "unidentified": (
+            f"needs_review = 0 AND enrichment_status IN "
+            f"({','.join('?' * len(UNIDENTIFIED))})"
+        ),
+    }
+
+    def review_counts(self) -> dict:
+        """How many records sit in each bucket."""
+        counts = {}
+        for name, clause in self.REVIEW_BUCKETS.items():
+            params = list(UNIDENTIFIED) if name == "unidentified" else []
+            row = self.query_one(
+                f"SELECT COUNT(*) AS c FROM books "
+                f"WHERE status != 'missing' AND ({clause})",
+                params,
+            )
+            counts[name] = row["c"] if row else 0
+        return counts
+
+    def get_review_queue(
+        self, page: int = 1, per_page: int = 25, bucket: str = "review"
+    ) -> dict:
         """
-        Records the verification gate could not confirm, least certain first.
+        Records awaiting attention, least certain first.
+
+        `bucket` is `review` (a human's judgement would change something) or
+        `unidentified` (no provider had this book — nothing to confirm, but
+        a title typed from the cover is worth having).
 
         Ordered by identity confidence, not `match_score`. A record with no API
         match has a NULL score, so `ORDER BY match_score IS NULL DESC` put a
@@ -405,10 +527,17 @@ class BookDatabase:
         summarises. Only the ordering keys are read for the whole queue — a few
         hundred rows — and the page itself is then fetched by id.
         """
+        clause = self.REVIEW_BUCKETS.get(bucket)
+        if clause is None:
+            clause = self.REVIEW_BUCKETS["review"]
+            bucket = "review"
+        params = list(UNIDENTIFIED) if bucket == "unidentified" else []
+
         ranked = self.query(
-            """SELECT id, file_name, title, authors, isbn_13, isbn_10, field_sources
-               FROM books
-               WHERE needs_review = 1 AND status != 'missing'"""
+            f"""SELECT id, file_name, title, authors, isbn_13, isbn_10, field_sources
+                FROM books
+                WHERE status != 'missing' AND ({clause})""",
+            params,
         )
         total = len(ranked)
 
@@ -445,6 +574,8 @@ class BookDatabase:
             "page": page,
             "per_page": per_page,
             "pages": max(1, (total + per_page - 1) // per_page),
+            "bucket": bucket,
+            "counts": self.review_counts(),
         }
 
     def pin_field(self, book_id: str, name: str, value) -> Optional[dict]:
@@ -529,7 +660,7 @@ class BookDatabase:
         offset = (page - 1) * per_page
         rows = self.query(
             f"""{self._SEARCH_CTE}
-                SELECT books.*,
+                SELECT {list_select()},
                        COALESCE(meta.score, 0) + COALESCE(body.score, 0) * {TEXT_MATCH_WEIGHT}
                            AS score,
                        COALESCE(body.snip, meta.snip) AS snippet,
@@ -636,8 +767,13 @@ class BookDatabase:
     def _apply_filters(self, where_clauses: list, params: list, filters: dict):
         """Apply filter clauses from kwargs."""
         where_clauses.append("books.status != 'missing'")
+        if not filters.get("include_duplicates"):
+            where_clauses.append(NOT_A_HIDDEN_DUPLICATE.format(p="books"))
         if filters.get("needs_review"):
             where_clauses.append("books.needs_review = 1")
+        if filters.get("enrichment_status"):
+            where_clauses.append("books.enrichment_status = ?")
+            params.append(filters["enrichment_status"])
         if filters.get("file_type"):
             where_clauses.append("books.file_type = ?")
             params.append(filters["file_type"])
@@ -822,7 +958,10 @@ class BookDatabase:
         and `get_review_queue`. Without that predicate the dashboard total
         drifted away from the library total the moment a file left the disk.
         """
-        live = "status != 'missing'"
+        # The same set the library lists, so the dashboard's headline figure
+        # and the grid's "N books" agree. `duplicates` below deliberately
+        # counts the hidden copies instead — that card is about them.
+        live = "status != 'missing' AND " + NOT_A_HIDDEN_DUPLICATE.format(p="books")
 
         total = self.query_one(f"SELECT COUNT(*) as cnt FROM books WHERE {live}")["cnt"]
         total_size = self.query_one(
@@ -853,11 +992,14 @@ class BookDatabase:
             f"SELECT AVG(user_rating) as avg FROM books WHERE {live} AND user_rating IS NOT NULL"
         )["avg"]
 
-        # `duplicate_of` is computed by the pipeline, stored, indexed and
-        # present in the TypeScript type — and was never rendered anywhere.
+        # How many copies the library is *hiding* — so this one counts the
+        # rows every other figure above leaves out, and uses the plain
+        # liveness predicate rather than `live`, which would make it zero by
+        # construction.
         duplicates = self.query_one(
-            f"SELECT COUNT(*) as cnt FROM books "
-            f"WHERE {live} AND duplicate_of IS NOT NULL AND duplicate_of != ''"
+            "SELECT COUNT(*) as cnt FROM books "
+            "WHERE status != 'missing' "
+            "  AND duplicate_of IS NOT NULL AND duplicate_of != ''"
         )["cnt"]
 
         categories = self._count_json_array_field("categories", live)
@@ -1062,7 +1204,11 @@ class BookDatabase:
             self.conn.commit()
 
     def get_book_count(self) -> int:
-        return self.query_one("SELECT COUNT(*) as cnt FROM books WHERE status != 'missing'")["cnt"]
+        """How many books the library lists — what `/api/health` reports."""
+        return self.query_one(
+            "SELECT COUNT(*) as cnt FROM books WHERE status != 'missing' "
+            f"AND {NOT_A_HIDDEN_DUPLICATE.format(p='books')}"
+        )["cnt"]
 
     def has_embedding(self, book_id: str) -> bool:
         return self.query_one("SELECT 1 FROM embeddings WHERE book_id = ?", (book_id,)) is not None

@@ -99,25 +99,26 @@ export function BookCover({ coverUrl, title, fileType, className }: BookCoverPro
 
   const bg = hashColor(title);
   const accent = hashAccentColor(title);
+  const Icon = fileType === 'epub' ? BookOpen : FileText;
   return (
     <div
       className={clsx('flex items-center justify-center overflow-hidden rounded-lg', className)}
       style={{ background: `linear-gradient(135deg, ${bg} 0%, ${accent} 100%)` }}
+      // The gradient is keyed to the title, so it is stable per book and the
+      // placeholder is still a recognisable shape in a grid.
+      role="img"
+      aria-label={title ? `${title} (no cover)` : 'No cover'}
     >
-      <CoverFallback title={title} fileType={fileType} />
-    </div>
-  );
-}
-
-function CoverFallback({ title, fileType }: { title: string; fileType: string }) {
-  const Icon = fileType === 'epub' ? BookOpen : FileText;
-  return (
-    <div className="flex flex-col items-center gap-3 p-4 text-center text-white/90">
-      <div className="rounded-full bg-white/10 p-3">
-        <Icon size={28} />
+      {/* Icon only. This used to print the title and the file type inside the
+          placeholder, and every caller already renders both right beside it —
+          so a cover-less card said its title twice and its type twice, and at
+          thumbnail sizes the inner copy was unreadable anyway. */}
+      {/* Sized from the container's width only — the placeholder is used at
+          everything from a 32px row thumbnail to a full detail-page cover,
+          and width is the one dimension every caller states. */}
+      <div className="flex aspect-square w-[34%] max-w-16 items-center justify-center rounded-full bg-white/10 text-white/90">
+        <Icon className="h-1/2 w-1/2" />
       </div>
-      <span className="line-clamp-3 text-xs font-semibold leading-tight drop-shadow-sm">{title || 'Untitled'}</span>
-      <span className="rounded-full bg-white/15 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider">{fileType}</span>
     </div>
   );
 }

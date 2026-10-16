@@ -8,15 +8,15 @@ Two rules that were missing before:
 * Page texts are kept separate so front matter and content sample can be
   partitioned rather than blended into one excerpt.
 """
-import io
 import logging
 import re
 from pathlib import Path
 
-from .config import COVERS_DIR, MAX_PAGES_TO_EXTRACT, MIN_TEXT_CHARS_FOR_HAS_TEXT
+from .config import MAX_PAGES_TO_EXTRACT, MIN_TEXT_CHARS_FOR_HAS_TEXT
+from .covers import save_cover
 from .models import BookRecord
 from .names import clean_authors, is_person_name, is_tool_title
-from .text_utils import detect_language, detect_script, partition_pages
+from .text_utils import clean_page, detect_language, detect_script, partition_pages
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def extract_pdf_metadata(file_path: Path, record: BookRecord) -> BookRecord:
             if i >= MAX_PAGES_TO_EXTRACT:
                 break
             try:
-                page_text = _clean_extracted_text(page.extract_text() or "")
+                page_text = clean_page(page.extract_text() or "")
                 pages.append(page_text)
                 total_chars += len(page_text)
             except Exception as e:
@@ -150,48 +150,17 @@ def _extract_pdf_cover(reader, file_path: Path, record: BookRecord):
     if record.cover_path:
         return
     try:
-        from PIL import Image
-    except ImportError:
-        logger.debug("Pillow not installed, skipping cover extraction")
-        return
-
-    try:
         first_page = reader.pages[0]
         images = first_page.images if hasattr(first_page, "images") else []
-        largest_img, largest_size = None, 0
+        largest, largest_size = None, 0
         for img in images:
             try:
                 data = img.data
                 if len(data) > largest_size:
-                    largest_size, largest_img = len(data), data
+                    largest_size, largest = len(data), data
             except Exception:
                 continue
-
-        if largest_img and largest_size > 1000:
-            cover_path = COVERS_DIR / f"{record.id or file_path.stem}_cover.jpg"
-            image = Image.open(io.BytesIO(largest_img))
-            if image.mode in ("RGBA", "P", "LA"):
-                image = image.convert("RGB")
-            if image.width > 800 or image.height > 1200:
-                image.thumbnail((800, 1200), Image.LANCZOS)
-            image.save(str(cover_path), "JPEG", quality=85)
-            record.set_field(
-                "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
-                "file_meta", 0.6,
-            )
+        if largest:
+            save_cover(record, largest, "file_meta", 0.6)
     except Exception as e:
         logger.debug(f"Cover extraction failed for {file_path.name}: {e}")
-
-
-def _clean_extracted_text(text: str) -> str:
-    """Tidy one page of extracted text."""
-    if not text:
-        return ""
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if stripped and (len(stripped) > 3 or stripped in {".", ",", ":", ";"}):
-            lines.append(stripped)
-    return "\n".join(lines)

@@ -14,14 +14,27 @@ Now:
   0.45–0.75 applies descriptive fields only and flags the record for review;
   below that, nothing is applied and the rejection is recorded;
 * an identifier is written only when it was *verified*, never merely returned.
+
+Each outcome is recorded on the record as `enrichment_status`. Only
+`borderline` asks for a human: the rest are facts about the providers ("not in
+either catalogue", "nothing to search with"), and flagging them for review
+drowned the few records a person could actually settle.
 """
 import logging
-from pathlib import Path
 from typing import Callable, Optional
 
 import requests
 
-from .config import API_REQUEST_TIMEOUT, COVERS_DIR
+from .config import API_REQUEST_TIMEOUT
+from .covers import save_cover
+from .enrichment_status import (
+    BORDERLINE,
+    DEFERRED,
+    NO_EVIDENCE,
+    REJECTED,
+    UNMATCHED,
+    VERIFIED,
+)
 from .evidence import (
     ACCEPT,
     PARTIAL,
@@ -49,7 +62,6 @@ from .providers import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 def gather_candidates(evidence: Evidence, max_isbns: int = 2) -> list[Candidate]:
     """Query both providers: ISBN lookups first, then field-scoped searches."""
@@ -92,7 +104,11 @@ def enrich_from_apis(
     }
 
     if not evidence.has_isbn() and not evidence.title_is_searchable():
-        record.flag_review("insufficient evidence to identify this file")
+        # Nothing to query with. `757.pdf` is not a defective record a human
+        # can confirm; it is a file whose name says nothing, and searching on
+        # it would return whatever the engine felt like.
+        record.enrichment_status = NO_EVIDENCE
+        record.note_reason("no ISBN and no usable title — not looked up")
         result["reason"] = "insufficient evidence — no ISBN and no usable title"
         return result
 
@@ -103,10 +119,14 @@ def enrich_from_apis(
     result["candidates"] = len(candidates)
     if not candidates:
         if result["incomplete"]:
-            record.flag_review("metadata lookup incomplete (provider errors) — will retry")
+            record.enrichment_status = DEFERRED
+            record.note_reason("metadata lookup incomplete (provider errors) — will retry")
             result["reason"] = "no candidates (provider errors)"
         else:
-            record.flag_review("no provider returned a match")
+            # Much of this library is not in OpenLibrary or Google Books. That
+            # is a fact about those catalogues, not a record to review.
+            record.enrichment_status = UNMATCHED
+            record.note_reason("no provider returned a match")
             result["reason"] = "no candidates returned"
         return result
 
@@ -117,7 +137,8 @@ def enrich_from_apis(
 
     if best is None:
         record.match_score = verdict["score"]
-        record.flag_review(f"no candidate passed verification ({verdict['reason']})")
+        record.enrichment_status = REJECTED
+        record.note_reason(f"no candidate passed verification ({verdict['reason']})")
         logger.info(
             f"   ⛔ rejected all {len(candidates)} candidates for {record.file_name}: "
             f"{verdict['reason']}"
@@ -133,7 +154,8 @@ def enrich_from_apis(
             result.update({"verdict": ACCEPT, "reason": verdict["reason"]})
         elif decision is False:
             record.match_score = verdict["score"]
-            record.flag_review("llm rejected the borderline match")
+            record.enrichment_status = REJECTED
+            record.note_reason("llm rejected the borderline match")
             result["verdict"] = REJECT
             result["reason"] = verdict["reason"] + " (llm-adjudicated mismatch)"
             return result
@@ -145,6 +167,7 @@ def enrich_from_apis(
     if verdict["verdict"] == ACCEPT:
         _apply_candidate(record, best, source, confidence, identity=True)
         record.match_score = confidence
+        record.enrichment_status = VERIFIED
         result["provider"] = best.provider
         if best.provider not in record.api_sources:
             record.api_sources.append(best.provider)
@@ -155,6 +178,9 @@ def enrich_from_apis(
     else:  # PARTIAL
         _apply_candidate(record, best, "api_partial", confidence, identity=False)
         record.match_score = confidence
+        # The one outcome a human really can settle: we found something
+        # plausible and declined to trust it with the identity fields.
+        record.enrichment_status = BORDERLINE
         record.flag_review(
             f"borderline match ({confidence:.2f}) with "
             f"'{best.full_title[:60]}' — identity fields left untouched"
@@ -257,44 +283,16 @@ def _apply_candidate(
 
 
 def _download_cover(record: BookRecord, url: str, source: str, confidence: float):
-    """Download a cover image."""
+    """Download a cover image from a provider and store it."""
     if record.cover_path:
         return
     try:
         from .providers import _get_session  # pooled session, retries, UA
         resp = _get_session().get(url, timeout=API_REQUEST_TIMEOUT, stream=True)
         resp.raise_for_status()
-        content = resp.content
-        content_type = resp.headers.get("content-type", "")
-        if "image" not in content_type or len(content) < 1000:
+        if "image" not in resp.headers.get("content-type", ""):
             return
-
-        ext = "png" if "png" in content_type else "jpg"
-        # Keyed on the record id: `pdfs/x.pdf` and `epubs/x.epub` share a stem
-        # and used to overwrite each other's cover.
-        cover_path = COVERS_DIR / f"{record.id or Path(record.file_name).stem}_cover.{ext}"
-        with open(cover_path, "wb") as f:
-            f.write(content)
-
-        try:
-            from PIL import Image
-            img = Image.open(cover_path)
-            if img.mode in ("RGBA", "P", "LA"):
-                img = img.convert("RGB")
-            if img.width > 800 or img.height > 1200:
-                img.thumbnail((800, 1200), Image.LANCZOS)
-            jpg_path = cover_path.with_suffix(".jpg")
-            img.save(str(jpg_path), "JPEG", quality=85)
-            if jpg_path != cover_path:
-                cover_path.unlink(missing_ok=True)
-                cover_path = jpg_path
-        except Exception:
-            pass
-
-        record.set_field(
-            "cover_path", str(cover_path.relative_to(COVERS_DIR.parent.parent)),
-            source, confidence,
-        )
+        save_cover(record, resp.content, source, confidence)
     except requests.RequestException as e:
         logger.debug(f"Failed to download cover from {url}: {e}")
     except Exception as e:  # pragma: no cover - defensive

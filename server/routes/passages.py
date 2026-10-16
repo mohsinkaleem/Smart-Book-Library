@@ -185,14 +185,22 @@ def _resolve_scope(request: Request, body, filters_dict: dict) -> dict:
         if not body.book_id:
             raise HTTPException(422, "scope='book' requires book_id")
         return {"book_id": body.book_id}
+    # Searching one book is the user pointing at that book, duplicate or not.
+    # Every other scope is a search of "the library", which shows one copy of
+    # each book — so the hidden copies' passages must not come back either.
+    duplicates = db.duplicate_book_ids()
     if scope in ("category", "author"):
         if not filters_dict:
             raise HTTPException(422, f"scope='{scope}' requires a category or author filter")
         return {
             "allowed_books": db.filtered_ids(**filters_dict),
             "exclude_book": getattr(body, "exclude_book", None),
+            "exclude_books": duplicates,
         }
-    return {"exclude_book": getattr(body, "exclude_book", None) or body.book_id}
+    return {
+        "exclude_book": getattr(body, "exclude_book", None) or body.book_id,
+        "exclude_books": duplicates,
+    }
 
 
 @router.get("/api/passages/status")
@@ -257,7 +265,12 @@ def similar_passages(body: SimilarPassagesRequest, request: Request):
             raise HTTPException(422, "scope='book' requires book_id")
         scope_args = {"book_id": body.book_id}
     else:
-        scope_args = {"exclude_book": body.book_id}
+        # "Where else does this idea appear" must not answer with the same
+        # paragraph out of the library's hidden second copy of this book.
+        scope_args = {
+            "exclude_book": body.book_id,
+            "exclude_books": request.app.state.db.duplicate_book_ids(),
+        }
 
     # Ask for one extra: in-book search will return the selection's own chunk,
     # which is a 1.0 match and tells the reader nothing.
@@ -313,6 +326,7 @@ async def passage_stance(body: StanceRequest, request: Request):
         body.text, similarity.encode_passage(body.text),
         limit=body.limit, mode="hybrid", rerank=True,
         exclude_book=body.book_id,
+        exclude_books=request.app.state.db.duplicate_book_ids(),
         min_score=MIN_SIMILAR_PASSAGE_SCORE, relative_floor=PASSAGE_RELATIVE_FLOOR,
     )
     passages = _serialise(request.app.state.db, hits)

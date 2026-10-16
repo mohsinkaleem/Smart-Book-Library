@@ -37,16 +37,19 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
 
+from catalog.chunking import make_anchor_text
 from catalog.config import (
     PASSAGE_RERANK,
     PASSAGE_RERANK_CANDIDATES,
     PASSAGE_RERANK_MODEL,
     RRF_K,
 )
+from catalog.full_text import read_span
 from catalog.passage_index import index_status, load_vectors
 
 from .db import BookDatabase
@@ -243,6 +246,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
         min_score: float = 0.0,
         relative_floor: float = 0.0,
     ) -> list[tuple[int, float]]:
@@ -272,6 +276,13 @@ class PassageIndex:
                 scores = np.where(mask, scores, -1.0)
             if exclude_book:
                 span = self.book_ranges.get(exclude_book)
+                if span:
+                    scores[span[0]:span[1]] = -1.0
+            # Copies of a book the library already shows under another id.
+            # Without this the same paragraph came back twice from what the
+            # reader sees as one book — see `BookDatabase.duplicate_book_ids`.
+            for dupe_id in exclude_books or ():
+                span = self.book_ranges.get(dupe_id)
                 if span:
                     scores[span[0]:span[1]] = -1.0
 
@@ -304,6 +315,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
     ) -> list[tuple[int, float]]:
         """
         BM25 over `chunks_fts`. Free to build and unbeatable for exact
@@ -331,6 +343,10 @@ class PassageIndex:
                 return []
             sql.append(f"AND c.book_id IN ({','.join('?' * len(allowed))})")
             params.extend(allowed)
+        excluded = list(exclude_books or ())
+        if excluded:
+            sql.append(f"AND c.book_id NOT IN ({','.join('?' * len(excluded))})")
+            params.extend(excluded)
         sql.append("ORDER BY rank LIMIT ?")
         params.append(limit)
 
@@ -411,25 +427,47 @@ class PassageIndex:
 
     # ── Row access ─────────────────────────────────────────────────────────
 
+    def _hydrate(self, rows: Iterable) -> list[dict]:
+        """
+        Turn chunk rows into dicts, reading each passage's words off disk.
+
+        A chunk row stores the span it occupies in `data/text/{book_id}.txt`,
+        not the text itself — the database used to hold a second copy of
+        every passage. `read_span` memoises whole books, so a page of hits
+        from one book costs one file read, and `anchor_text` is derived here
+        rather than stored a third time.
+        """
+        out: list[dict] = []
+        for r in rows:
+            text = read_span(r["book_id"], r["char_start"], r["char_end"],
+                             Path(r["file_path"]) if r["file_path"] else None,
+                             r["file_type"] or "")
+            out.append({
+                "chunk_id": int(r["id"]), "book_id": r["book_id"],
+                "chunk_idx": int(r["chunk_idx"]), "text": text,
+                "char_start": r["char_start"], "char_end": r["char_end"],
+                "page_start": r["page_start"], "page_end": r["page_end"],
+                "spine_index": r["spine_index"],
+                "anchor_text": make_anchor_text(text),
+                "section": r["section"] or "",
+            })
+        return out
+
+    _CHUNK_SELECT = """
+        SELECT c.id, c.book_id, c.chunk_idx, c.char_start, c.char_end,
+               c.page_start, c.page_end, c.spine_index, c.section,
+               b.file_path, b.file_type
+        FROM chunks c LEFT JOIN books b ON b.id = c.book_id
+    """
+
     def get_chunks(self, chunk_ids: Iterable[int]) -> dict[int, dict]:
         ids = list(chunk_ids)
         if not ids:
             return {}
         rows = self.db.query(
-            "SELECT id, book_id, chunk_idx, text, char_start, char_end, page_start, "
-            "       page_end, spine_index, anchor_text, section "
-            f"FROM chunks WHERE id IN ({','.join('?' * len(ids))})",
-            ids,
+            f"{self._CHUNK_SELECT} WHERE c.id IN ({','.join('?' * len(ids))})", ids
         )
-        return {
-            int(r[0]): {
-                "chunk_id": int(r[0]), "book_id": r[1], "chunk_idx": int(r[2]),
-                "text": r[3], "char_start": r[4], "char_end": r[5],
-                "page_start": r[6], "page_end": r[7], "spine_index": r[8],
-                "anchor_text": r[9] or "", "section": r[10] or "",
-            }
-            for r in rows
-        }
+        return {row["chunk_id"]: row for row in self._hydrate(rows)}
 
     def neighbours(self, chunk_id: int, span: int = 1) -> list[dict]:
         """The chunks either side of one, for reading a hit in context."""
@@ -439,20 +477,14 @@ class PassageIndex:
         if not row:
             return []
         rows = self.db.query(
-            "SELECT id, book_id, chunk_idx, text, page_start, page_end, spine_index, section "
-            "FROM chunks WHERE book_id = ? AND chunk_idx BETWEEN ? AND ? "
-            "ORDER BY chunk_idx",
+            f"{self._CHUNK_SELECT} WHERE c.book_id = ? "
+            "AND c.chunk_idx BETWEEN ? AND ? ORDER BY c.chunk_idx",
             (row[0], row[1] - span, row[1] + span),
         )
-        return [
-            {
-                "chunk_id": int(r[0]), "book_id": r[1], "chunk_idx": int(r[2]),
-                "text": r[3], "page_start": r[4], "page_end": r[5],
-                "spine_index": r[6], "section": r[7] or "",
-                "is_match": int(r[0]) == chunk_id,
-            }
-            for r in rows
-        ]
+        hydrated = self._hydrate(rows)
+        for item in hydrated:
+            item["is_match"] = item["chunk_id"] == chunk_id
+        return hydrated
 
     def cosines(self, chunk_ids: list[int], query_vec: np.ndarray) -> dict[int, float]:
         """
@@ -503,6 +535,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
         mode: str = "hybrid",
         rerank: bool = True,
         min_score: float = MIN_PASSAGE_SCORE,
@@ -531,7 +564,10 @@ class PassageIndex:
             return []
 
         pool = max(limit * 3, PASSAGE_RERANK_CANDIDATES if rerank else limit * 3)
-        scope = dict(book_id=book_id, exclude_book=exclude_book, allowed_books=allowed_books)
+        scope = dict(
+            book_id=book_id, exclude_book=exclude_book,
+            allowed_books=allowed_books, exclude_books=exclude_books,
+        )
 
         dense: list[tuple[int, float]] = []
         if mode in ("hybrid", "semantic") and query_vec is not None:

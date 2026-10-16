@@ -155,8 +155,14 @@ class SimilarityEngine:
                     vec_m = self.metadata_matrix[idx]
                     scores += 0.6 * (self.metadata_matrix @ vec_m)
 
-            # Zero out self
+            # Zero out self — and the library's hidden copies of other
+            # books, which otherwise top this list with a 100% match that is
+            # the same book under a second id.
             scores[idx] = -1.0
+            for dupe_id in self.db.duplicate_book_ids():
+                dupe_idx = self._id_to_idx.get(dupe_id)
+                if dupe_idx is not None:
+                    scores[dupe_idx] = -1.0
 
             # Get top-k
             top_indices = np.argsort(scores)[::-1][:limit]
@@ -188,11 +194,16 @@ class SimilarityEngine:
         language = book.get("language", "")
 
         # Query all other books and score them
-        all_books = self.db.query(
-            "SELECT id, categories, themes, author_primary, language FROM books "
-            "WHERE id != ? AND status != 'missing'",
-            (book_id,)
-        )
+        # Same exclusion as the embedding path: one copy of each book.
+        hidden = self.db.duplicate_book_ids()
+        all_books = [
+            row for row in self.db.query(
+                "SELECT id, categories, themes, author_primary, language FROM books "
+                "WHERE id != ? AND status != 'missing'",
+                (book_id,)
+            )
+            if row[0] not in hidden
+        ]
 
         scored = []
         for row in all_books:

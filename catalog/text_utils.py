@@ -147,6 +147,43 @@ def _is_plausible_author_line(line: str) -> bool:
     return is_person_name(line)
 
 
+# ── Page cleaning ───────────────────────────────────────────────────────────────
+
+# Control characters that survive extraction — form feeds from OCR, stray
+# device codes from a PDF text run. Tab (\x09) and newline (\x0a) are kept.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def clean_page(text: str, keep_blank_lines: bool = False) -> str:
+    """
+    Tidy one page (PDF), spine item (EPUB) or OCR'd image.
+
+    Collapse runs of spaces, drop lines that are only a page number, drop
+    one- to three-character line noise. Anything more aggressive
+    (de-hyphenation, header/footer stripping) shifts character offsets in ways
+    `full_text`'s offset map has to reason about, and buys little at chunk
+    scale.
+
+    `keep_blank_lines` is for OCR, where a blank line is the only paragraph
+    structure the page has left; runs of them collapse to one.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _CONTROL_CHARS.sub("", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
+
+    lines: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped and (len(stripped) > 3 or stripped in {".", ",", ":", ";"}):
+            lines.append(stripped)
+        elif keep_blank_lines and lines and lines[-1] != "":
+            lines.append("")
+    return "\n".join(lines).strip("\n")
+
+
 # ── Partitioning ────────────────────────────────────────────────────────────────
 
 def looks_like_toc(page_text: str) -> bool:

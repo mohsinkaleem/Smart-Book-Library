@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .config import COVERS_DIR, API_REQUEST_TIMEOUT
+from .config import API_REQUEST_TIMEOUT
+from .covers import save_cover
 from .models import BookRecord
 
 logger = logging.getLogger(__name__)
@@ -176,31 +177,17 @@ def _search_google_images_cover(page, query: str) -> Optional[str]:
 
 
 def _download_cover_image(record: BookRecord, url: str):
-    """Download a cover image from URL using requests."""
+    """Download a scraped cover image."""
     try:
         import requests
-        from PIL import Image
-        import io
 
         resp = requests.get(url, timeout=API_REQUEST_TIMEOUT, stream=True)
         resp.raise_for_status()
-
-        content_type = resp.headers.get("content-type", "")
-        if "image" not in content_type and len(resp.content) < 1000:
+        # `or`, not `and`: a 1 KB HTML error page is not a cover whichever
+        # side of the test it fails.
+        if "image" not in resp.headers.get("content-type", ""):
             return
-
-        cover_name = f"{record.id or Path(record.file_name).stem}_cover.jpg"
-        cover_path = COVERS_DIR / cover_name
-
-        img = Image.open(io.BytesIO(resp.content))
-        if img.mode in ("RGBA", "P", "LA"):
-            img = img.convert("RGB")
-        if img.width > 800 or img.height > 1200:
-            img.thumbnail((800, 1200), Image.LANCZOS)
-        img.save(str(cover_path), "JPEG", quality=85)
-
-        record.cover_path = str(cover_path.relative_to(COVERS_DIR.parent.parent))
-        logger.info(f"   🖼️  Downloaded cover via Playwright for {record.file_name}")
-
+        if save_cover(record, resp.content, "scraper", 0.45):
+            logger.info(f"   🖼️  Downloaded cover via Playwright for {record.file_name}")
     except Exception as e:
         logger.debug(f"Failed to download Playwright cover from {url}: {e}")

@@ -231,15 +231,22 @@ MAX_WORKERS = _env_int("MAX_WORKERS", 4)         # parallel per-book workers
 SCHEMA_VERSION = "2.0"
 
 # ─── Stage Versions ─────────────────────────────────────────────────────────────
-# A stage re-runs for a record when its version here is newer than the version
+# Work re-runs for a record when the version here is newer than the version
 # recorded on that record, or when the file's content hash changed. Bump a
-# version after changing that stage's logic to re-run it on the next pass.
+# version after changing that code to re-run it on the next pass.
+#
+# These are *units of staleness*, not stages. `parse`, `extract`, `ocr`,
+# `identify` and `enrich` used to carry five independent version numbers, but
+# the pipeline dragged all five along whenever any one of them was stale —
+# they write the same bibliographic fields and settle conflicts by
+# SOURCE_RANK, so re-running one without the others drops values nothing
+# restores. Five numbers that always moved together are one number; collapsing
+# them also removes the cohort rule that existed only to re-couple them.
+#
+# The numbering restarts here: every record in an existing catalog predates
+# the `metadata` key and is stale on the next run either way.
 STAGE_VERSIONS = {
-    "parse": 3,        # download artefacts, dotted/CamelCase names, [Author]_ prefixes
-    "extract": 3,      # EPUB spine order, cover-image, identifier/language hygiene
-    "ocr": 1,
-    "identify": 2,     # ISBN harvesting from filename / front matter / text
-    "enrich": 4,       # file-exact fields no longer overwritten; work-level OL fields dropped
+    "metadata": 1,     # parse + extract + ocr + identify + enrich
     "analyze": 2,      # controlled vocabulary + normalised scoring
     "llm": 2,
     "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable

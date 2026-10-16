@@ -5,6 +5,7 @@ These cover the failure the review called critical — bumping a stage version
 used to wipe every record's categories, themes and LLM summaries — plus the
 user-data preservation that `CatalogStore.upsert` promises.
 """
+import json
 import shutil
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from catalog import pipeline as pipeline_mod  # noqa: E402
+from catalog import schema  # noqa: E402
 from catalog.config import STAGE_VERSIONS  # noqa: E402
 from catalog.models import BookRecord  # noqa: E402
 from catalog.pipeline import Pipeline, PipelineConfig  # noqa: E402
@@ -64,30 +66,38 @@ class TestOutdatedStages(StageTestCase):
     def outdated(self, record, **config_kwargs):
         return self.pipeline(**config_kwargs)._outdated_stages(record, True)
 
+    @staticmethod
+    def stale_metadata(record) -> BookRecord:
+        record.stage_versions["metadata"] = STAGE_VERSIONS["metadata"] - 1
+        return record
+
     def test_current_record_runs_nothing(self):
         self.assertEqual(self.outdated(enriched_record()), set())
 
-    def test_stale_enrich_drags_the_whole_metadata_cohort(self):
-        record = enriched_record()
-        record.stage_versions["enrich"] = STAGE_VERSIONS["enrich"] - 1
-        outdated = self.outdated(record)
+    def test_a_stale_metadata_unit_schedules_all_five_of_its_stages(self):
+        outdated = self.outdated(self.stale_metadata(enriched_record()))
         for stage in ("parse", "extract", "ocr", "identify", "enrich"):
             self.assertIn(stage, outdated)
 
-    def test_stale_enrich_invalidates_its_consumers(self):
-        record = enriched_record()
-        record.stage_versions["enrich"] = STAGE_VERSIONS["enrich"] - 1
-        outdated = self.outdated(record, llm_enrich=True, embed=True)
+    def test_stale_metadata_invalidates_its_consumers(self):
+        outdated = self.outdated(
+            self.stale_metadata(enriched_record()), llm_enrich=True, embed=True
+        )
         self.assertIn("analyze", outdated)
-        self.assertIn("llm", outdated)     # transitive: enrich → analyze → llm
+        self.assertIn("llm", outdated)     # transitive: metadata → analyze → llm
         self.assertIn("embed", outdated)
 
     def test_disabled_stages_are_never_scheduled(self):
-        record = enriched_record()
-        record.stage_versions["enrich"] = STAGE_VERSIONS["enrich"] - 1
-        outdated = self.outdated(record, enrich_api=False)
+        outdated = self.outdated(self.stale_metadata(enriched_record()), enrich_api=False)
         self.assertNotIn("enrich", outdated)
         self.assertNotIn("llm", outdated)
+        self.assertIn("parse", outdated)   # the rest of the unit still runs
+
+    def test_a_stale_analyze_leaves_the_metadata_alone(self):
+        record = enriched_record()
+        record.stage_versions["analyze"] = STAGE_VERSIONS["analyze"] - 1
+        outdated = self.outdated(record)
+        self.assertEqual(outdated, {"analyze"})
 
     def test_force_runs_every_enabled_stage(self):
         outdated = self.outdated(enriched_record(), force_reprocess=True)
@@ -132,14 +142,20 @@ class TestInvalidation(StageTestCase):
         self.assertFalse(record.needs_review)
         self.assertEqual(record.review_reasons, [])
 
-    def test_shared_lists_reset_only_when_every_writer_reruns(self):
-        record = enriched_record(source_ids=["2015-12-24T14:22:40+00:00"],
+    def test_review_flags_survive_an_analyze_only_rerun(self):
+        record = enriched_record()
+        record.flag_review("borderline match")
+        self.invalidate(record, {"analyze"})
+        self.assertTrue(record.needs_review)
+
+    def test_merged_lists_reset_only_when_enrich_reruns(self):
+        record = enriched_record(source_ids=["ia:2015.168284"],
                                  subjects_raw=["From an API"])
         self.invalidate(record, {"parse", "extract", "ocr", "identify"})   # --no-api
         self.assertEqual(record.subjects_raw, ["From an API"])
-        self.assertEqual(record.source_ids, ["2015-12-24T14:22:40+00:00"])
+        self.assertEqual(record.source_ids, ["ia:2015.168284"])
 
-        self.invalidate(record, set(pipeline_mod.METADATA_COHORT))
+        self.invalidate(record, {"parse", "extract", "ocr", "identify", "enrich"})
         self.assertEqual(record.subjects_raw, [])
         self.assertEqual(record.source_ids, [])
 
@@ -153,26 +169,26 @@ class TestDeferredStages(StageTestCase):
 
     def test_enrich_with_provider_errors_is_retried(self):
         record = enriched_record()
-        del record.stage_versions["enrich"]
+        del record.stage_versions["metadata"]
         pipeline = self.pipeline()
         with unittest.mock.patch.object(
             pipeline_mod, "enrich_from_apis",
             return_value={"verdict": "reject", "incomplete": True, "reason": ""},
         ):
             self.run_stages(pipeline, record, {"enrich"})
-        self.assertNotIn("enrich", record.stage_versions)
+        self.assertNotIn("metadata", record.stage_versions)
         self.assertEqual(pipeline.stats["api_deferred"], 1)
         self.assertEqual(pipeline.stats["errors"], 0)
 
     def test_an_accepted_match_is_final_despite_provider_errors(self):
         record = enriched_record()
-        del record.stage_versions["enrich"]
+        del record.stage_versions["metadata"]
         with unittest.mock.patch.object(
             pipeline_mod, "enrich_from_apis",
             return_value={"verdict": "accept", "incomplete": True, "reason": "isbn match"},
         ):
             self.run_stages(self.pipeline(), record, {"enrich"})
-        self.assertEqual(record.stage_versions["enrich"], STAGE_VERSIONS["enrich"])
+        self.assertEqual(record.stage_versions["metadata"], STAGE_VERSIONS["metadata"])
 
     def test_llm_stage_waits_for_ollama(self):
         record = enriched_record()
@@ -184,10 +200,10 @@ class TestDeferredStages(StageTestCase):
 
     def test_ocr_stage_waits_for_tesseract(self):
         record = enriched_record(ocr_required=True)
-        del record.stage_versions["ocr"]
+        del record.stage_versions["metadata"]
         with unittest.mock.patch("catalog.ocr_extractor.is_available", return_value=False):
             self.run_stages(self.pipeline(), record, {"ocr"})
-        self.assertNotIn("ocr", record.stage_versions)
+        self.assertNotIn("metadata", record.stage_versions)
 
 
 class TestStoreUserData(StageTestCase):
@@ -302,3 +318,68 @@ class TestReadingProgressIsMonotonic(StageTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnrichmentStatusBackfill(unittest.TestCase):
+    """
+    Records written before `enrichment_status` existed get one derived from
+    the reasons already on them, so the review split applies without waiting
+    for a full pipeline run.
+    """
+
+    def setUp(self):
+        import sqlite3
+
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute(
+            "CREATE TABLE books (id TEXT PRIMARY KEY, review_reasons TEXT, "
+            "api_sources TEXT, match_score REAL, needs_review INTEGER, "
+            "enrichment_status TEXT DEFAULT '')"
+        )
+        self.addCleanup(self.conn.close)
+
+    def add(self, book_id, reasons, needs_review=1, api_sources="[]", match_score=None):
+        self.conn.execute(
+            "INSERT INTO books VALUES (?,?,?,?,?,'')",
+            (book_id, json.dumps(reasons), api_sources, match_score, needs_review),
+        )
+
+    def derive(self) -> dict:
+        schema._backfill_enrichment_status(self.conn)
+        return {
+            row[0]: (row[1], row[2])
+            for row in self.conn.execute(
+                "SELECT id, enrichment_status, needs_review FROM books"
+            )
+        }
+
+    def test_an_llm_rejection_is_rejected_not_borderline(self):
+        """
+        The needle "llm rejected the borderline match" *contains* "borderline
+        match". Matching the shorter one first filed 54 settled rejections as
+        decisions still waiting to be made.
+        """
+        self.add("a", ["llm rejected the borderline match"])
+        self.add("b", ["borderline match (0.52) with 'Something Else'"])
+        derived = self.derive()
+        self.assertEqual(("rejected", 0), derived["a"])
+        self.assertEqual(("borderline", 1), derived["b"])
+
+    def test_provider_silence_stops_asking_for_a_human(self):
+        self.add("a", ["no provider returned a match"])
+        self.add("b", ["insufficient evidence to identify this file"])
+        self.add("c", ["no candidate passed verification (below gate)"])
+        self.add("d", ["metadata lookup incomplete (provider errors) — will retry"])
+        derived = self.derive()
+        self.assertEqual(("unmatched", 0), derived["a"])
+        self.assertEqual(("no_evidence", 0), derived["b"])
+        self.assertEqual(("rejected", 0), derived["c"])
+        self.assertEqual(("deferred", 0), derived["d"])
+
+    def test_a_record_with_no_title_still_needs_a_person(self):
+        self.add("a", ["no provider returned a match", "no title could be established"])
+        self.assertEqual(("unmatched", 1), self.derive()["a"])
+
+    def test_a_clean_api_match_is_verified(self):
+        self.add("a", [], needs_review=0, api_sources='["google_books"]', match_score=0.93)
+        self.assertEqual(("verified", 0), self.derive()["a"])

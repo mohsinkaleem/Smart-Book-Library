@@ -5,6 +5,10 @@ Review queue routes.
 correct one. A record the verification gate could not confirm now surfaces
 here; a human correction is pinned as `source: "user"`, `confidence: 1.0`, and
 no future pipeline run may overwrite it.
+
+The queue is split in two (see `bucket`): "not in OpenLibrary" is a fact about
+the provider, not a defect to confirm, and mixing the two put 153 unactionable
+records in front of the few that needed a person.
 """
 from typing import Any, Optional
 
@@ -30,9 +34,21 @@ def review_queue(
     request: Request,
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=100),
+    bucket: str = Query("review", pattern="^(review|unidentified)$"),
 ):
-    """Records needing human confirmation, lowest confidence first."""
-    return request.app.state.db.get_review_queue(page=page, per_page=per_page)
+    """
+    Records awaiting attention, lowest confidence first.
+
+    Two buckets, because they ask for different things. `review` holds the
+    records a human's judgement would change — a borderline match we declined
+    to trust, a record with no title at all. `unidentified` holds the ones no
+    provider could name; there is nothing to confirm, but a title read off
+    the cover is still worth pinning. The response carries both counts so the
+    caller can show them side by side.
+    """
+    return request.app.state.db.get_review_queue(
+        page=page, per_page=per_page, bucket=bucket
+    )
 
 
 @router.post("/{book_id}/pin")

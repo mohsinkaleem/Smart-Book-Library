@@ -86,7 +86,8 @@ python build_catalog.py --llm                # Ollama summaries + borderline adj
 python build_catalog.py --verify-sources     # probe providers before running
 python build_catalog.py --force              # redo everything, ignoring stage versions
 python build_catalog.py --report             # catalog quality report
-python build_catalog.py --review             # list records needing human review
+python build_catalog.py --review             # list records waiting on a decision
+python build_catalog.py --unidentified       # list records no provider could name
 python build_catalog.py --export-json        # write data/catalog.json (an export, not a source)
 ```
 
@@ -181,6 +182,7 @@ Everything under *Passage Search*, *Similar Passages*, *Stance Grouping* and
 it is built those features say so rather than returning empty results.
 
 ```bash
+pip install 'books[passages]'                      # encoder + PyMuPDF (AGPL)
 python scripts/build_passage_index.py --limit 30   # try it on 30 books first
 python scripts/build_passage_index.py              # then the whole library
 python scripts/build_passage_index.py --status     # what is indexed now
@@ -190,6 +192,9 @@ It is resumable: a second run indexes only the books the first did not reach,
 and carries existing vectors over rather than recomputing them. Measured on a
 618-book / 187,000-page library: roughly **50 minutes once**, and about
 **530 MB** on disk (extracted text plus float16 vectors plus the FTS index).
+Passage text is not stored a second time in the database: a chunk row carries
+the character span it occupies in `data/text/{book_id}.txt`, and the text is
+read back from there.
 
 Passage search is exact brute-force — a NumPy matmul over the whole index,
 measured at 0.30 ms for 24,000 chunks. There is no ANN index to tune and no
@@ -267,6 +272,8 @@ books/
 │   ├── isbn_extractor.py    # ISBN detection from text/metadata
 │   ├── title_parser.py      # Filename → title/author parser
 │   ├── api_enricher.py      # Open Library / Google Books enrichment
+│   ├── enrichment_status.py # verified | borderline | rejected | unmatched | …
+│   ├── covers.py            # The one place an image becomes a cover file
 │   ├── cover_scraper.py     # Cover image extraction and download
 │   ├── llm_enricher.py      # LLM-based summarization
 │   ├── theme_analyzer.py    # Keyword/theme extraction
@@ -419,14 +426,24 @@ The server exposes a REST API at `http://localhost:8000/api/`. Interactive Swagg
 
 ### Review — `/api/review`
 
-Records the verification gate could not confirm. A correction made here is pinned as
-`source: "user"`, `confidence: 1.0`, and no future pipeline run may overwrite it.
+Two buckets. `review` holds the records your judgement would change — a borderline
+match the gate declined to trust with the identity fields, a file with no title at
+all. `unidentified` holds the ones no provider could name; nothing there is wrong,
+so there is nothing to confirm, but a title read off the cover is worth pinning.
+They used to be one list, and the 153 books that are simply not in OpenLibrary or
+Google Books buried the two that needed deciding.
 
-| Method | Endpoint                      | Description                          |
-| ------ | ----------------------------- | ------------------------------------ |
-| GET    | `/api/review/queue`           | Records needing review, worst first  |
-| POST   | `/api/review/{id}/pin`        | Pin a corrected field value          |
-| POST   | `/api/review/{id}/resolve`    | Mark a record as reviewed            |
+A correction made here is pinned as `source: "user"`, `confidence: 1.0`, and no
+future pipeline run may overwrite it.
+
+| Method | Endpoint                                  | Description                               |
+| ------ | ----------------------------------------- | ----------------------------------------- |
+| GET    | `/api/review/queue?bucket=review`         | Waiting on a decision, worst first        |
+| GET    | `/api/review/queue?bucket=unidentified`   | No provider had the book, worst first     |
+| POST   | `/api/review/{id}/pin`                    | Pin a corrected field value               |
+| POST   | `/api/review/{id}/resolve`                | Mark a record as reviewed                 |
+
+Both responses carry `counts` for each bucket, which is what the page's tabs show.
 
 ### Operations
 
@@ -492,15 +509,21 @@ extracted prose, kept separate so a 5 000-character excerpt cannot outrank an ex
 title match on term frequency alone. Both are external-content indexes over `books`,
 so neither stores a second copy of the text, and triggers keep them in sync.
 
-Three tables hold book data:
+Four tables hold book data:
 
 - `books` — everything the pipeline produces, including `field_sources` (per-field source
-  and confidence), `match_score`, `needs_review` and `stage_versions`
+  and confidence), `match_score`, `enrichment_status`, `needs_review` and `stage_versions`
 - `user_data` — ratings, tags, favourites, reading progress, reader position and pinned
   corrections. The pipeline does not write these columns, so a run (or a full rebuild)
   cannot destroy them. One declared exception: the opt-in reading-progress stage may
   *advance* `last_opened` when the filesystem reports a newer open, never move it back
 - `embeddings` — content and metadata vectors
+- `chunks` — one row per passage, holding the character span it occupies in
+  `data/text/{book_id}.txt` rather than the passage itself. The prose is already on
+  disk; keeping a second copy in the row cost 329 MB of a 670 MB catalog, and
+  `chunks_fts` a third. Opening an older database migrates it in place, after
+  checking every span still reads back — then
+  `python scripts/build_passage_index.py --vacuum` reclaims the space
 
 To inspect the database:
 
@@ -523,9 +546,20 @@ SELECT count(*) FROM books;
 `catalog/schema.py` is the only place the DDL lives, and `ensure_schema()` runs
 on every start from both the pipeline and the server. It adds missing columns
 in place and rebuilds an FTS index whenever its indexed column set changes, so
-upgrading is just starting the app. It is additive only — no existing table is
-dropped or rewritten — but `data/catalog.db` is your library's memory, so take
-a copy before a version jump:
+upgrading is just starting the app.
+
+It is additive with two declared exceptions, both one-time and both guarded:
+
+- a `chunks` table that still carries its `text` column is rewritten without
+  it, but only after every indexed book's text file is present and sampled
+  spans read back byte-for-byte. If that check fails nothing is touched and
+  the existing index keeps working;
+- records written before `enrichment_status` existed get one derived from the
+  reasons already recorded on them, so the review queue splits without waiting
+  for a full pipeline run.
+
+`data/catalog.db` is your library's memory, so take a copy before a version
+jump:
 
 ```bash
 sqlite3 data/catalog.db ".backup 'data/catalog.db.bak'"

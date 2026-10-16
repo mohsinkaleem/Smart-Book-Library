@@ -63,7 +63,8 @@ def show_stats():
     print(f"  With embeddings:    {stats['with_embeddings']}")
     print(f"  API enriched:       {stats['api_enriched']}")
     print(f"  Verified titles:    {stats['verified_titles']}")
-    print(f"  Needs review:       {stats['needs_review']}")
+    print(f"  Needs a decision:   {stats['needs_review']}")
+    print(f"  Unidentified:       {stats.get('unidentified', 0)}")
     print(f"  Duplicates:         {stats['duplicates']}")
     print(f"  Total size:         {stats['total_size_mb']} MB")
     if stats.get("categories"):
@@ -77,9 +78,11 @@ def show_review_queue(limit: int = 40):
     store = CatalogStore()
     records = store.needs_review()
     if not records:
-        print("✅ Nothing in the review queue.")
+        print("✅ Nothing waiting on a decision.")
+        print("   Records no provider could name are a separate list: "
+              "python build_catalog.py --unidentified")
         return
-    print(f"\n🔎 {len(records)} records need review\n")
+    print(f"\n🔎 {len(records)} records need a decision\n")
     for record in records[:limit]:
         score = "—" if record.match_score is None else f"{record.match_score:.2f}"
         print(f"  [{score:>4}] {record.file_name[:60]}")
@@ -87,6 +90,33 @@ def show_review_queue(limit: int = 40):
               f"(source: {record.field_source('title') or 'none'})")
         for reason in record.review_reasons[:2]:
             print(f"         ↳ {reason[:96]}")
+        print()
+
+
+def show_unidentified(limit: int = 40):
+    """
+    Records no provider could name.
+
+    Separate from `--review` because there is nothing here to confirm: these
+    books are simply not in OpenLibrary or Google Books, which is a fact about
+    those catalogues. Their titles come from the filename or the title page,
+    and a better one typed by hand is pinned and never overwritten.
+    """
+    from catalog.models import identity_confidence
+
+    store = CatalogStore()
+    records = store.unidentified()
+    if not records:
+        print("✅ Every book was found in a metadata provider.")
+        return
+    records.sort(key=identity_confidence)
+    print(f"\n❓ {len(records)} records no provider could name "
+          f"(least certain identity first)\n")
+    for record in records[:limit]:
+        print(f"  [id {identity_confidence(record):.2f}] {record.file_name[:60]}")
+        print(f"         title: {record.title[:70] or '(none)'} "
+              f"(source: {record.field_source('title') or 'none'}, "
+              f"{record.enrichment_status})")
         print()
 
 
@@ -184,7 +214,10 @@ def main():
     parser.add_argument("--changes", action="store_true", help="Check for filesystem changes (one-shot)")
     parser.add_argument("--stats", action="store_true", help="Show catalog statistics")
     parser.add_argument("--report", action="store_true", help="Show the catalog quality report")
-    parser.add_argument("--review", action="store_true", help="List records needing review")
+    parser.add_argument("--review", action="store_true",
+                        help="List records waiting on a human decision")
+    parser.add_argument("--unidentified", action="store_true",
+                        help="List records no metadata provider could name")
     parser.add_argument("--reading", action="store_true", help="Show reading progress")
     parser.add_argument("--search", type=str, help="Search the catalog")
     parser.add_argument("--export-csv", action="store_true", help="Export catalog to CSV")
@@ -203,6 +236,8 @@ def main():
         return
     if args.review:
         return show_review_queue()
+    if args.unidentified:
+        return show_unidentified()
     if args.search:
         return search_catalog(args.search)
     if args.export_csv:
@@ -274,10 +309,10 @@ def main():
         print(f"  New:            {plan['new_files']}")
         print(f"  Stale:          {plan['stale_records']}")
         print(f"  Up to date:     {plan['up_to_date']}")
-        if plan["per_stage"]:
-            print("\n  Stages that would run:")
-            for stage, count in plan["per_stage"].items():
-                print(f"    {stage:<10} {count} books")
+        if plan["per_unit"]:
+            print("\n  Work that would run:")
+            for unit, count in plan["per_unit"].items():
+                print(f"    {unit:<10} {count} books")
         print("=" * 60)
         return
 
@@ -288,7 +323,10 @@ def main():
     if stats.get("interrupted"):
         print("\n⚠️  Interrupted — the catalog is consistent; re-run to finish the remaining books.")
     print(f"\n✅ Catalog: {CATALOG_DB_FILE}")
-    print(f"   {stats['needs_review']} records need review — see 'python build_catalog.py --review'")
+    print(f"   {stats['needs_review']} records need a decision — "
+          "see 'python build_catalog.py --review'")
+    print(f"   {stats.get('unidentified', 0)} records no provider could name — "
+          "see 'python build_catalog.py --unidentified'")
     print("   Quality report:  python build_catalog.py --report")
 
 
