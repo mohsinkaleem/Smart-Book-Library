@@ -8,7 +8,13 @@ allowed anywhere near the record.
 
     scan → parse → extract → ocr → identify → enrich → analyze → llm → embed
                                                                        │
-                              covers → reading progress → dedupe → reconcile → save
+          scrape covers → render covers → reading progress → dedupe → reconcile → save
+
+The two cover stages are closing stages and run in that order for a reason:
+every book that reaches `render covers` has had an embedded jacket (`extract`),
+a provider's (`enrich`) and a scraped one (`cover_scrape`) all decline, so the
+rendered page 1 only ever fills a slot that would otherwise show the gradient
+placeholder.
 
 Resumability works in *units*, not stages. A unit carries a version; it runs
 when that version is newer than the one stored on the record, when the file's
@@ -53,6 +59,7 @@ from .config import (
 from .duplicate_detector import detect_duplicates
 from .embeddings import embed_records
 from .isbn_extractor import harvest_identifiers
+from .covers import PDF_PAGE_SOURCE
 from .models import BookRecord
 from .providers import get_metrics, reset_metrics, save_cache, unhealthy_sources
 from .scanner import compute_sha1, create_basic_record, scan_all_directories
@@ -147,6 +154,9 @@ class PipelineConfig:
     llm_adjudicate: bool = True        # only used when llm_enrich is on
     embed: bool = False
     cover_scrape: bool = False
+    # On by default, unlike `cover_scrape`: rendering a page costs no network
+    # call and no browser, so there is nothing for the user to opt into.
+    cover_render: bool = True
     reading_progress: bool = False     # one `mdls` subprocess per book; opt in
     dedupe: bool = True
     reconcile_deletions: bool = True
@@ -194,6 +204,8 @@ class Pipeline:
             "isbn_extracted": 0,
             "llm_enriched": 0,
             "covers_scraped": 0,
+            "covers_rendered": 0,
+            "covers_unusable": 0,
             "duplicates_found": 0,
             "needs_review": 0,
             "unidentified": 0,
@@ -281,6 +293,8 @@ class Pipeline:
                 self._stage_embed_batch()
                 if self.config.cover_scrape:
                     self._stage_cover_scrape()
+                if self.config.cover_render:
+                    self._stage_cover_render()
                 if self.config.reading_progress:
                     self._stage_reading_progress()
                 if self.config.dedupe:
@@ -503,6 +517,13 @@ class Pipeline:
         # in `enrich` alone meant a --no-api run could never retire a stale flag.
         if any(STAGE_UNIT[s] == "metadata" for s in outdated):
             record.clear_review()
+            # A rendered page 1 is a placeholder, not a jacket. The stages that
+            # can find a real one are about to re-run, so give the slot back —
+            # and forget the `cover` mark with it, so the closing stage renders
+            # the page again if nothing better turns up this time.
+            if record.field_source("cover_path") == PDF_PAGE_SOURCE:
+                if record.reset_field("cover_path"):
+                    record.stage_versions.pop("cover", None)
 
     def _run_book_stages(self, record: BookRecord, file_path: Path, outdated: set[str]):
         """
@@ -726,6 +747,60 @@ class Pipeline:
                 logger.debug(f"Cover scraping failed for {record.file_name}: {e}")
         self.stats["stages_completed"].append("cover_scrape")
 
+    def _stage_cover_render(self):
+        """
+        Page 1 of a PDF, rendered, for the books nothing else could cover.
+
+        Scoped by the `cover` unit rather than by `cover_path` alone: a book
+        whose page 1 is a blank title page has no cover *and* nothing left to
+        try, and re-opening it on every run to re-reject the same white sheet
+        is work with a known answer. The mark says the attempt was made; a
+        version bump is what asks for it again.
+        """
+        version = STAGE_VERSIONS["cover"]
+        records = [
+            r for r in self._scoped_records()
+            if not r.cover_path
+            and r.file_type == "pdf"
+            and r.status != "missing"
+            and not r.stage_is_current("cover", version)
+        ]
+        if not records:
+            return
+
+        from .pdf_extractor import can_render_pages, render_page_1_cover
+        if not can_render_pages():
+            # Left unmarked on purpose: the next run retries it, exactly as a
+            # deferred per-book stage would.
+            logger.info(
+                "\n🖼️  pymupdf not installed — cannot render page-1 covers. "
+                "Run: pip install 'books[passages]'"
+            )
+            return
+
+        logger.info(f"\n🖼️  RENDERING page 1 as a cover for {len(records)} books...")
+        for record in records:
+            path = PROJECT_ROOT / record.file_path
+            if not path.exists():
+                continue
+            try:
+                reason = render_page_1_cover(path, record)
+            except Exception as e:
+                logger.debug(f"Page-1 cover failed for {record.file_name}: {e}")
+                continue
+            record.mark_stage("cover", version)
+            self.store.upsert(record)
+            if reason:
+                self.stats["covers_unusable"] += 1
+                logger.debug(f"   page 1 of {record.file_name} is unusable: {reason}")
+            else:
+                self.stats["covers_rendered"] += 1
+        self.stats["stages_completed"].append("cover_render")
+        logger.info(
+            f"   {self.stats['covers_rendered']} rendered, "
+            f"{self.stats['covers_unusable']} page-1s unusable"
+        )
+
     def _stage_reading_progress(self):
         """
         Filesystem-derived reading hints, advanced monotonically.
@@ -824,6 +899,8 @@ class Pipeline:
         logger.info(f"  ISBNs extracted:  {s['isbn_extracted']}")
         logger.info(f"  LLM enriched:     {s['llm_enriched']}")
         logger.info(f"  Covers scraped:   {s['covers_scraped']}")
+        logger.info(f"  Covers rendered:  {s['covers_rendered']} "
+                    f"(page 1; {s['covers_unusable']} page-1s unusable)")
         logger.info(f"  Duplicates found: {s['duplicates_found']}")
         logger.info(f"  Missing files:    {s['missing_files']}")
         logger.info(f"  Errors:           {s['errors']}")

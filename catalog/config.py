@@ -217,8 +217,12 @@ OLLAMA_MAX_INPUT_CHARS = _env_int("OLLAMA_MAX_INPUT_CHARS", 3000)
 # Ollama serves one request at a time well; keep concurrency low.
 LLM_MAX_CONCURRENCY = _env_int("LLM_MAX_CONCURRENCY", 1)
 
-# ─── Cover Scraping (Playwright) ────────────────────────────────────────────────
+# ─── Covers ─────────────────────────────────────────────────────────────────────
 COVER_SCRAPER_HEADLESS = _env_bool("COVER_SCRAPER_HEADLESS", True)
+# Rasterising page 1 as a last-resort cover. 150 DPI puts a US Letter page at
+# roughly 1275x1650, which `covers.save_cover` thumbnails to 800x1200 — so the
+# title stays legible in the grid without decoding an OCR-sized bitmap.
+COVER_RENDER_DPI = _env_int("COVER_RENDER_DPI", 150)
 
 # ─── Duplicate Detection ────────────────────────────────────────────────────────
 DUPLICATE_TITLE_THRESHOLD = _env_int("DUPLICATE_TITLE_THRESHOLD", 90)
@@ -245,12 +249,18 @@ SCHEMA_VERSION = "2.0"
 #
 # The numbering restarts here: every record in an existing catalog predates
 # the `metadata` key and is stale on the next run either way.
+# `cover` is the one unit that is not a per-book stage: covers are filled by a
+# closing stage, because a rendered page 1 may only be tried once the embedded
+# images, the providers and the scraper have all failed to produce a jacket.
+# What it records is that the attempt was *made* — so a book whose page 1 is a
+# blank title page is not re-rendered on every run.
 STAGE_VERSIONS = {
     "metadata": 1,     # parse + extract + ocr + identify + enrich
     "analyze": 2,      # controlled vocabulary + normalised scoring
     "llm": 2,
     "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable
     "chunk": 1,        # full-text extraction + passage chunking (Part 1)
+    "cover": 2,        # last-resort cover rendered from page 1 of a PDF
 }
 
 # ─── Logging ────────────────────────────────────────────────────────────────────

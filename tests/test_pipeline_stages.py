@@ -206,6 +206,133 @@ class TestDeferredStages(StageTestCase):
         self.assertNotIn("metadata", record.stage_versions)
 
 
+class TestCoverRenderStage(StageTestCase):
+    """
+    The cover of last resort, and the two things that make it safe to keep.
+
+    It must never take a slot a real jacket could have, and it must not reopen
+    the same blank title page on every run to reach the same conclusion.
+    """
+
+    def book(self, **overrides) -> BookRecord:
+        record = enriched_record(**overrides)
+        record.stage_versions.pop("cover", None)
+        self.store.upsert(record)
+        return record
+
+    def render(self, pipeline, reason=""):
+        """Run the stage with the renderer stubbed; returns what it looked at."""
+        seen = []
+
+        def _render(path, record):
+            seen.append(record.id)
+            if not reason:
+                record.set_field("cover_path", "data/covers/x.jpg", "pdf_page_1", 0.1)
+            return reason
+
+        with unittest.mock.patch("catalog.pdf_extractor.render_page_1_cover", _render), \
+                unittest.mock.patch("catalog.pdf_extractor.can_render_pages", return_value=True), \
+                unittest.mock.patch.object(Path, "exists", lambda self: True):
+            pipeline._stage_cover_render()
+        return seen
+
+    def test_a_book_with_no_cover_gets_its_page_1(self):
+        self.book()
+        pipeline = self.pipeline()
+        self.assertEqual(["sha-1"], self.render(pipeline))
+        self.assertEqual(1, pipeline.stats["covers_rendered"])
+        self.assertEqual("pdf_page_1", self.store.get_by_path("pdfs/book.pdf").field_source("cover_path"))
+
+    def test_a_book_that_already_has_a_cover_is_never_opened(self):
+        """The whole point: a provider's jacket outranks a page of the book."""
+        record = enriched_record()
+        record.stage_versions.pop("cover", None)
+        record.set_field("cover_path", "data/covers/real.jpg", "api_verified", 0.9)
+        self.store.upsert(record)
+        self.assertEqual([], self.render(self.pipeline()))
+
+    def test_epubs_are_not_candidates(self):
+        self.book(id="sha-2", content_sha1="sha-2", file_path="epubs/b.epub", file_type="epub")
+        self.assertEqual([], self.render(self.pipeline()))
+
+    def test_a_missing_file_is_not_candidate(self):
+        self.book(status="missing")
+        self.assertEqual([], self.render(self.pipeline()))
+
+    def test_a_blank_page_1_is_not_retried_on_the_next_run(self):
+        self.book()
+        first = self.pipeline()
+        self.assertEqual(["sha-1"], self.render(first, reason="nothing on the page (0.0000% ink)"))
+        self.assertEqual(1, first.stats["covers_unusable"])
+        self.assertEqual("", self.store.get_by_path("pdfs/book.pdf").cover_path)
+
+        # Still cover-less, but the attempt is on the record, so a second run
+        # does not open the file again.
+        self.assertEqual([], self.render(self.pipeline()))
+
+    def test_a_version_bump_asks_again(self):
+        self.book()
+        self.render(self.pipeline(), reason="nothing on the page (0.0000% ink)")
+        with unittest.mock.patch.dict(
+            pipeline_mod.STAGE_VERSIONS, {"cover": STAGE_VERSIONS["cover"] + 1}
+        ):
+            self.assertEqual(["sha-1"], self.render(self.pipeline()))
+
+    def test_the_stage_is_retried_when_pymupdf_is_missing(self):
+        """Deferred, not failed: nothing is marked, so the next run tries again."""
+        self.book()
+        with unittest.mock.patch("catalog.pdf_extractor.can_render_pages", return_value=False):
+            self.pipeline()._stage_cover_render()
+        self.assertNotIn("cover", self.store.get_by_path("pdfs/book.pdf").stage_versions)
+
+    def test_it_can_be_turned_off(self):
+        self.assertFalse(self.pipeline(cover_render=False).config.cover_render)
+
+
+class TestRenderedCoverYieldsToARealOne(StageTestCase):
+    """
+    A rendered page 1 is a placeholder, and `_invalidate` treats it as one.
+
+    Without this the first run to render a page would pin that page as the
+    cover forever: `save_cover` refuses a record that already has one, so no
+    later jacket — embedded, verified or scraped — could ever replace it.
+    """
+
+    def invalidate(self, record, outdated):
+        self.pipeline()._invalidate(record, outdated)
+        return record
+
+    def rendered(self) -> BookRecord:
+        record = enriched_record()
+        record.set_field("cover_path", "data/covers/sha-1_cover.jpg", "pdf_page_1", 0.1)
+        record.mark_stage("cover", STAGE_VERSIONS["cover"])
+        return record
+
+    def test_a_metadata_rerun_gives_the_slot_back(self):
+        record = self.invalidate(self.rendered(), {"parse", "extract", "ocr", "identify"})
+        self.assertEqual("", record.cover_path)
+        self.assertNotIn("cover", record.stage_versions)   # so it renders again if nothing better
+
+    def test_a_verified_jacket_survives_a_no_api_rerun(self):
+        """Only the placeholder yields. A --no-api rebuild keeps the real one."""
+        record = enriched_record()
+        record.set_field("cover_path", "data/covers/real.jpg", "api_verified", 0.9)
+        record.mark_stage("cover", STAGE_VERSIONS["cover"])
+        self.invalidate(record, {"parse", "extract", "ocr", "identify"})
+        self.assertEqual("data/covers/real.jpg", record.cover_path)
+        self.assertIn("cover", record.stage_versions)
+
+    def test_an_analyze_only_rerun_keeps_the_rendered_cover(self):
+        record = self.invalidate(self.rendered(), {"analyze"})
+        self.assertEqual("data/covers/sha-1_cover.jpg", record.cover_path)
+
+    def test_a_cover_the_user_pinned_is_never_withdrawn(self):
+        record = self.rendered()
+        record.set_field("cover_path", "data/covers/mine.jpg", "user", 1.0)
+        self.invalidate(record, set(pipeline_mod.PER_BOOK_STAGES))
+        self.assertEqual("data/covers/mine.jpg", record.cover_path)
+
+
 class TestStoreUserData(StageTestCase):
     def test_rating_and_tags_survive_a_content_change(self):
         self.store.upsert(enriched_record())

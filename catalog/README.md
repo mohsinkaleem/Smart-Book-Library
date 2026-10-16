@@ -93,7 +93,7 @@ stages share the `metadata` unit: they write the same bibliographic fields and
 settle conflicts by `SOURCE_RANK`, so re-running one without the others drops
 values nothing restores — the pipeline already forced them to move together,
 and one version says that directly. The units are `metadata`, `analyze`,
-`llm`, `embed` and `chunk`.
+`llm`, `embed`, `chunk` and `cover`.
 
 | Stage | Description |
 |---|---|
@@ -113,6 +113,7 @@ and one version says that directly. The units are `metadata`, `analyze`,
 | `analyze` | `analyze` | `metadata` |
 | `llm` | `llm` | `analyze` |
 | `embed` | `embed` | `metadata`, `analyze` |
+| `cover` | `cover_render` (closing) | — |
 
 `enrich` is the one stage inside `metadata` that can be switched off
 (`--no-api`), so it is also the only one whose provenance labels are withdrawn
@@ -120,10 +121,41 @@ separately: a run with it off re-runs the local stages and keeps the verified
 values it is not going to look up again.
 
 Closing stages run in a `finally` block, so an interrupted run still leaves a
-consistent catalog: batched embedding → cover scraping → reading progress →
-dedupe (over the whole catalog) → deletion reconciliation → save. A narrowed
-run (`--only`, `--max`, `--type`) scopes the per-record closing stages to the
-files it touched.
+consistent catalog: batched embedding → cover scraping → cover rendering →
+reading progress → dedupe (over the whole catalog) → deletion reconciliation
+→ save. A narrowed run (`--only`, `--max`, `--type`) scopes the per-record
+closing stages to the files it touched.
+
+### Covers
+
+Four sources, tried in that order, each weaker than the last — and the order
+is why `cover_render` is a closing stage rather than part of `extract`:
+
+| Source label | Where it comes from | Confidence |
+|---|---|---|
+| `isbn_match` / `api_verified` | OpenLibrary or Google Books, past the gate | 0.8–0.9 |
+| `file_meta` | an image embedded in the PDF or EPUB | 0.6–0.7 |
+| `scraper` | Playwright, `--covers` | 0.45 |
+| `pdf_page_1` | page 1 of the PDF, rendered | 0.1 |
+
+`pdf_page_1` is a placeholder and is treated as one: when the `metadata` unit
+re-runs, `_invalidate` withdraws it and forgets the `cover` mark, so a jacket
+found this time round takes the slot and the page is only re-rendered if none
+is. Before it existed, 93 of 618 books had no cover at all; after it, 2 — one
+EPUB, and one PDF whose first page really is blank.
+
+Which is the part worth knowing: a page is rejected on how much **ink** is on
+it (`covers.is_usable_cover`), not on how uniform it is. The browser's
+original "more than 90% one colour" rule is right for a downloaded jacket and
+wrong for a rendered page, where margins are the normal state of affairs — it
+rejected 61 of 92 real title pages, The Holy Bible and The Kite Runner among
+them. `frontend/.../BookCover.tsx` mirrors the ink test, so the two ends
+agree about what is worth showing.
+
+```bash
+python build_catalog.py --covers-only     # fill missing covers, touch nothing else
+python build_catalog.py --no-page-covers  # leave the gradient placeholder instead
+```
 
 ## Module map
 
