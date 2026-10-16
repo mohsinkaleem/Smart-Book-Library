@@ -6,6 +6,9 @@ export interface Book {
   file_type: 'pdf' | 'epub' | 'mobi';
   size: number;
   title: string;
+  // Served by the API all along (it is in `LIST_COLUMNS`) and missing from
+  // this type, so nothing could render it.
+  subtitle: string;
   original_title_meta: string;
   authors: string[];
   publisher: string;
