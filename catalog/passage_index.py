@@ -160,6 +160,52 @@ def _book_files(conn: sqlite3.Connection) -> dict[str, tuple[Path, str]]:
     }
 
 
+def _book_labels(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """book_id -> (title, author), the context a chunk is embedded under."""
+    return {
+        r[0]: (r[1] or "", r[2] or "")
+        for r in conn.execute("SELECT id, title, author_primary FROM books")
+    }
+
+
+#: Bumped when the *input* to the encoder changes, as opposed to the model.
+#:
+#: A vector of a bare paragraph and a vector of the same paragraph under its
+#: book's title are not comparable, and nothing about the failure is loud: the
+#: shapes match and the cosines look plausible. The recipe rides along with the
+#: model id in `chunk_index_meta`, so an index built under the old one
+#: re-embeds itself for the same reason a model change does.
+CONTEXT_RECIPE = "ctx1"
+
+
+def vector_recipe() -> str:
+    """The stamp a vector file must match to be usable: model *and* input."""
+    from .embeddings import model_id
+    return f"{model_id()}+{CONTEXT_RECIPE}"
+
+
+def embedding_input(title: str, author: str, section: str, text: str) -> str:
+    """
+    What the encoder actually sees for a chunk.
+
+    A chunk arrives at the encoder as an anonymous paragraph. Half of this
+    library is Islamic studies, where a paragraph may discuss "the two
+    witnesses" without once naming the subject a reader would search for, and
+    the other half is CS, where a page about cache lines never says "computer
+    architecture". The book's title and the section heading are the context a
+    human reader has on that page and the embedding did not.
+
+    Only the *vector* is built from this. The stored span, and so everything
+    shown, cited or highlighted, is the passage itself — the context is a lens
+    for retrieval, not words put into the reader's mouth.
+    """
+    head = " — ".join(p for p in (title.strip(), author.strip()) if p)
+    section = (section or "").strip()
+    if section and section.lower() not in head.lower():
+        head = f"{head} · {section}" if head else section
+    return f"{head}\n{text}" if head else text
+
+
 def _chunk_one(book_id: str, file_path: str, file_type: str, force_text: bool) -> list[Chunk]:
     path = Path(file_path)
     if not path.exists():
@@ -215,7 +261,7 @@ def build_index(
 
     from .embeddings import encode_passages, model_id
 
-    model = model_id()
+    model = vector_recipe()
     meta = conn.execute("SELECT model_id FROM chunk_index_meta WHERE id = 1").fetchone()
     stored_model = meta[0] if meta else ""
 
@@ -226,7 +272,7 @@ def build_index(
     if model_changed:
         logger.warning(
             f"Chunk index was built with {stored_model!r}, configured for {model!r}. "
-            f"Re-embedding every chunk; vectors from two models cannot be mixed."
+            f"Re-embedding every chunk; vectors from two recipes cannot be mixed."
         )
 
     candidates = _candidate_books(conn, book_ids)
@@ -323,14 +369,20 @@ def build_index(
                 result.errors.append(f"{book_id}: cached text lost and cannot be re-read")
 
     # ── Embed what has no vector ────────────────────────────────────────────
+    labels = _book_labels(conn)
+
+    def _input_for(book_id: str, chunk: Chunk) -> str:
+        title, author = labels.get(book_id, ("", ""))
+        return embedding_input(title, author, chunk.section, chunk.text)
+
     pending: list[tuple[str, int, str]] = []
     for book_id, chunks in fresh.items():
         for chunk in chunks:
-            pending.append((book_id, chunk.chunk_idx, chunk.text))
+            pending.append((book_id, chunk.chunk_idx, _input_for(book_id, chunk)))
     for book_id, pairs in retained.items():
         for chunk, vec in pairs:
             if vec is None:
-                pending.append((book_id, chunk.chunk_idx, chunk.text))
+                pending.append((book_id, chunk.chunk_idx, _input_for(book_id, chunk)))
 
     new_vectors: dict[tuple[str, int], np.ndarray] = {}
     if pending:

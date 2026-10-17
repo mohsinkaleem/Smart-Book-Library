@@ -377,8 +377,10 @@ class PassageIndex:
             return
 
         try:
-            from catalog.embeddings import model_id
-            expected = model_id()
+            # The recipe, not just the model: a vector built from a bare chunk
+            # and one built from a chunk under its title are not comparable.
+            from catalog.passage_index import vector_recipe
+            expected = vector_recipe()
         except Exception:
             expected = ""
 

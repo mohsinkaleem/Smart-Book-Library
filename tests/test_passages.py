@@ -159,7 +159,9 @@ def test_index_meta_stamps_the_model(indexed):
     status = pi.index_status(conn)
     conn.close()
     assert status["built"]
-    assert status["model_id"] == "stub-model"
+    # The stamp is the model *and* the input recipe: a vector of a bare chunk
+    # and a vector of a chunk under its title are not comparable.
+    assert status["model_id"] == f"stub-model+{pi.CONTEXT_RECIPE}"
     assert status["dim"] == DIM
     assert status["count"] == status["chunks_in_db"]
 
