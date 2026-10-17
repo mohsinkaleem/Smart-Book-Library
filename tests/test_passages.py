@@ -309,13 +309,63 @@ def test_lexical_search_finds_exact_terms(index):
     assert all(row["book_id"] == "book-two" for row in rows.values())
 
 
-def test_fts_query_survives_punctuation():
+def test_fts_query_survives_punctuation(index):
+    """
+    User punctuation must never reach fts5 as an operator. The parentheses in
+    the output are ours — they group the OR'd half under an AND'd phrase — so
+    the check that matters is that the query parses and runs.
+    """
     from server.passages import fts_query
 
     query = fts_query('what is "modernity" (really)? -- see p.12')
-    assert '"' not in query.replace('"', "", query.count('"'))  # only as term quoting
-    assert "OR" in query
-    assert "*" not in query and "(" not in query
+    assert "*" not in query                      # no accidental prefix search
+    assert '"modernity"' in query                # the quotes were an instruction
+    assert '"really"' in query                   # the brackets were not
+    index.lexical_search('what is "modernity" (really)? -- see p.12', limit=3)
+
+
+def test_function_words_do_not_eat_the_term_budget():
+    """
+    `max_terms` is the scarce resource: nine of the thirteen words here match
+    every chunk in the index, and before this the subject words fell off the
+    end of the budget.
+    """
+    from server.passages import fts_query
+
+    query = fts_query(
+        "what does the author say about the collapse of the abbasid caliphate"
+    )
+    assert '"abbasid"' in query and '"caliphate"' in query
+    for stopword in ('"what"', '"does"', '"the"', '"about"'):
+        assert stopword not in query
+
+
+def test_a_query_of_only_function_words_still_searches():
+    """"What is the good life" is a real question about the good life."""
+    from server.passages import fts_query
+
+    assert fts_query("what is the good life")
+    # And one that survives nothing at all is empty, not malformed.
+    assert fts_query("?? -- ()") == ""
+
+
+def test_a_quoted_phrase_is_required_not_merely_preferred(index):
+    """
+    The dense half cannot read quotes, so without this the phrase would be a
+    suggestion: chunks *about* the subject fuse in beside the ones that
+    actually contain the words.
+    """
+    text = sentences("ocean", 3)
+    present = index.search(f'"{text.split(".")[0].strip()}"', stub_vector(text), limit=5,
+                           mode="hybrid", rerank=False, min_score=0.0, relative_floor=0.0)
+    assert present
+    for hit in present:
+        assert text.split(".")[0].strip().lower() in " ".join(hit.text.lower().split())
+
+    absent = index.search('"a phrase that appears in none of these books"',
+                          stub_vector(text), limit=5, mode="hybrid", rerank=False,
+                          min_score=0.0, relative_floor=0.0)
+    assert absent == []
 
 
 def test_rrf_rewards_agreement_between_the_two_rankings():

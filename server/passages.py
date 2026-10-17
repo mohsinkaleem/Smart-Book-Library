@@ -167,17 +167,84 @@ class PassageHit:
     lexical_rank: Optional[int] = None
 
 
+# Function words, kept out of the OR'd half of a hybrid query.
+#
+# They are not *wrong* — BM25 discounts a term that appears everywhere — but
+# they are expensive in the only currency this query has: `max_terms` is 24,
+# and "what does the author say about the collapse of the abbasid caliphate"
+# spends nine of them on words that match all 251,110 chunks. Measured on this
+# index, dropping them is what let `abbasid` and `caliphate` into a query that
+# had been truncated before it reached them.
+#
+# Words of two characters or fewer are already dropped, so this list only
+# needs the longer ones. Anything with a subject-matter sense in this library
+# is deliberately absent: `being` and `will` are philosophy, `state` and
+# `order` are politics, `may` is a month and a jurisprudential term.
+STOPWORDS = frozenset("""
+the and for are but not you all any can had her was one our out has him his
+how its now see two who did get say she use that this with have from they
+will what when your said them then than were into more some such only over
+also very does where which their there these those would could should about
+after again because been before both each just like make many most much must
+other same than them they this those through under upon while whose why yes
+""".split())
+
+_PHRASE = re.compile(r'"([^"]{2,})"')
+
+
+def split_phrases(text: str) -> tuple[list[str], str]:
+    """
+    Quoted spans, and whatever was left outside them.
+
+    A reader who types quotes is asking for those words in that order. The
+    sanitiser used to delete the quotes before anything looked at them, so
+    `"the right of the wayfarer"` became eight OR'd words, four of them
+    function words, and the phrase itself ranked no higher than a chunk that
+    happened to mention a wayfarer.
+    """
+    text = text or ""
+    phrases = [" ".join(m.group(1).split()) for m in _PHRASE.finditer(text)]
+    rest = _PHRASE.sub(" ", text)
+    return [p for p in phrases if p], rest
+
+
+def _contains_phrases(haystack: str, phrases: Iterable[str]) -> bool:
+    """Every phrase present, ignoring case and how the line wrapped."""
+    flat = " ".join((haystack or "").lower().split())
+    return all(" ".join(p.lower().split()) in flat for p in phrases)
+
+
 def fts_query(text: str, max_terms: int = 24) -> str:
     """
     A safe fts5 query from arbitrary user text.
 
-    Terms are OR'd rather than AND'd: this is the lexical half of a hybrid
-    search, and its job is recall on exact terminology and proper nouns. RRF
-    handles precision by only rewarding terms that also rank well densely.
+    Loose terms are OR'd rather than AND'd: this is the lexical half of a
+    hybrid search, and its job is recall on exact terminology and proper
+    nouns. RRF handles precision by only rewarding terms that also rank well
+    densely.
+
+    A quoted phrase is the exception. It is an instruction, not a hint, so it
+    is AND'd: `"wayfarer" AND (zakat OR traveller)` asks for the phrase and
+    lets the loose terms order what is left. `search` enforces the same thing
+    on the dense side, which cannot read quotes at all.
     """
-    cleaned = _FTS_UNSAFE.sub(" ", text or "")
-    terms = [t for t in cleaned.split() if len(t) > 2][:max_terms]
-    return " OR ".join(f'"{t}"' for t in terms)
+    phrases, rest = split_phrases(text)
+
+    cleaned = _FTS_UNSAFE.sub(" ", rest)
+    words = [t for t in cleaned.split() if len(t) > 2]
+    terms = [t for t in words if t.lower() not in STOPWORDS]
+    # A query that is *all* function words still has to search for something:
+    # "what is the good life" is a real question about the good life.
+    if not terms and not phrases:
+        terms = words
+    terms = terms[:max_terms]
+
+    parts = [f'"{_FTS_UNSAFE.sub(" ", p).strip()}"' for p in phrases]
+    parts = [p for p in parts if p != '""']
+    loose = " OR ".join(f'"{t}"' for t in terms)
+    if loose:
+        parts.append(f"({loose})" if parts else loose)
+    return " AND ".join(parts)
 
 
 # ── Apparatus, not argument ─────────────────────────────────────────────────
@@ -818,6 +885,17 @@ class PassageIndex:
             if not fused:
                 return []
             hits = self.to_hits(fused, pool, cosines=cosines)
+
+        # A quoted phrase binds the dense half too. It cannot read quotes —
+        # an embedding of `"the right of the wayfarer"` is an embedding of the
+        # words — so a chunk that is *about* wayfarers would otherwise be fused
+        # in alongside the ones that actually contain the phrase, and the quote
+        # would mean nothing except in `keyword` mode.
+        required, _ = split_phrases(text)
+        if required:
+            hits = [h for h in hits if _contains_phrases(h.text, required)]
+            if not hits:
+                return []
 
         if will_rerank:
             hits = self.rerank(text, hits)
