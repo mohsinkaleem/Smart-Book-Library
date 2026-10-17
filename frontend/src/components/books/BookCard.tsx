@@ -24,11 +24,18 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
   // The favourite button used to be nested inside the `<Link>`, kept working
   // by `preventDefault`. That is invalid HTML and confusing for keyboard and
   // screen-reader users, so the link now covers the card via an overlay and
-  // the button is a real sibling above it.
+  // the button sits above it on `z-20`.
   return (
     <article className="group relative flex flex-col overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200/60 transition-all duration-200 hover:shadow-lg hover:ring-slate-300 dark:bg-slate-800 dark:ring-slate-700 dark:hover:ring-slate-600">
-      {/* Cover */}
-      <div className="relative aspect-[3/4] w-full">
+      {/* Cover.
+
+          `min-h-0` is load-bearing. A flex item's default `min-height: auto`
+          floors it at its content's intrinsic height, and an `<img>` is
+          content with an intrinsic height — so `aspect-[3/4]` was being
+          overruled by whatever shape the jacket happened to be, and every
+          cover in a row ended at a different place. `shrink-0` is the other
+          half: the box must not be squeezed when a title wraps to two lines. */}
+      <div className="relative aspect-[3/4] w-full min-h-0 shrink-0 overflow-hidden">
         <BookCover coverUrl={book.cover_url} title={book.title} fileType={book.file_type} className="h-full w-full" />
         {/* File type badge */}
         <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-bold uppercase text-white">
@@ -40,10 +47,32 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
         {book.progress_percent > 0 && book.reading_status !== 'finished' && (
           <ProgressBar percent={book.progress_percent} className="absolute inset-x-0 bottom-0 rounded-none" />
         )}
+
+        {/* Favourite — inside the cover so it can sit at its corner, and on
+            `z-20` so the link overlay below does not swallow the click. It
+            used to be anchored at `top-[calc(75%-2rem)]`, which was the 3/4
+            aspect ratio written out a second time in another unit. */}
+        <button
+          onClick={() => onFavorite?.(book.id, !book.favorite)}
+          aria-label={book.favorite ? `Remove ${book.title} from favourites` : `Add ${book.title} to favourites`}
+          aria-pressed={book.favorite}
+          className={clsx(
+            'absolute bottom-2 right-2 z-20 rounded-full p-1.5 shadow-sm backdrop-blur-sm transition-all',
+            book.favorite
+              ? 'bg-red-500 text-white opacity-100'
+              : 'bg-black/40 text-white opacity-0 hover:bg-red-500 focus-visible:opacity-100 group-hover:opacity-100',
+          )}
+        >
+          <Heart size={14} className={book.favorite ? 'fill-current' : ''} />
+        </button>
       </div>
-      {/* Info */}
+      {/* Info.
+
+          The title reserves both of its lines whether or not it needs them,
+          so the author sits on the same baseline across a row instead of
+          floating up on every short title. */}
       <div className="flex flex-1 flex-col gap-1 p-3">
-        <h3 className="line-clamp-2 text-sm font-semibold leading-tight text-slate-900 dark:text-white">
+        <h3 className="line-clamp-2 min-h-[2.2rem] text-sm font-semibold leading-tight text-slate-900 dark:text-white">
           <Link to={`/books/${book.id}`} className="after:absolute after:inset-0 after:content-['']">
             {book.title || 'Untitled'}
           </Link>
@@ -64,22 +93,6 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
           )}
         </div>
       </div>
-
-      {/* Favourite — above the link overlay, so it stays clickable */}
-      <button
-        onClick={() => onFavorite?.(book.id, !book.favorite)}
-        aria-label={book.favorite ? `Remove ${book.title} from favourites` : `Add ${book.title} to favourites`}
-        aria-pressed={book.favorite}
-        className={clsx(
-          'absolute right-1.5 z-10 rounded-full p-1 transition-all',
-          'top-[calc(75%-2rem)]',
-          book.favorite
-            ? 'bg-red-500 text-white opacity-100'
-            : 'bg-black/40 text-white opacity-0 hover:bg-red-500 focus-visible:opacity-100 group-hover:opacity-100',
-        )}
-      >
-        <Heart size={14} className={book.favorite ? 'fill-current' : ''} />
-      </button>
     </article>
   );
 }

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from catalog import api_enricher, providers  # noqa: E402
+from catalog import api_enricher, covers, pdf_extractor, providers  # noqa: E402
 from catalog import enrichment_status as status  # noqa: E402
 from catalog.api_enricher import _apply_candidate, enrich_from_apis  # noqa: E402
 from catalog.epub_extractor import _harvest_identifiers  # noqa: E402
@@ -261,6 +261,152 @@ class TestEmbeddedTitles(unittest.TestCase):
         self.assertEqual("", clean_meta_title("Microsoft Word"))
         self.assertEqual("", clean_meta_title("Adobe InDesign CS5.5 (7.5)"))
         self.assertEqual("", clean_meta_title("Untitled"))
+
+
+class TestCoverUsability(unittest.TestCase):
+    """
+    The server-side half of `isUnusableCover()` in `BookCover.tsx`.
+
+    Deciding this once, at extraction time, is what keeps a white title page
+    out of the catalog — the browser would reject it on every render anyway,
+    and a rejected cover shows the same gradient placeholder as no cover at
+    all, having cost a download first.
+    """
+
+    @staticmethod
+    def image(width=600, height=800, fill=(255, 255, 255), stripes=False):
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (width, height), fill)
+        if stripes:
+            # Coarse bands on purpose: the check samples a 20x20 downscale, so
+            # a fine pattern averages out to one flat colour there — as it does
+            # in the browser, and as a page of body text very nearly does.
+            draw = ImageDraw.Draw(img)
+            band = max(4, height // 8)
+            for i, y in enumerate(range(0, height, band)):
+                if i % 2 == 0:
+                    draw.rectangle([0, y, width, y + band], fill=(10, 20, 30))
+        return img
+
+    def test_a_blank_page_is_not_a_cover(self):
+        self.assertIn("nothing on the page", covers.is_usable_cover(self.image()))
+
+    def test_a_page_bearing_only_a_page_number_is_not_a_cover(self):
+        """The one thing a genuinely empty leading page still carries."""
+        from PIL import ImageDraw
+        img = self.image()
+        ImageDraw.Draw(img).text((300, 760), "12", fill=(120, 120, 120))
+        self.assertIn("nothing on the page", covers.is_usable_cover(img))
+
+    def test_a_sparse_title_page_is_a_cover(self):
+        """
+        The regression this heuristic was rewritten for: a title page is
+        mostly margin, and the uniformity rule it replaces threw away 61 of
+        92 real ones for exactly that.
+        """
+        from PIL import ImageDraw
+        img = self.image()
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([120, 330, 480, 370], fill=(0, 0, 0))     # title
+        draw.rectangle([200, 420, 400, 440], fill=(40, 40, 40))  # author
+        self.assertEqual("", covers.is_usable_cover(img))
+
+    def test_a_page_with_real_content_is_a_cover(self):
+        self.assertEqual("", covers.is_usable_cover(self.image(stripes=True)))
+
+    def test_a_spine_scan_is_rejected_on_its_shape(self):
+        reason = covers.is_usable_cover(self.image(120, 1200, stripes=True))
+        self.assertIn("aspect ratio", reason)
+
+    def test_a_thumbnail_is_too_small(self):
+        self.assertIn("too small", covers.is_usable_cover(self.image(40, 40, stripes=True)))
+
+    def test_unreadable_bytes_are_left_to_save_cover(self):
+        """`save_cover` already fails on these; two guards would hide which."""
+        self.assertEqual("", covers.is_usable_cover(b"not an image"))
+
+
+class TestPageOneCover(unittest.TestCase):
+    """
+    Page 1 rendered as the cover of last resort.
+
+    92 of the 93 cover-less books in the live catalog are PDFs, so this is
+    what takes cover coverage from 85% to effectively 100% — but only ever
+    for a slot an embedded jacket, a provider and the scraper all left empty.
+    """
+
+    def setUp(self):
+        try:
+            import pymupdf  # noqa: F401
+        except ImportError:
+            self.skipTest("pymupdf not installed (the `passages` extra)")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        patcher = unittest.mock.patch.object(covers, "COVERS_DIR", self.root / "data" / "covers")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def pdf(self, name: str, blank: bool = False) -> Path:
+        import pymupdf
+        doc = pymupdf.open()
+        page = doc.new_page()
+        if not blank:
+            # Enough ink that a 20x20 downscale is not one flat colour.
+            for i in range(14):
+                page.draw_rect(
+                    pymupdf.Rect(40, 40 + i * 48, 560, 70 + i * 48),
+                    color=(0.1, 0.1, 0.2), fill=(0.1, 0.1, 0.2),
+                )
+        path = self.root / name
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    @staticmethod
+    def record(**overrides) -> BookRecord:
+        record = BookRecord(id="sha-1", file_path="pdfs/b.pdf", file_name="b.pdf", file_type="pdf")
+        for key, value in overrides.items():
+            setattr(record, key, value)
+        return record
+
+    def test_a_rendered_page_becomes_the_cover(self):
+        record = self.record()
+        self.assertEqual("", pdf_extractor.render_page_1_cover(self.pdf("full.pdf"), record))
+        self.assertTrue(record.cover_path.endswith("sha-1_cover.jpg"))
+        self.assertTrue((self.root / record.cover_path).exists())
+
+    def test_the_source_says_the_cover_is_a_page_of_the_book(self):
+        record = self.record()
+        pdf_extractor.render_page_1_cover(self.pdf("full.pdf"), record)
+        self.assertEqual("pdf_page_1", record.field_source("cover_path"))
+
+    def test_it_is_the_least_confident_cover_source(self):
+        """A real jacket must always outrank a photograph of a title page."""
+        record = self.record()
+        pdf_extractor.render_page_1_cover(self.pdf("full.pdf"), record)
+        self.assertLess(record.field_confidence("cover_path"), 0.45)   # the scraper's
+
+    def test_a_blank_title_page_is_left_without_a_cover(self):
+        record = self.record()
+        reason = pdf_extractor.render_page_1_cover(self.pdf("blank.pdf", blank=True), record)
+        self.assertIn("nothing on the page", reason)
+        self.assertEqual("", record.cover_path)
+
+    def test_a_book_that_already_has_a_cover_is_not_rendered(self):
+        record = self.record()
+        record.set_field("cover_path", "data/covers/real.jpg", "api_verified", 0.9)
+        self.assertEqual(
+            "already has a cover",
+            pdf_extractor.render_page_1_cover(self.pdf("full.pdf"), record),
+        )
+        self.assertEqual("data/covers/real.jpg", record.cover_path)
+
+    def test_an_unreadable_pdf_reports_rather_than_raises(self):
+        broken = self.root / "broken.pdf"
+        broken.write_bytes(b"%PDF-1.4 truncated")
+        reason = pdf_extractor.render_page_1_cover(broken, self.record())
+        self.assertIn("could not be rendered", reason)
 
 
 class TestLlmOutputShapes(unittest.TestCase):

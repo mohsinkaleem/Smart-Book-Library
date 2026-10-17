@@ -25,42 +25,65 @@ function hashAccentColor(str: string): string {
 
 /**
  * Detect if an image is unusable as a cover:
- * - Extreme aspect ratio (spine scans, thin strips like 39×1200)
- * - Mostly a solid color (corrupted/blank cover)
+ * - Extreme aspect ratio (spine scans, thin strips like 39x1200)
+ * - Nothing on the page at all (a corrupt or empty image)
  * - Too small to be a real cover
+ *
+ * The content test measures *ink* — how much of the image differs from its own
+ * background — and not uniformity. This used to reject anything more than 90%
+ * one colour, which is right for a downloaded jacket and wrong for the page-1
+ * renders the pipeline now produces as a last-resort cover: a title page is
+ * mostly margin by design. Measured over this catalog, the old rule threw away
+ * the title pages of The Kite Runner, Mein Kampf and The Holy Bible.
+ *
+ * The thresholds mirror `catalog/covers.py`, which applies the same test
+ * server-side at extraction time. This one is the backstop for covers that
+ * predate it or came from elsewhere, so it is deliberately the more forgiving
+ * of the two: a blank page scores 0.0000 here and the sparsest real title page
+ * in the library 0.0039.
  */
+const MIN_COVER_PX = 50;
+const COVER_ASPECT_MIN = 0.25;
+const COVER_ASPECT_MAX = 4;
+const INK_SAMPLE_W = 160;
+const INK_SAMPLE_H = 220;
+const INK_GREY_DELTA = 16;
+const MIN_INK_FRACTION = 0.001;
+
 function isUnusableCover(img: HTMLImageElement): boolean {
   const w = img.naturalWidth;
   const h = img.naturalHeight;
 
-  // Too small to be a real cover (< 50px in either dimension)
-  if (w < 50 || h < 50) return true;
+  if (w < MIN_COVER_PX || h < MIN_COVER_PX) return true;
 
-  // Extreme aspect ratio: real covers are roughly 1:1.2 to 1:1.8
-  // Reject if width/height ratio is outside ~1:4 to 4:1
   const ratio = w / h;
-  if (ratio < 0.25 || ratio > 4) return true;
+  if (ratio < COVER_ASPECT_MIN || ratio > COVER_ASPECT_MAX) return true;
 
-  // Check if it's mostly a solid color via canvas sampling
   try {
     const canvas = document.createElement('canvas');
-    const size = 20;
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
+    canvas.width = INK_SAMPLE_W;
+    canvas.height = INK_SAMPLE_H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return false;
-    ctx.drawImage(img, 0, 0, size, size);
-    const data = ctx.getImageData(0, 0, size, size).data;
-    const r0 = data[0], g0 = data[1], b0 = data[2];
-    let uniformCount = 0;
-    const total = size * size;
+    ctx.drawImage(img, 0, 0, INK_SAMPLE_W, INK_SAMPLE_H);
+    const { data } = ctx.getImageData(0, 0, INK_SAMPLE_W, INK_SAMPLE_H);
+
+    // Modal grey level, not a corner pixel: a page scanned at an angle, or a
+    // jacket with a border, has a corner that is not the background.
+    const histogram = new Uint32Array(256);
     for (let i = 0; i < data.length; i += 4) {
-      const dr = Math.abs(data[i] - r0);
-      const dg = Math.abs(data[i + 1] - g0);
-      const db = Math.abs(data[i + 2] - b0);
-      if (dr < 25 && dg < 25 && db < 25) uniformCount++;
+      const grey = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+      histogram[grey | 0]++;
     }
-    if (uniformCount / total > 0.9) return true;
+    let background = 0;
+    for (let v = 1; v < 256; v++) if (histogram[v] > histogram[background]) background = v;
+
+    const total = INK_SAMPLE_W * INK_SAMPLE_H;
+    let within = 0;
+    const lo = Math.max(0, background - INK_GREY_DELTA);
+    const hi = Math.min(255, background + INK_GREY_DELTA);
+    for (let v = lo; v <= hi; v++) within += histogram[v];
+    if (1 - within / total < MIN_INK_FRACTION) return true;
   } catch {
     // canvas tainted by CORS — can't sample, fall through
   }
@@ -82,9 +105,12 @@ export function BookCover({ coverUrl, title, fileType, className }: BookCoverPro
     setShowFallback(true);
   }, []);
 
+  // The inset ring matters more than it looks: a rendered page-1 cover is a
+  // white page on a white card, and without an edge it reads as a hole in the
+  // grid rather than as a book.
   if (coverUrl && !showFallback) {
     return (
-      <div className={clsx('relative overflow-hidden rounded-lg bg-slate-200 dark:bg-slate-700', className)}>
+      <div className={clsx('relative overflow-hidden rounded-lg bg-slate-200 ring-1 ring-inset ring-slate-900/10 dark:bg-slate-700 dark:ring-white/10', className)}>
         <img
           src={coverUrl}
           alt={title}

@@ -12,6 +12,7 @@ Usage:
     python build_catalog.py --llm                 # Ollama summaries + adjudication
     python build_catalog.py --embed               # vector embeddings
     python build_catalog.py --no-ocr              # skip OCR on image-based PDFs
+    python build_catalog.py --covers-only         # fill missing covers, touch nothing else
     python build_catalog.py --force               # ignore stage versions, redo everything
     python build_catalog.py --plan                # show what a run would do, write nothing
     python build_catalog.py --verify-sources      # probe providers, then run
@@ -202,6 +203,11 @@ def main():
     parser.add_argument("--llm", action="store_true",
                         help="LLM summaries + borderline-match adjudication (requires Ollama)")
     parser.add_argument("--covers", action="store_true", help="Scrape missing covers via Playwright")
+    parser.add_argument("--covers-only", action="store_true",
+                        help="Only fill missing covers, over the whole catalog: no scanning, "
+                             "no per-book stages, no dedupe. Add --covers to scrape as well.")
+    parser.add_argument("--no-page-covers", action="store_true",
+                        help="Do not fall back to rendering page 1 of a PDF as its cover")
     parser.add_argument("--reading-progress", action="store_true",
                         help="Refresh last-opened times from Spotlight (one subprocess per book)")
     parser.add_argument("--force", action="store_true", help="Reprocess everything, ignoring stage versions")
@@ -281,6 +287,18 @@ def main():
     if args.test:
         print("🧪 Running in TEST mode (5 books, no API calls)")
         config = PipelineConfig(max_books=5, enrich_api=False, embed=False, workers=args.workers)
+    elif args.covers_only:
+        # Everything off but the cover stages. Nothing re-reads a book, nothing
+        # calls a provider, and the only columns written are the cover ones —
+        # which is what makes this safe to run against a live catalog.
+        print("🖼️  Filling missing covers only — no other stage will run")
+        config = PipelineConfig(
+            scan=False, parse=False, extract=False, ocr=False, identify=False,
+            enrich_api=False, analyze=False, llm_enrich=False, embed=False,
+            cover_scrape=args.covers, cover_render=not args.no_page_covers,
+            reading_progress=False, dedupe=False, reconcile_deletions=False,
+            workers=args.workers,
+        )
     else:
         config = PipelineConfig(
             max_books=args.max,
@@ -291,6 +309,7 @@ def main():
             ocr=not args.no_ocr,
             llm_enrich=args.llm,
             cover_scrape=args.covers,
+            cover_render=not args.no_page_covers,
             reading_progress=args.reading_progress,
             force_reprocess=args.force,
             workers=args.workers,

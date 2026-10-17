@@ -7,13 +7,24 @@ Two rules that were missing before:
   only ever considered as an author when they pass `is_person_name`.
 * Page texts are kept separate so front matter and content sample can be
   partitioned rather than blended into one excerpt.
+
+`render_page_1_cover` is the odd one out: it reads nothing, it writes a cover,
+and it goes through PyMuPDF rather than pypdf because pypdf cannot rasterise a
+page. It lives here anyway — rendering a PDF page is this module's business,
+and the pipeline calls it as a closing stage rather than from
+`extract_pdf_metadata`, so that a real jacket always gets first refusal.
 """
 import logging
 import re
 from pathlib import Path
 
-from .config import MAX_PAGES_TO_EXTRACT, MIN_TEXT_CHARS_FOR_HAS_TEXT
-from .covers import save_cover
+from .config import COVER_RENDER_DPI, MAX_PAGES_TO_EXTRACT, MIN_TEXT_CHARS_FOR_HAS_TEXT
+from .covers import (
+    PDF_PAGE_CONFIDENCE,
+    PDF_PAGE_SOURCE,
+    is_usable_cover,
+    save_cover,
+)
 from .models import BookRecord
 from .names import clean_authors, is_person_name, is_tool_title
 from .text_utils import clean_page, detect_language, detect_script, partition_pages
@@ -164,3 +175,49 @@ def _extract_pdf_cover(reader, file_path: Path, record: BookRecord):
             save_cover(record, largest, "file_meta", 0.6)
     except Exception as e:
         logger.debug(f"Cover extraction failed for {file_path.name}: {e}")
+
+
+def can_render_pages() -> bool:
+    """Whether page rasterisation is available (PyMuPDF is an optional extra)."""
+    try:
+        import pymupdf  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def render_page_1_cover(file_path: Path, record: BookRecord) -> str:
+    """
+    Use page 1 of a PDF as its cover. Returns "" on success, else the reason.
+
+    The last resort in the cover chain, and deliberately the weakest link in
+    it: 92 of the 93 cover-less books in this catalog are PDFs whose page 1
+    renders perfectly well, and a title page beats the gradient placeholder for
+    recognising a book in a grid. A *blank* title page does not, which is why
+    the render is put through `is_usable_cover` before it is saved.
+    """
+    if record.cover_path:
+        return "already has a cover"
+
+    try:
+        import pymupdf
+    except ImportError:   # pragma: no cover - supplied by the `passages` extra
+        return "pymupdf not installed"
+
+    try:
+        with pymupdf.open(str(file_path)) as doc:
+            if doc.page_count < 1:
+                return "no pages"
+            # `alpha=False` keeps the bitmap at three channels: a rendered page
+            # has nothing to be transparent against.
+            pixmap = doc[0].get_pixmap(dpi=COVER_RENDER_DPI, alpha=False)
+            data = pixmap.tobytes("png")
+    except Exception as e:
+        return f"page 1 could not be rendered: {e}"
+
+    reason = is_usable_cover(data)
+    if reason:
+        return reason
+    if not save_cover(record, data, PDF_PAGE_SOURCE, PDF_PAGE_CONFIDENCE):
+        return "cover could not be saved"
+    return ""
