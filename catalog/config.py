@@ -270,6 +270,11 @@ SCHEMA_VERSION = "2.0"
 #
 # The numbering restarts here: every record in an existing catalog predates
 # the `metadata` key and is stale on the next run either way.
+# `bibliography` is the other closing unit, and marks the same kind of fact:
+# that the front matter was *read*. A book whose opening pages simply do not
+# name an author has no author to find, and asking a local model about it again
+# on every run costs ~8 seconds to reach the same silence.
+#
 # `cover` is the one unit that is not a per-book stage: covers are filled by a
 # closing stage, because a rendered page 1 may only be tried once the embedded
 # images, the providers and the scraper have all failed to produce a jacket.
@@ -282,6 +287,7 @@ STAGE_VERSIONS = {
     "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable
     "chunk": 1,        # full-text extraction + passage chunking (Part 1)
     "cover": 2,        # last-resort cover rendered from page 1 of a PDF
+    "bibliography": 1, # author/year/publisher read off the front matter by the LLM
 }
 
 # ─── Logging ────────────────────────────────────────────────────────────────────

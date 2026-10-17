@@ -4,6 +4,8 @@ LLM enrichment via Ollama.
 The LLM is used where it is actually strong:
 
 * summarising the *content sample* (not the copyright page);
+* reading author, year and publisher off the *front matter* — the one place
+  the copyright page is the right input rather than the wrong one;
 * mapping messy external subjects onto the fixed taxonomy — it chooses from an
   enum, it does not invent labels;
 * adjudicating borderline (0.45–0.75) candidate matches.
@@ -27,6 +29,7 @@ from .config import (
     OLLAMA_TIMEOUT,
 )
 from .models import BookRecord
+from .names import clean_authors, looks_like_tool
 from .taxonomy import CANONICAL_CATEGORIES, constrain_categories
 from .text_utils import is_mostly_boilerplate
 
@@ -245,6 +248,98 @@ Answer with JSON only: {{"same_book": true|false, "confidence": 0.0-1.0, "why": 
         f"{'match' if decision else 'mismatch'} ({str(parsed.get('why', ''))[:80]})"
     )
     return decision
+
+
+# The window a printed book states its own provenance in. Earlier than 1400 is
+# not a publication date on a page, and a year past next year is a typo or a
+# misread "catalogue number".
+_EARLIEST_YEAR = 1400
+
+
+def _plausible_year(value) -> Optional[int]:
+    """An int in book-publishing range, or None. Models like to return "n.d."."""
+    from datetime import date
+    try:
+        year = int(str(value).strip()[:4])
+    except (TypeError, ValueError):
+        return None
+    if _EARLIEST_YEAR <= year <= date.today().year + 1:
+        return year
+    return None
+
+
+def extract_bibliography(record: BookRecord) -> dict:
+    """
+    Read author, year and publisher off the front matter.
+
+    For the books no provider could identify. 219 of this catalog's 618 are in
+    that state — mostly niche Islamic and dawah titles that OpenLibrary and
+    Google Books have never heard of — and for a third of the library that
+    left `publication_year` empty, which is what the Year filter and the
+    publication histogram are built on.
+
+    `parse_front_matter` already reads a title page with regexes and fills
+    `authors` and `publisher` when it can. What it cannot do is read a page
+    whose layout it does not recognise: a byline inside a dedication, "Compiled
+    by", an author named only in Arabic transliteration two lines below a
+    basmala. That is the gap this fills, and it fills it at `llm` rank — below
+    every provider and below the filename — so it only ever lands in a hole.
+
+    Returns the fields worth writing; `{}` when the model had nothing or the
+    answer failed validation. Never raises on a bad answer: a book with no
+    stated author is the normal case, not an error.
+    """
+    front = (record.front_matter or "").strip()
+    if len(front) < 40:
+        return {}
+
+    prompt = f"""You are a cataloguer reading the opening pages of a book, which are given
+below exactly as they were extracted. Report only what those pages actually state.
+
+Return JSON with these keys:
+- "authors": the people or organisations credited as the author, as a list of names as
+  printed. Not the translator, editor, compiler, publisher, or the writer of a foreword.
+  Empty list if the pages do not name an author.
+- "publication_year": the year of publication or copyright printed on the pages, as a
+  four-digit number. null if no year is printed.
+- "publisher": the publishing house, if named. null otherwise.
+
+Rules:
+- Never guess. If the pages do not state something, the answer is null or an empty list,
+  even if you happen to know the book.
+- Do not translate or reformat a name; copy it as printed.
+- A Hijri year (e.g. 1424 AH) is not the publication year unless no Gregorian year is given.
+
+Respond with JSON only, no commentary:
+{{"authors": [], "publication_year": null, "publisher": null}}
+
+File name: {record.file_name}
+Catalogued title: {record.title or "(none)"}
+
+Opening pages:
+{front[:OLLAMA_MAX_INPUT_CHARS]}"""
+
+    raw = _generate(prompt, temperature=0.1, num_predict=256)
+    result = _parse_llm_json(raw, required_key="authors")
+    if not result:
+        return {}
+
+    out: dict = {}
+
+    authors = clean_authors(_str_list(result.get("authors")))
+    if authors:
+        out["authors"] = authors
+
+    year = _plausible_year(result.get("publication_year"))
+    if year:
+        out["publication_year"] = year
+
+    publisher = (result.get("publisher") or "")
+    publisher = publisher.strip() if isinstance(publisher, str) else ""
+    if 2 < len(publisher) <= 120 and not looks_like_tool(publisher):
+        out["publisher"] = publisher
+
+    return out
 
 
 def _parse_llm_json(raw: Optional[str], required_key: str = "summary") -> Optional[dict]:

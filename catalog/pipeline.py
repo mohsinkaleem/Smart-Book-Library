@@ -152,6 +152,7 @@ class PipelineConfig:
     analyze: bool = True
     llm_enrich: bool = False
     llm_adjudicate: bool = True        # only used when llm_enrich is on
+    llm_bibliography: bool = True      # ditto: front-matter author/year/publisher
     embed: bool = False
     cover_scrape: bool = False
     # On by default, unlike `cover_scrape`: rendering a page costs no network
@@ -203,6 +204,8 @@ class Pipeline:
             "ocr_processed": 0,
             "isbn_extracted": 0,
             "llm_enriched": 0,
+            "bibliography_filled": 0,
+            "bibliography_empty": 0,
             "covers_scraped": 0,
             "covers_rendered": 0,
             "covers_unusable": 0,
@@ -291,6 +294,8 @@ class Pipeline:
             # used to leave the catalog un-deduplicated and the app stale.
             try:
                 self._stage_embed_batch()
+                if self.config.llm_enrich and self.config.llm_bibliography:
+                    self._stage_bibliography()
                 if self.config.cover_scrape:
                     self._stage_cover_scrape()
                 if self.config.cover_render:
@@ -524,6 +529,10 @@ class Pipeline:
             if record.field_source("cover_path") == PDF_PAGE_SOURCE:
                 if record.reset_field("cover_path"):
                     record.stage_versions.pop("cover", None)
+            # `extract` may have produced different front matter, and `enrich`
+            # may have just filled the very fields the model was asked for, so
+            # the reading is worth taking again.
+            record.stage_versions.pop("bibliography", None)
 
     def _run_book_stages(self, record: BookRecord, file_path: Path, outdated: set[str]):
         """
@@ -801,6 +810,80 @@ class Pipeline:
             f"{self.stats['covers_unusable']} page-1s unusable"
         )
 
+    def _stage_bibliography(self):
+        """
+        Ask the local model to read author, year and publisher off page one.
+
+        Only for the records that are still missing one of them after every
+        provider has had its turn — which is why this is a closing stage and
+        not part of `llm`. 201 books here have no publication year and 59 no
+        author, nearly all of them titles no external catalogue carries, and
+        the information is usually printed on the title page the extractor
+        already has in `front_matter`.
+
+        Everything is written at `llm` rank, so it cannot displace a provider's
+        answer or a filename's. The mark records that the pages were read, so a
+        book that genuinely does not name its author is asked once.
+        """
+        version = STAGE_VERSIONS["bibliography"]
+        records = [
+            r for r in self._scoped_records()
+            if r.status != "missing"
+            and r.front_matter
+            and (not r.authors or not r.publication_year)
+            and not r.stage_is_current("bibliography", version)
+        ]
+        if not records:
+            return
+        if not self._llm_available():
+            # Unmarked, like a deferred per-book stage: the next run asks again.
+            logger.info("\n📇 Ollama unavailable — skipping front-matter bibliography")
+            return
+
+        from .llm_enricher import extract_bibliography
+
+        logger.info(f"\n📇 READING front matter for {len(records)} books...")
+        for record in records:
+            try:
+                found = extract_bibliography(record)
+            except Exception as e:
+                logger.debug(f"Bibliography read failed for {record.file_name}: {e}")
+                continue
+
+            def fill(name: str, value, confidence: float) -> bool:
+                if getattr(record, name):
+                    return False
+                # A field can be empty and still carry a source entry — a
+                # provider that wrote a name a later run cleared, say. A source
+                # with no value behind it has nothing to protect, and leaving
+                # it there would let `api_verified` outrank a reading of the
+                # actual page on behalf of a value that is not there.
+                if record.field_source(name):
+                    record.reset_field(name)
+                return record.set_field(name, value, "llm", confidence)
+
+            wrote = False
+            if found.get("authors"):
+                wrote |= fill("authors", found["authors"], 0.4)
+            if found.get("publication_year"):
+                wrote |= fill("publication_year", found["publication_year"], 0.4)
+            if found.get("publisher"):
+                wrote |= fill("publisher", found["publisher"], 0.35)
+
+            record.mark_stage("bibliography", version)
+            self.store.upsert(record)
+            if wrote:
+                self.stats["bibliography_filled"] += 1
+                logger.info(f"   📇 {record.file_name}: {', '.join(sorted(found))}")
+            else:
+                self.stats["bibliography_empty"] += 1
+
+        self.stats["stages_completed"].append("bibliography")
+        logger.info(
+            f"   {self.stats['bibliography_filled']} filled, "
+            f"{self.stats['bibliography_empty']} pages named nothing new"
+        )
+
     def _stage_reading_progress(self):
         """
         Filesystem-derived reading hints, advanced monotonically.
@@ -898,6 +981,8 @@ class Pipeline:
         logger.info(f"  OCR processed:    {s['ocr_processed']}")
         logger.info(f"  ISBNs extracted:  {s['isbn_extracted']}")
         logger.info(f"  LLM enriched:     {s['llm_enriched']}")
+        logger.info(f"  Front matter read:{s['bibliography_filled']} filled, "
+                    f"{s['bibliography_empty']} named nothing new")
         logger.info(f"  Covers scraped:   {s['covers_scraped']}")
         logger.info(f"  Covers rendered:  {s['covers_rendered']} "
                     f"(page 1; {s['covers_unusable']} page-1s unusable)")

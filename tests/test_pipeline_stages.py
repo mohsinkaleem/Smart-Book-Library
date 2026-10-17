@@ -289,6 +289,86 @@ class TestCoverRenderStage(StageTestCase):
         self.assertFalse(self.pipeline(cover_render=False).config.cover_render)
 
 
+class TestBibliographyStage(StageTestCase):
+    """
+    The front-matter reading, and the two things that keep it in its place:
+    it may only fill a hole, and it asks each book once.
+    """
+
+    def book(self, **overrides) -> BookRecord:
+        overrides.setdefault("front_matter", "A TITLE PAGE\nby Someone\nPublished 1994")
+        record = enriched_record(**overrides)
+        record.stage_versions.pop("bibliography", None)
+        self.store.upsert(record)
+        return record
+
+    def run_stage(self, pipeline, found=None):
+        """Run the closing stage with the model stubbed; returns what it read."""
+        seen = []
+
+        def _extract(record):
+            seen.append(record.id)
+            return dict(found or {})
+
+        with unittest.mock.patch("catalog.llm_enricher.extract_bibliography", _extract), \
+                unittest.mock.patch.object(Pipeline, "_llm_available", lambda self: True):
+            pipeline._stage_bibliography()
+        return seen
+
+    def test_a_book_with_no_author_is_read(self):
+        self.book(authors=[])
+        pipeline = self.pipeline(llm_enrich=True)
+        self.assertEqual(["sha-1"], self.run_stage(pipeline, {"authors": ["Read Off Page"]}))
+        stored = self.store.get_by_path("pdfs/book.pdf")
+        self.assertEqual(["Read Off Page"], stored.authors)
+        self.assertEqual("llm", stored.field_source("authors"))
+        self.assertEqual(1, pipeline.stats["bibliography_filled"])
+
+    def test_a_missing_year_is_enough_to_ask(self):
+        self.book(publication_year=None)
+        pipeline = self.pipeline(llm_enrich=True)
+        self.run_stage(pipeline, {"publication_year": 1994})
+        self.assertEqual(1994, self.store.get_by_path("pdfs/book.pdf").publication_year)
+
+    def test_a_verified_author_is_never_displaced(self):
+        """The whole safety story: `llm` ranks below every provider."""
+        self.book(publication_year=None)          # authors are api_verified
+        pipeline = self.pipeline(llm_enrich=True)
+        self.run_stage(pipeline, {"authors": ["Impostor"], "publication_year": 1994})
+        stored = self.store.get_by_path("pdfs/book.pdf")
+        self.assertEqual(["Jane Doe"], stored.authors)
+        self.assertEqual("api_verified", stored.field_source("authors"))
+
+    def test_a_complete_record_is_not_asked(self):
+        self.book(publication_year=1990)          # has both already
+        self.assertEqual([], self.run_stage(self.pipeline(llm_enrich=True)))
+
+    def test_a_book_with_no_front_matter_is_not_asked(self):
+        self.book(authors=[], front_matter="")
+        self.assertEqual([], self.run_stage(self.pipeline(llm_enrich=True)))
+
+    def test_pages_that_name_nothing_are_not_asked_twice(self):
+        self.book(authors=[])
+        first = self.pipeline(llm_enrich=True)
+        self.assertEqual(["sha-1"], self.run_stage(first, {}))
+        self.assertEqual(1, first.stats["bibliography_empty"])
+        self.assertEqual([], self.run_stage(self.pipeline(llm_enrich=True)))
+
+    def test_it_is_retried_when_ollama_is_down(self):
+        """Deferred, not failed: nothing is marked, so the next run asks."""
+        self.book(authors=[])
+        with unittest.mock.patch.object(Pipeline, "_llm_available", lambda self: False):
+            self.pipeline(llm_enrich=True)._stage_bibliography()
+        self.assertNotIn("bibliography", self.store.get_by_path("pdfs/book.pdf").stage_versions)
+
+    def test_a_metadata_rerun_asks_again(self):
+        """New front matter, or a provider that has just filled the gap."""
+        record = self.book(authors=[])
+        record.mark_stage("bibliography", STAGE_VERSIONS["bibliography"])
+        self.pipeline(llm_enrich=True)._invalidate(record, {"parse", "extract", "identify"})
+        self.assertNotIn("bibliography", record.stage_versions)
+
+
 class TestRenderedCoverYieldsToARealOne(StageTestCase):
     """
     A rendered page 1 is a placeholder, and `_invalidate` treats it as one.
