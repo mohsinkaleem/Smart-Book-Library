@@ -120,7 +120,37 @@ logger = logging.getLogger(__name__)
 # abstract humanities queries this library is mostly for — "how does the
 # author define modernity" tops out at 0.723 — so the floor stops here and
 # `is_apparatus` and `PassageIndex.diversify` pick up the rest of the work.
-MIN_PASSAGE_SCORE = 0.68
+#
+# **Re-measured 2026-10-17 after chunks began being embedded under their book
+# and section** (`catalog.passage_index.embedding_input`). Changing the
+# encoder's input moves the whole distribution, so the floor had to be re-run:
+# `scripts/calibrate_floors.py`, 12 real queries against 10 nonsense ones over
+# the 251,112-vector index.
+#
+#     real queries    top score 0.714 - 0.865
+#     nonsense        top score 0.610 - 0.704
+#
+# **The gap that had closed has reopened, and the context prefix is what
+# reopened it.** The nonsense ceiling fell from 0.724 to 0.704 — a chunk
+# embedded under "Deep Work — Cal Newport" is a worse match for "lunar surfing
+# championship rules" than the same words embedded anonymously — while the
+# real band held. The two bands no longer touch; they are 0.010 apart.
+#
+#     floor    nonsense surviving    "define modernity" keeps
+#     0.68     3 of 10               18 hits
+#     0.70     1 of 10                4
+#     0.705    0 of 10                2
+#     0.71     0 of 10                2
+#
+# So the floor moves into the gap. The third decimal is not false precision:
+# the gap *is* 0.010 wide, its edges are 0.704 and 0.714, and 0.70 and 0.71 sit
+# on those edges rather than between them.
+#
+# What this does not buy is comfort. The query defining the lower edge keeps
+# two hits, so a humanities query a little more abstract than "how does the
+# author define modernity" will return nothing at all. If that starts
+# happening, this is the number to re-measure — not to nudge by hand.
+MIN_PASSAGE_SCORE = 0.705
 PASSAGE_RELATIVE_FLOOR = 0.80
 
 # Passage-to-passage comparison is a third distribution. The query is a real
@@ -134,6 +164,11 @@ PASSAGE_RELATIVE_FLOOR = 0.80
 # index: second-best 0.795-0.931, 200th 0.715-0.769, and 50-518 chunks above
 # 0.75 per passage. This band barely moved as the index grew — unlike the
 # short-query one above — so the number is unchanged.
+#
+# Re-measured again the same day under the context-prefixed vectors, same
+# protocol: second-best 0.785-0.884, 200th 0.699-0.808. The band tightened at
+# both ends and 0.75 still sits below every passage's best non-self match, so
+# every passage still has somewhere to point. Unchanged again.
 MIN_SIMILAR_PASSAGE_SCORE = 0.75
 
 # fts5 treats these as syntax. A user typing `what is "modernity"?` should get

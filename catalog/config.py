@@ -209,11 +209,40 @@ PASSAGE_MAX_PER_BOOK = _env_int("PASSAGE_MAX_PER_BOOK", 3)
 # Two chunks this close in one book overlap by construction.
 PASSAGE_NEIGHBOUR_GAP = _env_int("PASSAGE_NEIGHBOUR_GAP", 1)
 
-# Cross-encoder reranking of the fused top-N (§1.11 phase 2). Off by default:
-# it is a large precision gain for ~50 ms, but the model is an ~80 MB download
-# on first use, so opting in is the user's call rather than a surprise at the
-# first query. When the model will not load, search falls back to the fused
-# ranking rather than failing.
+# Cross-encoder reranking of the fused top-N (§1.11 phase 2). Off by default,
+# and the reason is no longer a guess.
+#
+# It shipped with the claim "a large precision gain for ~50 ms", which had
+# never been run against this index — the flag has been off since it was
+# written and there is no .env here. Measured 2026-10-17 by
+# `scripts/eval_rerank.py`: 18 queries over the 251,112-chunk index, in the
+# proportions this library actually holds, with the top 3 of each ordering
+# read side by side rather than scored by a rubric.
+#
+#     cost      +275 ms per query (70 ms median without, 345 ms with),
+#               16.9 s on the first query for the model load,
+#               +700 MB resident (589 MB -> 1,290 MB)
+#     effect    17 of 18 top-3s changed, 11 of 18 top-1s
+#     verdict   better on 6, worse on 8, indistinguishable on 4
+#
+# So the cost is 5x what the comment claimed and the gain is negative. It is
+# not random, either, and the pattern is worth keeping: it helps where the
+# fused ranking leads with apparatus or with a book that merely mentions the
+# subject — it put Kuhn's own account of "paradigm" above two pages of his
+# endnotes, and al-Ghazali's biography above a book about Ibn Taymiyya quoting
+# him. It hurts by demoting the passage that names the subject outright in
+# favour of a more discursive one: "Distributed Transactions and Consensus"
+# fell below "seek abstractions...", and a query about the Abbasid decline
+# gained a passage about Umayyad weakness.
+#
+# That is what a model trained on MS MARCO web queries does: it ranks "does
+# this passage answer this question" and this library is mostly read with
+# "where does my shelf discuss this". `is_apparatus` already handles the first
+# failure it fixes, for free.
+#
+# Left on the flag rather than deleted: the measurement is of one model on one
+# library, and a different cross-encoder may well do better. When the model
+# will not load, search falls back to the fused ranking rather than failing.
 PASSAGE_RERANK = _env_bool("PASSAGE_RERANK", False)
 PASSAGE_RERANK_MODEL = _env_str("PASSAGE_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 PASSAGE_RERANK_CANDIDATES = _env_int("PASSAGE_RERANK_CANDIDATES", 50)
