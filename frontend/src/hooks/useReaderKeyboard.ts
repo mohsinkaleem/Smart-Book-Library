@@ -12,6 +12,16 @@ export interface ReaderKeyboardActions {
   onToggleSidebar?: () => void;
   onGoBack?: () => void;
   onToggleToc?: () => void;
+  /**
+   * Scroll the page by a line or a screen. When set, ↑/↓, Space and
+   * PageUp/PageDown scroll through it and only ←/→ and j/k jump pages.
+   *
+   * Scroll mode used to bind ↓ and Space to "next page" like paginated mode
+   * did, so the keys a reader scrolls with leapt a whole page instead — and
+   * the EPUB reader, which has no page to jump to in scroll mode, swallowed
+   * them outright.
+   */
+  onScrollBy?: (direction: 1 | -1, unit: 'line' | 'screen') => void;
   /** Disable arrow/page shortcuts (e.g. when user is typing in sidebar) */
   disabled?: boolean;
 }
@@ -19,7 +29,7 @@ export interface ReaderKeyboardActions {
 /**
  * Keyboard shortcuts for the book reader views.
  *
- * Navigation:
+ * Navigation (paginated; see `onScrollBy` for scroll mode):
  *   ArrowRight / ArrowDown / j / PageDown / Space  → next page
  *   ArrowLeft  / ArrowUp   / k / PageUp            → prev page
  *   Home                                            → first page
@@ -61,6 +71,23 @@ export function useReaderKeyboard(actions: ReaderKeyboardActions) {
     }
 
     if (isInput) return;
+
+    // Scrolling, when the reader scrolls rather than flips.
+    if (a.onScrollBy) {
+      const scroll: Record<string, [1 | -1, 'line' | 'screen']> = {
+        ArrowDown: [1, 'line'],
+        ArrowUp: [-1, 'line'],
+        PageDown: [1, 'screen'],
+        PageUp: [-1, 'screen'],
+        ' ': [e.shiftKey ? -1 : 1, 'screen'],
+      };
+      const hit = scroll[e.key];
+      if (hit) {
+        e.preventDefault();
+        a.onScrollBy(...hit);
+        return;
+      }
+    }
 
     // Navigation
     switch (e.key) {

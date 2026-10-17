@@ -132,10 +132,15 @@ export function EpubReader() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [fontSize, setFontSize] = useLocalStorage('reader.epub.fontSize', 100);
-  const [readingTheme, setReadingTheme] = useLocalStorage<ReadingTheme>('reader.theme', 'auto');
+  const [readingTheme, setReadingTheme] = useLocalStorage<ReadingTheme>('reader.theme', 'paper');
   const [typography, setTypography] =
     useLocalStorage<EpubTypography>('reader.epub.typography', DEFAULT_TYPOGRAPHY);
-  const [continuous, setContinuous] = useState(false);
+  // Scroll is the default and the choice sticks; see the PDF reader.
+  const [continuous, setContinuousStored] = useLocalStorage('reader.epub.continuous', true);
+  const continuousRef = useRef(continuous);
+  continuousRef.current = continuous;
+  const toggleContinuous = useCallback(
+    () => setContinuousStored(!continuousRef.current), [setContinuousStored]);
   const [percent, setPercent] = useState(0);
   // Exact position, once the locations index exists. 0 until then, and the
   // spine ratio carries the progress bar in the meantime.
@@ -247,6 +252,17 @@ export function EpubReader() {
   const flipNext = useCallback(() => renditionRef.current?.next(), []);
   const flipPrev = useCallback(() => renditionRef.current?.prev(), []);
 
+  /**
+   * Scroll mode's ↑/↓ and Space. epub.js's continuous manager scrolls its own
+   * `.epub-container`, not the window, so the keys have to be pointed at it.
+   */
+  const scrollBy = useCallback((direction: 1 | -1, unit: 'line' | 'screen') => {
+    const el = document.querySelector<HTMLElement>('.epub-container');
+    if (!el) return;
+    const step = unit === 'line' ? 80 : el.clientHeight * 0.9;
+    el.scrollBy({ top: direction * step, behavior: 'smooth' });
+  }, []);
+
   const increaseFontSize = useCallback(
     () => setFontSize(Math.min(200, fontSize + 10)), [fontSize, setFontSize]);
   const decreaseFontSize = useCallback(
@@ -300,6 +316,25 @@ export function EpubReader() {
       const cfi = typeof args[0] === 'string' ? args[0] : '';
       const contents = args[1] as EpubContents | undefined;
       captureSelection(contents?.window, cfi);
+    });
+
+    // Keys pressed inside the book reach the reader's shortcuts.
+    //
+    // Clicking into the text puts focus in epub.js's iframe, whose key events
+    // never reach this window — so after the first click Space, Esc, S, F and
+    // the rest did nothing until the reader clicked the toolbar. epub.js
+    // relays the iframe's DOM events through the rendition; this re-raises
+    // them here, and hands a `preventDefault` back so a key a shortcut
+    // handled does not also scroll the iframe.
+    rendition.on('keydown', (...args: unknown[]) => {
+      const e = args[0] as KeyboardEvent | undefined;
+      if (!e?.key) return;
+      const relayed = new KeyboardEvent('keydown', {
+        key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey, altKey: e.altKey, cancelable: true,
+      });
+      window.dispatchEvent(relayed);
+      if (relayed.defaultPrevented) e.preventDefault();
     });
 
     // Position and progress on every relocation.
@@ -535,13 +570,13 @@ export function EpubReader() {
         return;
       }
       if (e.ctrlKey || e.metaKey) return;
-      if (e.key === 'c') { e.preventDefault(); setContinuous((c) => !c); }
+      if (e.key === 'c') { e.preventDefault(); toggleContinuous(); }
       if (e.key === 'b') { e.preventDefault(); addBookmark(); }
       if (e.key === '/') { e.preventDefault(); setSearchOpen(true); }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [addBookmark]);
+  }, [addBookmark, toggleContinuous]);
 
   useReaderKeyboard({
     onNextPage: continuous ? undefined : flipNext,
@@ -552,6 +587,7 @@ export function EpubReader() {
     onToggleFullscreen: () => setFullscreen((f) => !f),
     onToggleSidebar: () => setSidebarOpen((s) => !s),
     onToggleToc: () => setShowToc((t) => !t),
+    onScrollBy: continuous ? scrollBy : undefined,
     onGoBack: () => {
       if (searchOpen) setSearchOpen(false);
       else if (fullscreen) setFullscreen(false);
@@ -633,7 +669,7 @@ export function EpubReader() {
     'rounded p-1.5 bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300';
 
   return (
-    <div className={`flex ${fullscreen ? 'fixed inset-0 z-50 bg-white dark:bg-slate-900' : 'h-[calc(100vh-56px)]'}`}>
+    <div className={`flex ${fullscreen ? 'fixed inset-0 z-50 bg-white dark:bg-slate-900' : 'h-full'}`}>
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Toolbar */}
         <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-3 py-1.5 dark:border-slate-700 dark:bg-slate-800">
@@ -682,7 +718,7 @@ export function EpubReader() {
           <div className="flex-1" />
 
           <button
-            onClick={() => setContinuous((c) => !c)}
+            onClick={() => toggleContinuous()}
             className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors ${
               continuous
                 ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300'
@@ -750,6 +786,10 @@ export function EpubReader() {
                 manager: continuous ? 'continuous' : 'default',
               }}
               getRendition={handleRendition}
+              // react-reader flips pages on ←/→ keyup by itself, on top of
+              // `useReaderKeyboard`'s keydown — one press turned two pages.
+              // A handler of our own switches its binding off.
+              handleKeyPress={ignoreKey}
             />
           ) : (
             <div className="flex h-full items-center justify-center">
@@ -763,17 +803,17 @@ export function EpubReader() {
         <div className="flex items-center justify-between border-t border-slate-200 bg-white px-4 py-1.5 text-xs text-slate-400 dark:border-slate-700 dark:bg-slate-800">
           <span>
             EPUB{continuous ? ' · scroll' : ''}
-            {percent > 0 && <span className="ml-2 tabular-nums">· {Math.round(percent)}%</span>}
+            {percent > 0 && <span className="tabular-nums"> · {Math.round(percent)}%</span>}
             {locationTotal > 0 && locationIndex > 0 ? (
-              <span className="ml-2 tabular-nums text-slate-400">
-                · page {locationIndex} of {locationTotal}
+              <span className="tabular-nums text-slate-400">
+                {' · '}page {locationIndex} of {locationTotal}
               </span>
             ) : locationsBuilding ? (
-              <span className="ml-2 text-slate-400">· indexing pages…</span>
+              <span className="text-slate-400"> · indexing pages…</span>
             ) : null}
           </span>
           <span className="hidden text-[10px] sm:inline">
-            {continuous ? '↑↓ Scroll' : '← → Navigate'}
+            {continuous ? '↑↓ Space Scroll' : '← → Navigate'}
             &nbsp;·&nbsp; / Search &nbsp;·&nbsp; B Bookmark &nbsp;·&nbsp; +/- Font &nbsp;·&nbsp; C
             Mode &nbsp;·&nbsp; F Fullscreen &nbsp;·&nbsp; S Sidebar &nbsp;·&nbsp; T TOC
           </span>
@@ -835,6 +875,9 @@ function cfiFromSelection(rendition: EpubRendition | null, win: Window): string 
     return '';
   }
 }
+
+/** Swallows react-reader's built-in arrow-key paging; see its use. */
+function ignoreKey(): void {}
 
 /** The window of the currently rendered EPUB section, for clearing selections. */
 function currentFrameWindow(): Window | null {

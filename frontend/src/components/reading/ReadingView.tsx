@@ -102,7 +102,7 @@ export function ReadingView() {
   const isExcerpt = (textData.text.length || 0) >= 4900;
 
   return (
-    <div className="flex h-[calc(100vh-56px)]">
+    <div className="flex h-full">
       {/* Text Panel */}
       <div className="flex flex-1 flex-col">
         {/* Toolbar */}

@@ -113,12 +113,19 @@ export function PdfReader() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [readingTheme, setReadingTheme] = useLocalStorage<ReadingTheme>('reader.theme', 'auto');
+  const [readingTheme, setReadingTheme] = useLocalStorage<ReadingTheme>('reader.theme', 'paper');
   const [selection, setSelection] = useState<ReaderSelection | null>(null);
   const [selectedText, setSelectedText] = useState('');
   const [surroundingText, setSurroundingText] = useState('');
   const [pageInputValue, setPageInputValue] = useState('1');
-  const [continuous, setContinuous] = useState(false);
+  // Scroll is the default and the choice sticks. It used to reset to single
+  // pages on every open, so a reader who preferred scrolling switched modes
+  // every time they picked a book back up.
+  const [continuous, setContinuousStored] = useLocalStorage('reader.pdf.continuous', true);
+  const continuousRef = useRef(continuous);
+  continuousRef.current = continuous;
+  const toggleContinuous = useCallback(
+    () => setContinuousStored(!continuousRef.current), [setContinuousStored]);
   const [renderedRange, setRenderedRange] = useState<[number, number]>([1, 5]);
 
   // Which text runs each page's highlights cover, resolved once per page from
@@ -206,7 +213,18 @@ export function PdfReader() {
     if (Number.isFinite(saved) && saved > 1 && saved <= numPages) {
       setCurrentPage(saved);
       setRenderedRange([Math.max(1, saved - WINDOW_BEFORE), Math.min(numPages, saved + WINDOW_AFTER)]);
+      // In scroll mode the page is a scroll offset, not state, and the
+      // mode-switch effect that scrolls to `currentPage` ran on mount, before
+      // the document had pages. Every slot exists by now (placeholders
+      // included), so this lands before the observer's first report — which
+      // would otherwise say "page 1" and overwrite the saved position.
+      if (continuous) {
+        requestAnimationFrame(() => {
+          pageSlotRefs.current.get(saved)?.scrollIntoView({ behavior: 'instant', block: 'start' });
+        });
+      }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [numPages, book, deepLinkPage]);
 
   // ── Fit-to-width / fit-to-page ────────────────────────────────────────────
@@ -326,6 +344,14 @@ export function PdfReader() {
   );
 
   const nextPage = useCallback(() => goToPage(currentPage + 1), [currentPage, goToPage]);
+
+  /** Scroll mode's ↑/↓ and Space: move the page, not to the next one. */
+  const scrollBy = useCallback((direction: 1 | -1, unit: 'line' | 'screen') => {
+    const el = containerRef.current;
+    if (!el) return;
+    const step = unit === 'line' ? 80 : el.clientHeight * 0.9;
+    el.scrollBy({ top: direction * step, behavior: 'smooth' });
+  }, []);
   const prevPage = useCallback(() => goToPage(currentPage - 1), [currentPage, goToPage]);
 
   const setManualScale = useCallback((update: (s: number) => number) => {
@@ -455,14 +481,14 @@ export function PdfReader() {
         return;
       }
       if (e.ctrlKey || e.metaKey) return;
-      if (e.key === 'c') { e.preventDefault(); setContinuous((c) => !c); }
+      if (e.key === 'c') { e.preventDefault(); toggleContinuous(); }
       if (e.key === 'p') { e.preventDefault(); setThumbsOpen(!thumbsOpen); }
       if (e.key === 'b') { e.preventDefault(); addBookmark(); }
       if (e.key === '/') { e.preventDefault(); setSearchOpen(true); }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [addBookmark, thumbsOpen, setThumbsOpen]);
+  }, [addBookmark, thumbsOpen, setThumbsOpen, toggleContinuous]);
 
   useReaderKeyboard({
     onNextPage: nextPage,
@@ -475,6 +501,7 @@ export function PdfReader() {
     onToggleFullscreen: () => setFullscreen((f) => !f),
     onToggleSidebar: () => setSidebarOpen((s) => !s),
     onToggleToc: () => setOutlineOpen((o) => !o),
+    onScrollBy: continuous ? scrollBy : undefined,
     onGoBack: () => {
       if (searchOpen) setSearchOpen(false);
       else if (fullscreen) setFullscreen(false);
@@ -565,7 +592,7 @@ export function PdfReader() {
 
   return (
     <div
-      className={`flex ${fullscreen ? 'fixed inset-0 z-50 bg-white dark:bg-slate-900' : 'h-[calc(100vh-56px)]'}`}
+      className={`flex ${fullscreen ? 'fixed inset-0 z-50 bg-white dark:bg-slate-900' : 'h-full'}`}
     >
       {/* Page thumbnails (§2.1) */}
       {thumbsOpen && (
@@ -644,7 +671,7 @@ export function PdfReader() {
                 aria-label="Page number"
                 className="w-10 rounded border border-slate-200 bg-transparent px-1.5 py-0.5 text-center text-xs tabular-nums dark:border-slate-600"
               />
-              <span>/ {numPages}</span>
+              <span className="whitespace-nowrap">/ {numPages}</span>
             </div>
             <button onClick={nextPage} disabled={currentPage >= numPages}
                     className={`${iconButton} disabled:opacity-30`} title="Next page (→)">
@@ -683,7 +710,7 @@ export function PdfReader() {
           </div>
 
           <button
-            onClick={() => setContinuous((c) => !c)}
+            onClick={() => toggleContinuous()}
             className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors ${
               continuous
                 ? 'bg-primary-100 text-primary-700 dark:bg-primary-900/40 dark:text-primary-300'
@@ -797,11 +824,11 @@ export function PdfReader() {
           <span>
             Page {currentPage} of {numPages}{continuous ? ' · scroll' : ''}
             {numPages > 0 && (
-              <span className="ml-2 tabular-nums">· {Math.round((currentPage / numPages) * 100)}%</span>
+              <span className="tabular-nums"> · {Math.round((currentPage / numPages) * 100)}%</span>
             )}
           </span>
           <span className="hidden text-[10px] sm:inline">
-            {continuous ? '↑↓ Scroll · J/K page jump' : '← → Navigate'}
+            {continuous ? '↑↓ Space Scroll · ← → J/K Page' : '← → Navigate'}
             &nbsp;·&nbsp; / Search &nbsp;·&nbsp; B Bookmark &nbsp;·&nbsp; C Mode &nbsp;·&nbsp; T
             Contents &nbsp;·&nbsp; F Fullscreen &nbsp;·&nbsp; S Sidebar
           </span>

@@ -69,8 +69,9 @@ export const READING_THEME_META: Record<Exclude<ReadingTheme, 'auto'>, ReadingTh
 /**
  * Resolve `auto` against the app theme.
  *
- * `auto` is the default because the app already has four themes and a reader
- * that ignored them was the actual complaint — a white page in a dark app.
+ * `auto` follows the app's four themes — a white page in a dark app was the
+ * original complaint. The readers default to `paper` now, by request; `auto`
+ * stays one click away in the page-appearance menu.
  */
 export function resolveReadingTheme(
   choice: ReadingTheme,
