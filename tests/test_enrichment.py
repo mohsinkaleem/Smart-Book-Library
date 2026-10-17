@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from catalog import providers  # noqa: E402
+from catalog import api_enricher, providers  # noqa: E402
+from catalog import enrichment_status as status  # noqa: E402
 from catalog.api_enricher import _apply_candidate, enrich_from_apis  # noqa: E402
 from catalog.epub_extractor import _harvest_identifiers  # noqa: E402
 from catalog.evidence import (  # noqa: E402
@@ -156,6 +157,74 @@ class TestProviders(TempCacheCase):
             result = enrich_from_apis(record)
         self.assertTrue(result["incomplete"])
         self.assertTrue(any("incomplete" in r for r in record.review_reasons))
+        self.assertEqual(status.DEFERRED, record.enrichment_status)
+        self.assertFalse(record.needs_review)
+
+
+class TestEnrichmentStatus(TempCacheCase):
+    """
+    The split the review queue turns on: "no provider had this book" is a fact
+    about OpenLibrary and Google Books, not a record a human can confirm. It
+    used to set `needs_review`, which put 153 unactionable rows in front of
+    the few that needed a decision.
+    """
+
+    @staticmethod
+    def searchable() -> BookRecord:
+        record = BookRecord(file_name="Some Findable Title.epub")
+        record.set_field("title", "Some Findable Title", "filename", 0.4)
+        return record
+
+    def test_no_provider_match_is_unmatched_not_review(self):
+        with unittest.mock.patch.object(providers, "_fetch_json",
+                                        return_value=(providers.OK, {})):
+            enrich_from_apis(record := self.searchable())
+        self.assertEqual(status.UNMATCHED, record.enrichment_status)
+        self.assertFalse(record.needs_review)
+        self.assertIn("no provider returned a match", record.review_reasons)
+
+    def test_a_file_with_nothing_to_search_on_is_no_evidence(self):
+        record = BookRecord(file_name="757.pdf")
+        record.set_field("title", "757", "filename", 0.4)
+        enrich_from_apis(record)
+        self.assertEqual(status.NO_EVIDENCE, record.enrichment_status)
+        self.assertFalse(record.needs_review)
+
+    def test_a_borderline_match_is_the_one_that_asks_for_a_person(self):
+        record = self.searchable()
+        borderline = {
+            "score": 0.5, "verdict": "partial", "reason": "borderline: title=0.50",
+        }
+        candidate = Candidate(provider="google_books", title="Some Findable Titles",
+                              description="A description.")
+        with unittest.mock.patch.object(
+            api_enricher, "gather_candidates", return_value=[candidate]
+        ), unittest.mock.patch.object(
+            api_enricher, "best_candidate", return_value=(candidate, borderline, [])
+        ):
+            enrich_from_apis(record)
+        self.assertEqual(status.BORDERLINE, record.enrichment_status)
+        self.assertTrue(record.needs_review)
+
+    def test_an_accepted_match_is_verified(self):
+        record = self.searchable()
+        verdict = {"score": 0.95, "verdict": "accept", "reason": "title=0.95"}
+        candidate = Candidate(provider="google_books", title="Some Findable Title",
+                              authors=["Jane Doe"])
+        with unittest.mock.patch.object(
+            api_enricher, "gather_candidates", return_value=[candidate]
+        ), unittest.mock.patch.object(
+            api_enricher, "best_candidate", return_value=(candidate, verdict, [])
+        ):
+            enrich_from_apis(record)
+        self.assertEqual(status.VERIFIED, record.enrichment_status)
+        self.assertFalse(record.needs_review)
+
+    def test_unidentified_covers_every_we_do_not_know_outcome(self):
+        self.assertEqual(
+            {status.REJECTED, status.UNMATCHED, status.NO_EVIDENCE},
+            set(status.UNIDENTIFIED),
+        )
 
 
 class FakeEpub:

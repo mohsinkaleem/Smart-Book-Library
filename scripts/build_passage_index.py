@@ -5,11 +5,17 @@ Build the passage index (Part 1).
     python scripts/build_passage_index.py                # everything not yet indexed
     python scripts/build_passage_index.py --force        # re-chunk and re-embed all
     python scripts/build_passage_index.py --status       # what is in there now
+    python scripts/build_passage_index.py --vacuum       # hand freed pages back to the OS
 
 Measured on this machine over a 59-book slice: 23,920 chunks in 275 s, at
 1.5-2.9 ms/page for extraction and ~94 chunks/s for embedding. Extrapolated to
 the full 618-book library that is roughly 250k chunks, ~50 min, and ~530 MB on
 disk (~340 MB extracted text + ~190 MB float16 vectors, plus the FTS index).
+
+A chunk row holds the character span it occupies in `data/text/{book_id}.txt`,
+not the passage itself. Opening the database migrates an older index to that
+shape automatically; `--vacuum` then returns the freed pages to the operating
+system, which SQLite will not do on its own.
 
 It is resumable — a second run indexes only the books the first one did not
 reach, and carries the existing vectors over rather than recomputing them.
@@ -25,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from catalog.config import CATALOG_DB_FILE
 from catalog.passage_index import build_index, drop_index, index_status
+from catalog.schema import ensure_schema
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("build-index")
@@ -41,6 +48,8 @@ def main() -> int:
                         help="also discard the cached extracted text and read the files again")
     parser.add_argument("--status", action="store_true", help="print index status and exit")
     parser.add_argument("--drop", action="store_true", help="delete the index and exit")
+    parser.add_argument("--vacuum", action="store_true",
+                        help="rebuild the database file to reclaim freed space, then exit")
     parser.add_argument("--db", type=Path, default=CATALOG_DB_FILE)
     args = parser.parse_args()
 
@@ -52,6 +61,17 @@ def main() -> int:
         if args.drop:
             drop_index(conn)
             log.info("Passage index dropped")
+            return 0
+        if args.vacuum:
+            before = args.db.stat().st_size
+            ensure_schema(conn)      # performs any pending migration first
+            log.info("Vacuuming — this rewrites the whole file and takes a minute…")
+            conn.execute("VACUUM")
+            after = args.db.stat().st_size
+            log.info(
+                f"{before / 1e6:.0f} MB → {after / 1e6:.0f} MB "
+                f"({(before - after) / 1e6:.0f} MB reclaimed)"
+            )
             return 0
 
         def progress(done: int, total: int, title: str):

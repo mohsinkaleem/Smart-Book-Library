@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional
 
 from .config import REPORT_FILE
+from .enrichment_status import UNIDENTIFIED
 from .models import identity_confidence
 from .store import CatalogStore
 
@@ -50,12 +51,21 @@ def build_report(store: CatalogStore, stats: Optional[dict] = None) -> dict:
         else:
             buckets["<0.45"] += 1
 
+    enrichment = Counter(r.enrichment_status or "none" for r in records)
     review = [r for r in records if r.needs_review]
+    # Disjoint from `review`, the same way the store and the API define it.
+    unidentified = [
+        r for r in records
+        if r.enrichment_status in UNIDENTIFIED and not r.needs_review
+    ]
     # Ranked by identity confidence, not `match_score`. A record with no API
     # match has `match_score is None`, and sorting that as -1 put an EPUB
     # identified perfectly from its own `dc:` metadata at the very top of the
     # "worst" list, below a 0.20 rubbish match.
-    worst = sorted(review, key=identity_confidence)[:25]
+    # Both buckets, worst first: a record nobody could identify is still the
+    # most useful thing to put in front of a person, even though there is
+    # nothing about it to "confirm".
+    worst = sorted(review + unidentified, key=identity_confidence)[:25]
 
     categories = Counter()
     for record in records:
@@ -73,6 +83,8 @@ def build_report(store: CatalogStore, stats: Optional[dict] = None) -> dict:
         "field_sources": {name: dict(counter) for name, counter in field_sources.items()},
         "match_score_distribution": dict(buckets),
         "needs_review": len(review),
+        "unidentified": len(unidentified),
+        "enrichment_status": dict(enrichment.most_common()),
         "duplicates": sum(1 for r in records if r.duplicate_of),
         "categories": dict(categories.most_common(25)),
         "distinct_categories": len(categories),
@@ -108,7 +120,14 @@ def print_report(report: dict):
     print("📊 CATALOG QUALITY REPORT")
     print("=" * 68)
     print(f"  Books: {total}  (active {report['active']}, missing {report['missing']})")
-    print(f"  Needs review: {report['needs_review']}   Duplicates: {report['duplicates']}")
+    print(f"  Needs a decision: {report['needs_review']}   "
+          f"Unidentified: {report.get('unidentified', 0)}   "
+          f"Duplicates: {report['duplicates']}")
+    if report.get("enrichment_status"):
+        rendered = "  ".join(
+            f"{name}={count}" for name, count in report["enrichment_status"].items()
+        )
+        print(f"  Enrichment: {rendered}")
     print(f"  Categories: {report['distinct_categories']} distinct, "
           f"{report['categories_used_once']} used once")
 

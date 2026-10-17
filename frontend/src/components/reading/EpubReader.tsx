@@ -95,6 +95,25 @@ function swatch(color: string): string {
   return HIGHLIGHT_COLORS.find((c) => c.id === color)?.swatch ?? '#fde68a';
 }
 
+/**
+ * How long the paragraph a retrieved passage landed on stays marked.
+ *
+ * Long enough to find without looking for it, short enough that it cannot be
+ * mistaken for a highlight the reader saved. Matches the PDF reader.
+ */
+const PASSAGE_FLASH_MS = 9000;
+
+/**
+ * How many 250 ms turns to spend searching a *rendered* section for a
+ * passage's anchor text, and how long to wait for one to render at all.
+ *
+ * Twelve turns of 250 ms was the whole budget, counted from the jump, so it
+ * expired 3.3 seconds in — before a cold EPUB has put a single character in
+ * its iframe. See `goToSpine`.
+ */
+const ANCHOR_ATTEMPTS = 12;
+const ANCHOR_DEADLINE_MS = 30_000;
+
 export function EpubReader() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -388,38 +407,78 @@ export function EpubReader() {
    * rendered the section but left the paginated column offset pointing at the
    * other call's result, and every jump landed on a blank page.
    */
-  const goToSpine = useCallback((spineIndex: number, anchorText: string) => {
+  /**
+   * Mark the paragraph the jump landed on, then put it back.
+   *
+   * Scrolling a passage into view and leaving it unmarked asks the reader to
+   * find, in the middle of a rendered chapter, the paragraph the search had
+   * already located. The styles go on inline and are restored verbatim
+   * afterwards: this is inside epub.js's iframe, whose document is replaced
+   * on every relocation, so a class would need a stylesheet injected into a
+   * document that is about to be thrown away.
+   */
+  const flashElement = useCallback((element: HTMLElement | null) => {
+    if (!element) return;
+    const previous = element.getAttribute('style') || '';
+    element.style.transition = 'background-color 400ms ease-out';
+    element.style.backgroundColor = 'rgba(129, 140, 248, 0.35)';
+    element.style.borderRadius = '3px';
+    window.setTimeout(() => {
+      if (previous) element.setAttribute('style', previous);
+      else element.removeAttribute('style');
+    }, PASSAGE_FLASH_MS);
+  }, []);
+
+  const goToSpine = useCallback((spineIndex: number, anchorText: string): boolean => {
     const rendition = renditionRef.current;
     const href = rendition?.book?.spine?.get?.(spineIndex)?.href;
-    if (!href) return;
+    // Not "this book has no such section" — far more often "the spine has not
+    // been parsed yet". Saying which is the caller's problem, so this reports
+    // whether the jump happened rather than failing silently.
+    if (!href) return false;
     setLocation(href);
 
-    if (!anchorText) return;
+    if (!anchorText) return true;
     // The section has to render before its text can be searched, and epub.js
     // offers no "rendered" promise for a `location` change — so this waits for
     // the relocation to land, then gives up rather than polling forever.
+    //
+    // **Only turns that had something to search count against the budget.**
+    // Counting every turn meant the budget was really a timeout, and a cold
+    // EPUB — the first one opened, with the file still arriving and epub.js
+    // still laying out columns — spent all of it staring at an empty iframe
+    // and gave up a second before the text appeared. Measured in the browser:
+    // the document was empty for the first ~15 s and the old 3.3 s budget
+    // never saw a single character of it. The deadline is what stops this
+    // polling forever, and it is generous because the cost of one more turn
+    // is a `querySelector` on a document that is already in memory.
     const needle = anchorText.slice(0, 40).trim();
+    const deadline = Date.now() + ANCHOR_DEADLINE_MS;
     let attempts = 0;
     const findIt = () => {
-      attempts += 1;
       const doc = currentFrameWindow()?.document;
-      if (doc?.body) {
+      const ready = !!doc?.body && (doc.body.textContent || '').trim().length > 0;
+      if (ready && doc) {
+        attempts += 1;
         const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
         let node: Node | null = walker.nextNode();
         while (node) {
           if ((node.textContent || '').includes(needle)) {
-            (node.parentElement as HTMLElement | null)?.scrollIntoView({
-              behavior: 'smooth', block: 'center',
-            });
+            const element = node.parentElement as HTMLElement | null;
+            element?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            flashElement(element);
             return;
           }
           node = walker.nextNode();
         }
       }
-      if (attempts < 12) window.setTimeout(findIt, 250);
+      if (attempts < ANCHOR_ATTEMPTS && Date.now() < deadline) {
+        window.setTimeout(findIt, 250);
+      }
     };
     window.setTimeout(findIt, 350);
-  }, []);
+    return true;
+  }, [flashElement]);
 
   const navigateToPassage = useCallback((passage: Passage) => {
     if (passage.spine_index !== null && passage.spine_index !== undefined) {
@@ -433,14 +492,34 @@ export function EpubReader() {
   // cleared afterwards so a later in-reader navigation is not undone by a
   // stale URL on the next render.
   useEffect(() => {
-    if (deepLinkHandled.current || !renditionRef.current || deepLinkSpine === null) return;
-    deepLinkHandled.current = true;
-    goToSpine(deepLinkSpine, deepLinkAnchor);
-    const next = new URLSearchParams(searchParams);
-    next.delete('spine');
-    next.delete('chunk');
-    next.delete('anchor');
-    setSearchParams(next, { replace: true });
+    if (deepLinkHandled.current || deepLinkSpine === null) return;
+
+    // Retried until the jump lands, not attempted once and abandoned.
+    //
+    // The effect used to fire on the first render where a rendition existed
+    // and mark itself handled whatever happened — but a rendition exists
+    // before its book's spine is parsed, so `spine.get()` returned nothing,
+    // the jump was dropped, and the deep link left the reader wherever they
+    // had been last time. There is no event for "spine ready", and the whole
+    // check is a property lookup, so this asks again until it is.
+    let timer = 0;
+    const deadline = Date.now() + ANCHOR_DEADLINE_MS;
+    const attempt = () => {
+      if (goToSpine(deepLinkSpine, deepLinkAnchor)) {
+        deepLinkHandled.current = true;
+        // Cleared only once the jump has happened: a reload before that
+        // should still be able to use them.
+        const next = new URLSearchParams(searchParams);
+        next.delete('spine');
+        next.delete('chunk');
+        next.delete('anchor');
+        setSearchParams(next, { replace: true });
+        return;
+      }
+      if (Date.now() < deadline) timer = window.setTimeout(attempt, 250);
+    };
+    attempt();
+    return () => window.clearTimeout(timer);
   }, [deepLinkSpine, deepLinkAnchor, goToSpine, searchParams, setSearchParams, epubBook]);
 
   // Single-key toggles specific to this reader.
@@ -709,7 +788,13 @@ export function EpubReader() {
           onHighlight={addHighlight}
           onNote={addNote}
           onAsk={() => openSidebar('analysis')}
-          onCompare={() => openSidebar('analysis')}
+          // Compare is the passage panel, not the Analysis tab. It used to
+          // open Analysis, whose "Similar in Other Books" is the *book*-level
+          // comparison: one vector per book, cards that link to a book's
+          // detail page, and no way back to the paragraph that matched. The
+          // reader had asked about a paragraph, so the answer is paragraphs —
+          // and those carry a page or a section and jump to it.
+          onCompare={() => openSidebar('passages')}
           onDismiss={() => setSelection(null)}
         />
       )}

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .config import CATALOG_DB_FILE, CATALOG_FILE, PROCESSING_LOG_FILE, SCHEMA_VERSION
+from .enrichment_status import UNIDENTIFIED
 from .fts import fts_query as _fts_query
 from .models import BookRecord
 from .schema import BOOK_COLUMNS, PIPELINE_COLUMNS, USER_COLUMNS, ensure_schema
@@ -330,6 +331,25 @@ class CatalogStore:
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
+    def unidentified(self) -> list[BookRecord]:
+        """
+        Records no provider could name. Nothing to confirm — see
+        `enrichment_status` — but the first place to look for a title typed
+        off the cover.
+
+        Disjoint from `needs_review`, and the server's `unidentified` bucket
+        is defined the same way: a record that is both (no title *and* no
+        provider match) belongs in the list that asks for a decision, and
+        counting it twice makes the two totals disagree.
+        """
+        placeholders = ",".join("?" * len(UNIDENTIFIED))
+        rows = self.conn.execute(
+            f"SELECT * FROM books WHERE status != 'missing' AND needs_review = 0 "
+            f"AND enrichment_status IN ({placeholders})",
+            UNIDENTIFIED,
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
     def compute_stats(self) -> dict:
         records = self.all_records()
         if not records:
@@ -357,6 +377,10 @@ class CatalogStore:
             "duplicates": sum(1 for r in records if r.duplicate_of),
             "api_enriched": sum(1 for r in records if r.api_sources),
             "needs_review": sum(1 for r in records if r.needs_review),
+            "unidentified": sum(1 for r in records if r.enrichment_status in UNIDENTIFIED),
+            "by_enrichment_status": dict(
+                Counter(r.enrichment_status or "none" for r in records).most_common()
+            ),
             "verified_titles": sum(
                 1 for r in records if r.field_source("title") in ("api_verified", "isbn_match", "user")
             ),

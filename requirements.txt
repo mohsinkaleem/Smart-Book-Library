@@ -29,10 +29,14 @@ uvicorn[standard]>=0.41.0
 # pytest>=8.0
 
 # ── Optional extras (see pyproject.toml [project.optional-dependencies]) ──
-# embed  — semantic search / similarity: sentence-transformers>=2.2  (~2 GB, pulls torch)
-# ocr    — image-based PDFs: pytesseract>=0.3.10, pdf2image>=1.16
-#          Also requires: brew install tesseract poppler
-# covers — cover scraping: playwright>=1.40  (then: playwright install chromium)
-# watch  — folder watching: watchdog>=4.0
+# embed    — semantic search / similarity: sentence-transformers>=2.2  (~2 GB, pulls torch)
+# passages — the passage index: sentence-transformers>=2.2 + pymupdf>=1.24
+#            PyMuPDF reads whole documents 10-20x faster than pypdf and is the
+#            only reader `catalog.full_text` uses. It is AGPL, which is why it
+#            is an extra rather than a core dependency.
+# ocr      — image-based PDFs: pytesseract>=0.3.10, pdf2image>=1.16
+#            Also requires: brew install tesseract poppler
+# covers   — cover scraping: playwright>=1.40  (then: playwright install chromium)
+# watch    — folder watching: watchdog>=4.0
 #
 # LLM summaries need no extra package — just a running `ollama serve`.

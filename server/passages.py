@@ -31,22 +31,36 @@ with Reciprocal Rank Fusion (`score = Σ 1/(k + rank)`). RRF needs no score
 normalisation between the two systems, which is the usual source of
 hybrid-search bugs: BM25 is unbounded and cosine is not, so any attempt to
 average them directly is a hidden weighting.
+
+**Relevance is not the last word on ordering.** Ranking by score alone gives
+one book the whole page and shows the same paragraph three times, because
+consecutive chunks overlap by `CHUNK_OVERLAP_CHARS` and a book that discusses
+a topic discusses it in several adjacent chunks. `PassageIndex.diversify` is
+the stage after fusion and reranking: it demotes a chunk adjacent to one
+already kept, the fourth hit from one book, and apparatus (`is_apparatus` —
+bibliographies retrieve well and answer nothing). It demotes rather than
+drops, so the page keeps its length and changes its order.
 """
 from __future__ import annotations
 
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
 
+from catalog.chunking import make_anchor_text
 from catalog.config import (
+    PASSAGE_MAX_PER_BOOK,
+    PASSAGE_NEIGHBOUR_GAP,
     PASSAGE_RERANK,
     PASSAGE_RERANK_CANDIDATES,
     PASSAGE_RERANK_MODEL,
     RRF_K,
 )
+from catalog.full_text import read_span
 from catalog.passage_index import index_status, load_vectors
 
 from .db import BookDatabase
@@ -83,7 +97,30 @@ logger = logging.getLogger(__name__)
 # kept only as a long-tail trim, not as a relevance judgement. Do not tighten
 # it hoping it will reject nonsense; it cannot, and tightening it will start
 # discarding real results instead.
-MIN_PASSAGE_SCORE = 0.66
+#
+# **Re-measured 2026-10-17, at 251,110 chunks over 557 books.** The index has
+# grown 10.5x since the calibration above, and a floor is a property of the
+# score distribution, so it had to be re-run: same protocol, 12 real queries
+# against 10 nonsense ones.
+#
+#     real queries    top score 0.723 - 0.857
+#     nonsense        top score 0.608 - 0.724
+#
+# **The measured gap has closed to nothing.** At 23,920 chunks the two bands
+# were 0.05 apart; at 251,110 they touch at ~0.72, because a larger index
+# means more chances that *something* in it resembles any input at all. No
+# absolute floor can reject every nonsense query any more, so the floor's job
+# is now the cheap half of them:
+#
+#     0.66 (was)   5 of 10 nonsense queries still returned something
+#     0.68 (now)   3 of 10, and not one real query lost a single hit
+#     0.74         0 of 10, but 2 real queries returned nothing at all
+#
+# 0.68 is where nonsense halves for free. Above 0.71 it starts costing the
+# abstract humanities queries this library is mostly for — "how does the
+# author define modernity" tops out at 0.723 — so the floor stops here and
+# `is_apparatus` and `PassageIndex.diversify` pick up the rest of the work.
+MIN_PASSAGE_SCORE = 0.68
 PASSAGE_RELATIVE_FLOOR = 0.80
 
 # Passage-to-passage comparison is a third distribution. The query is a real
@@ -92,6 +129,11 @@ PASSAGE_RELATIVE_FLOOR = 0.80
 # match (the first that is not the passage itself) scores 0.867-0.923 and the
 # 200th scores 0.689-0.716. A floor calibrated for short queries would return
 # most of the book, so this one is separate and higher.
+#
+# Re-measured 2026-10-17 over 8 passages drawn at random from the 251,110-chunk
+# index: second-best 0.795-0.931, 200th 0.715-0.769, and 50-518 chunks above
+# 0.75 per passage. This band barely moved as the index grew — unlike the
+# short-query one above — so the number is unchanged.
 MIN_SIMILAR_PASSAGE_SCORE = 0.75
 
 # fts5 treats these as syntax. A user typing `what is "modernity"?` should get
@@ -136,6 +178,106 @@ def fts_query(text: str, max_terms: int = 24) -> str:
     cleaned = _FTS_UNSAFE.sub(" ", text or "")
     terms = [t for t in cleaned.split() if len(t) > 2][:max_terms]
     return " OR ".join(f'"{t}"' for t in terms)
+
+
+# ── Apparatus, not argument ─────────────────────────────────────────────────
+#
+# A bibliography retrieves beautifully and answers nothing.
+#
+# The §1.9.4 thread code met this first: its first run over a conference
+# proceedings returned four "recurring concepts" at strength 0.935, and every
+# one was a reference list — each paper ends in one, and reference lists
+# resemble each other more than any two arguments do. Search had the same leak
+# and nobody had looked: measured 2026-10-17 over ten queries on the 251k
+# index, 4 of 200 dense top-20 hits were reference lists, endnote runs or
+# tables of contents, including an ISBN block that outranked real prose on the
+# query's own subject.
+#
+# Every signal here is a *pair*: the vocabulary or number density of an
+# apparatus **and** less prose than an argument would have. One signal alone
+# does not survive this library. Tried and rejected, against 500 random
+# chunks:
+#
+#   digit density alone        flagged latency tables, equations, option
+#                              prices — a CS and finance shelf is full of
+#                              legitimate numbers
+#   3 citation markers         flagged any footnoted page: `vol.`, `p.` and
+#                              `no.` reach three in one page of real argument
+#                              about Islamic law (this was the thread code's
+#                              rule, and it was demoting prose)
+#   few long "sentences"       flagged code listings and verse
+#   `\.\s?\.\s?\.`              flagged ellipses in quoted dialogue, so a dot
+#                              leader has to be five dots, not three
+#
+# What is left runs at 6 flags in 500 random chunks, 5 of them genuine.
+# Densities are per 1,000 characters so a long chunk is not condemned for
+# being long.
+_REFERENCE_MARKERS = re.compile(
+    r"\b(?:pp?\.|vol\.|no\.|ed(?:s)?\.|ibid|op\.\s*cit|doi:|isbn|"
+    r"retrieved\s+from|available\s+at|proceedings\s+of|j\.\s|int\.\s)",
+    re.IGNORECASE,
+)
+# `[97]`-style numbered references.
+_NUMBERED_CITATION = re.compile(r"\[\d{1,4}\]")
+# A dot leader in a table of contents or an index. Five dots, because three is
+# an ellipsis and this library has novels in it.
+_DOT_LEADER = re.compile(r"(?:\.\s?){5,}")
+
+MAX_DIGIT_RATIO = 0.08
+# Below this many 60-character-plus segments per 1,000 characters, a passage
+# is not making an argument. Measured over 500 random chunks: the median is
+# 6.2 and the 5th percentile is 3.3.
+MIN_PROSE_DENSITY = 2.0
+# Too short to judge. A 250-character search hit can be real prose with no
+# room for three sentences; the apparatus this catches comes in slabs.
+MIN_JUDGEABLE_CHARS = 600
+
+
+def is_apparatus(text: str) -> bool:
+    """
+    Whether a passage is a book's apparatus rather than its argument.
+
+    Reference lists, endnote runs, index tails, tables of contents. Used to
+    demote search results (`PassageIndex.diversify`) and to reject concept
+    threads (`_is_conceptual`), which adds its own length rule on top.
+    """
+    body = (text or "").strip()
+    if len(body) < MIN_JUDGEABLE_CHARS:
+        return False
+
+    per_1k = len(body) / 1000
+    digits = sum(1 for c in body if c.isdigit()) / len(body)
+    citations = len(_REFERENCE_MARKERS.findall(body)) / per_1k
+    numbered = len(_NUMBERED_CITATION.findall(body)) / per_1k
+    leaders = len(_DOT_LEADER.findall(body)) / per_1k
+    prose = sum(1 for part in body.split(".") if len(part.strip()) > 60) / per_1k
+
+    # A dot leader is a table of contents or an index and nothing else.
+    if leaders >= 1.0:
+        return True
+    # A numbered bibliography: `[97] Author: "Title," venue, year.`
+    if numbered >= 3.0 and citations >= 1.5:
+        return True
+    # Citation vocabulary or number runs, with no prose around them.
+    if prose < MIN_PROSE_DENSITY and (citations >= 1.5 or digits > MAX_DIGIT_RATIO):
+        return True
+    # Dense citations with thin prose: an author-date bibliography, whose
+    # entries are long enough to pass for sentences.
+    if citations >= 2.5 and prose < MIN_PROSE_DENSITY * 2:
+        return True
+    return False
+
+
+# Two copies of one book produce byte-identical chunks, so a prefix is enough
+# to recognise them, and a prefix is all that can be compared cheaply: the
+# whole text of 30 candidates against each other is quadratic in the length of
+# a passage, for a case where the first line already settles it.
+_FINGERPRINT_CHARS = 300
+
+
+def _text_fingerprint(text: str) -> str:
+    """A normalised prefix, for spotting the same passage under two book ids."""
+    return " ".join((text or "").split())[:_FINGERPRINT_CHARS].lower()
 
 
 class PassageIndex:
@@ -243,6 +385,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
         min_score: float = 0.0,
         relative_floor: float = 0.0,
     ) -> list[tuple[int, float]]:
@@ -272,6 +415,13 @@ class PassageIndex:
                 scores = np.where(mask, scores, -1.0)
             if exclude_book:
                 span = self.book_ranges.get(exclude_book)
+                if span:
+                    scores[span[0]:span[1]] = -1.0
+            # Copies of a book the library already shows under another id.
+            # Without this the same paragraph came back twice from what the
+            # reader sees as one book — see `BookDatabase.duplicate_book_ids`.
+            for dupe_id in exclude_books or ():
+                span = self.book_ranges.get(dupe_id)
                 if span:
                     scores[span[0]:span[1]] = -1.0
 
@@ -304,6 +454,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
     ) -> list[tuple[int, float]]:
         """
         BM25 over `chunks_fts`. Free to build and unbeatable for exact
@@ -331,6 +482,10 @@ class PassageIndex:
                 return []
             sql.append(f"AND c.book_id IN ({','.join('?' * len(allowed))})")
             params.extend(allowed)
+        excluded = list(exclude_books or ())
+        if excluded:
+            sql.append(f"AND c.book_id NOT IN ({','.join('?' * len(excluded))})")
+            params.extend(excluded)
         sql.append("ORDER BY rank LIMIT ?")
         params.append(limit)
 
@@ -370,6 +525,75 @@ class PassageIndex:
             (cid, score, dense_rank.get(cid), lexical_rank.get(cid))
             for cid, score in ordered
         ]
+
+    # ── Diversity ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def diversify(
+        hits: list["PassageHit"],
+        limit: int,
+        max_per_book: int = PASSAGE_MAX_PER_BOOK,
+        neighbour_gap: int = PASSAGE_NEIGHBOUR_GAP,
+        demote_apparatus: bool = True,
+    ) -> list["PassageHit"]:
+        """
+        Reorder a ranked page so it is not three views of the same paragraph.
+
+        Relevance ranking alone concentrates: measured on the 251k index,
+        "quantum tunnelling" took 8 of the dense top 20 from one book, 5 of
+        them consecutive chunks — and consecutive chunks share
+        `CHUNK_OVERLAP_CHARS` of text, so the reader is being shown the same
+        prose two or three times while nine other books that discuss it sit
+        below the fold.
+
+        Four demotions, in one pass down the ranking: a chunk within
+        `neighbour_gap` of one already kept from the same book, text already
+        shown from a *different* book, the `max_per_book + 1`-th hit from a
+        book, and apparatus rather than argument. Demoted, not dropped — they
+        go behind everything that is none of those things. The candidate pool
+        is three times the page, so in practice this changes the order of the
+        page and not its length, and when the pool is thin the demoted hits
+        come back rather than leaving the reader short.
+
+        The cross-book text check is not redundant with `exclude_books`. That
+        drops the copies the catalog has *linked* (`books.duplicate_of`), and
+        the measurement that prompted this found three unlinked ones: "the
+        migratory patterns of ceiling fans" returned the same paragraph of
+        Henrich at 0.691 three times, from `The WEIRDest People in the World`,
+        `The Weirdest People in the World` and `Henrich the Weirdest People in
+        the World`, of which only the third is registered as a duplicate.
+        Retrieval cannot wait for the duplicates page to catch up.
+
+        `max_per_book` is 0 for an in-book search, where every hit is from one
+        book by definition and a cap would just truncate the page.
+        """
+        keep: list[PassageHit] = []
+        deferred: list[PassageHit] = []
+        kept_per_book: dict[str, int] = {}
+        kept_idx: dict[str, list[int]] = {}
+        kept_text: set[str] = set()
+
+        for hit in hits:
+            seen = kept_idx.setdefault(hit.book_id, [])
+            overlapping = any(abs(hit.chunk_idx - idx) <= neighbour_gap for idx in seen)
+            crowded = max_per_book > 0 and kept_per_book.get(hit.book_id, 0) >= max_per_book
+            fingerprint = _text_fingerprint(hit.text)
+            if (
+                overlapping
+                or crowded
+                or (fingerprint and fingerprint in kept_text)
+                or (demote_apparatus and is_apparatus(hit.text))
+            ):
+                deferred.append(hit)
+                continue
+            keep.append(hit)
+            kept_per_book[hit.book_id] = kept_per_book.get(hit.book_id, 0) + 1
+            seen.append(hit.chunk_idx)
+            if fingerprint:
+                kept_text.add(fingerprint)
+
+        ordered = keep + deferred
+        return ordered[:limit] if limit else ordered
 
     # ── Reranking (§1.11 phase 2) ──────────────────────────────────────────
 
@@ -411,25 +635,47 @@ class PassageIndex:
 
     # ── Row access ─────────────────────────────────────────────────────────
 
+    def _hydrate(self, rows: Iterable) -> list[dict]:
+        """
+        Turn chunk rows into dicts, reading each passage's words off disk.
+
+        A chunk row stores the span it occupies in `data/text/{book_id}.txt`,
+        not the text itself — the database used to hold a second copy of
+        every passage. `read_span` memoises whole books, so a page of hits
+        from one book costs one file read, and `anchor_text` is derived here
+        rather than stored a third time.
+        """
+        out: list[dict] = []
+        for r in rows:
+            text = read_span(r["book_id"], r["char_start"], r["char_end"],
+                             Path(r["file_path"]) if r["file_path"] else None,
+                             r["file_type"] or "")
+            out.append({
+                "chunk_id": int(r["id"]), "book_id": r["book_id"],
+                "chunk_idx": int(r["chunk_idx"]), "text": text,
+                "char_start": r["char_start"], "char_end": r["char_end"],
+                "page_start": r["page_start"], "page_end": r["page_end"],
+                "spine_index": r["spine_index"],
+                "anchor_text": make_anchor_text(text),
+                "section": r["section"] or "",
+            })
+        return out
+
+    _CHUNK_SELECT = """
+        SELECT c.id, c.book_id, c.chunk_idx, c.char_start, c.char_end,
+               c.page_start, c.page_end, c.spine_index, c.section,
+               b.file_path, b.file_type
+        FROM chunks c LEFT JOIN books b ON b.id = c.book_id
+    """
+
     def get_chunks(self, chunk_ids: Iterable[int]) -> dict[int, dict]:
         ids = list(chunk_ids)
         if not ids:
             return {}
         rows = self.db.query(
-            "SELECT id, book_id, chunk_idx, text, char_start, char_end, page_start, "
-            "       page_end, spine_index, anchor_text, section "
-            f"FROM chunks WHERE id IN ({','.join('?' * len(ids))})",
-            ids,
+            f"{self._CHUNK_SELECT} WHERE c.id IN ({','.join('?' * len(ids))})", ids
         )
-        return {
-            int(r[0]): {
-                "chunk_id": int(r[0]), "book_id": r[1], "chunk_idx": int(r[2]),
-                "text": r[3], "char_start": r[4], "char_end": r[5],
-                "page_start": r[6], "page_end": r[7], "spine_index": r[8],
-                "anchor_text": r[9] or "", "section": r[10] or "",
-            }
-            for r in rows
-        }
+        return {row["chunk_id"]: row for row in self._hydrate(rows)}
 
     def neighbours(self, chunk_id: int, span: int = 1) -> list[dict]:
         """The chunks either side of one, for reading a hit in context."""
@@ -439,20 +685,14 @@ class PassageIndex:
         if not row:
             return []
         rows = self.db.query(
-            "SELECT id, book_id, chunk_idx, text, page_start, page_end, spine_index, section "
-            "FROM chunks WHERE book_id = ? AND chunk_idx BETWEEN ? AND ? "
-            "ORDER BY chunk_idx",
+            f"{self._CHUNK_SELECT} WHERE c.book_id = ? "
+            "AND c.chunk_idx BETWEEN ? AND ? ORDER BY c.chunk_idx",
             (row[0], row[1] - span, row[1] + span),
         )
-        return [
-            {
-                "chunk_id": int(r[0]), "book_id": r[1], "chunk_idx": int(r[2]),
-                "text": r[3], "page_start": r[4], "page_end": r[5],
-                "spine_index": r[6], "section": r[7] or "",
-                "is_match": int(r[0]) == chunk_id,
-            }
-            for r in rows
-        ]
+        hydrated = self._hydrate(rows)
+        for item in hydrated:
+            item["is_match"] = item["chunk_id"] == chunk_id
+        return hydrated
 
     def cosines(self, chunk_ids: list[int], query_vec: np.ndarray) -> dict[int, float]:
         """
@@ -503,6 +743,7 @@ class PassageIndex:
         book_id: Optional[str] = None,
         exclude_book: Optional[str] = None,
         allowed_books: Optional[Iterable[str]] = None,
+        exclude_books: Optional[Iterable[str]] = None,
         mode: str = "hybrid",
         rerank: bool = True,
         min_score: float = MIN_PASSAGE_SCORE,
@@ -530,8 +771,15 @@ class PassageIndex:
         if not self.available:
             return []
 
-        pool = max(limit * 3, PASSAGE_RERANK_CANDIDATES if rerank else limit * 3)
-        scope = dict(book_id=book_id, exclude_book=exclude_book, allowed_books=allowed_books)
+        # The pool only needs to be reranker-sized when a reranker will
+        # actually run. `rerank=True` with `PASSAGE_RERANK` off used to hydrate
+        # 50 passages — 50 span reads — and then reorder none of them.
+        will_rerank = rerank and PASSAGE_RERANK
+        pool = max(limit * 3, PASSAGE_RERANK_CANDIDATES if will_rerank else 0)
+        scope = dict(
+            book_id=book_id, exclude_book=exclude_book,
+            allowed_books=allowed_books, exclude_books=exclude_books,
+        )
 
         dense: list[tuple[int, float]] = []
         if mode in ("hybrid", "semantic") and query_vec is not None:
@@ -559,7 +807,7 @@ class PassageIndex:
             # used to filter anything in this mode, but it tells the reader
             # whether an exact-term hit is also about what they meant.
             cosines = self.cosines([cid for cid, _, _, _ in fused], query_vec)
-            hits = self.to_hits(fused, pool if rerank else limit, cosines=cosines)
+            hits = self.to_hits(fused, pool, cosines=cosines)
         else:
             cosines = dict(dense)
             missing = [cid for cid, _, _, _ in fused if cid not in cosines]
@@ -569,8 +817,15 @@ class PassageIndex:
             fused = [f for f in fused if cosines.get(f[0], 0.0) >= cutoff]
             if not fused:
                 return []
-            hits = self.to_hits(fused, pool if rerank else limit, cosines=cosines)
+            hits = self.to_hits(fused, pool, cosines=cosines)
 
-        if rerank:
+        if will_rerank:
             hits = self.rerank(text, hits)
-        return hits[:limit]
+        # Apparatus is left alone in `keyword` mode: §1.9.5 is "every mention
+        # of X", and a reader hunting a citation across 618 books is one of
+        # the people a bibliography is the right answer for.
+        return self.diversify(
+            hits, limit,
+            max_per_book=0 if book_id else PASSAGE_MAX_PER_BOOK,
+            demote_apparatus=mode != "keyword",
+        )

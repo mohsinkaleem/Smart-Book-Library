@@ -27,6 +27,7 @@ import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 import { useBook } from '../../api/books';
 import { useAnnotations, useCreateAnnotation } from '../../api/annotations';
+import { usePassage } from '../../api/passages';
 import { useReaderKeyboard } from '../../hooks/useReaderKeyboard';
 import { useReadingProgress } from '../../hooks/useReadingProgress';
 import { useReadingSession } from '../../hooks/useReadingSession';
@@ -78,6 +79,19 @@ const WINDOW_AFTER = 5;
 /** A4 at 72 dpi — the placeholder height for a page that is not rendered. */
 const ESTIMATED_PAGE_HEIGHT = 842;
 
+/**
+ * Landing on the right page is not the same as finding the passage.
+ *
+ * A retrieved passage used to hand the reader a page number and leave them to
+ * re-read the page looking for the paragraph the search had already located —
+ * on a dense academic page that is most of the work the search just did. The
+ * passage is painted instead, through the same text-layer machinery as a
+ * highlight (`mapHighlightsToRuns`), and fades out on its own: it is where
+ * you landed, not something you saved.
+ */
+const PASSAGE_FLASH_ID = '__passage_flash__';
+const PASSAGE_FLASH_MS = 9000;
+
 type ZoomMode = 'manual' | 'width' | 'page';
 
 export function PdfReader() {
@@ -117,6 +131,16 @@ export function PdfReader() {
   const deepLinkPage = Number(searchParams.get('page')) || 0;
   const deepLinkHandled = useRef(false);
 
+  // The passage to paint, and the chunk a deep link arrived with.
+  //
+  // `chunk` used to be deleted from the URL unread, so a hit opened from
+  // another book landed on the page with nothing marked. Captured on the
+  // first render because the deep-link effect clears the params straight
+  // after using them.
+  const [flash, setFlash] = useState<{ page: number; text: string } | null>(null);
+  const [deepLinkChunk] = useState(() => Number(searchParams.get('chunk')) || 0);
+  const { data: deepLinkPassage } = usePassage(deepLinkChunk || null, 0);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const pageSlotRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const observerRef = useRef<IntersectionObserver | null>(null);
@@ -141,8 +165,23 @@ export function PdfReader() {
       list.push({ id: a.id, color: a.color, text: a.text });
       map.set(a.page, list);
     }
+    // The retrieved passage rides along as one more highlight — last, so a
+    // real highlight the reader saved keeps its colour where the two overlap.
+    if (flash) {
+      const list = map.get(flash.page) ?? [];
+      list.push({ id: PASSAGE_FLASH_ID, color: 'flash', text: flash.text, approximate: true });
+      map.set(flash.page, list);
+    }
     return map;
-  }, [annotationData]);
+  }, [annotationData, flash]);
+
+  // The flash clears itself. Keyed on the object so a second jump restarts
+  // the clock rather than inheriting the first one's remaining time.
+  useEffect(() => {
+    if (!flash) return;
+    const timer = window.setTimeout(() => setFlash(null), PASSAGE_FLASH_MS);
+    return () => window.clearTimeout(timer);
+  }, [flash]);
 
   useEffect(() => setPageInputValue(String(currentPage)), [currentPage]);
 
@@ -361,9 +400,11 @@ export function PdfReader() {
     if (annotation.page) goToPage(annotation.page);
   }, [goToPage]);
 
-  /** Jump to a retrieved passage inside this book (§1.9.1). */
+  /** Jump to a retrieved passage inside this book (§1.9.1), and mark it. */
   const navigateToPassage = useCallback((passage: Passage) => {
-    if (passage.page_start) goToPage(passage.page_start);
+    if (!passage.page_start) return;
+    goToPage(passage.page_start);
+    setFlash({ page: passage.page_start, text: passage.text });
   }, [goToPage]);
 
   // Arriving on a deep link from a passage card elsewhere in the library.
@@ -381,6 +422,15 @@ export function PdfReader() {
     next.delete('chunk');
     setSearchParams(next, { replace: true });
   }, [numPages, deepLinkPage, goToPage, searchParams, setSearchParams]);
+
+  // The deep-linked passage's text arrives from the API a moment after the
+  // page does, so painting it is its own effect rather than part of the jump.
+  // The page comes from the chunk, not from the URL, so a stale `?page=`
+  // cannot mark the wrong page.
+  useEffect(() => {
+    if (!deepLinkPassage?.page_start || !deepLinkPassage.text) return;
+    setFlash({ page: deepLinkPassage.page_start, text: deepLinkPassage.text });
+  }, [deepLinkPassage]);
 
   const handlePageInput = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -766,7 +816,13 @@ export function PdfReader() {
           onHighlight={addHighlight}
           onNote={addNote}
           onAsk={() => openSidebar('analysis')}
-          onCompare={() => openSidebar('analysis')}
+          // Compare is the passage panel, not the Analysis tab. It used to
+          // open Analysis, whose "Similar in Other Books" is the *book*-level
+          // comparison: one vector per book, cards that link to a book's
+          // detail page, and no way back to the paragraph that matched. The
+          // reader had asked about a paragraph, so the answer is paragraphs —
+          // and those carry a page or a section and jump to it.
+          onCompare={() => openSidebar('passages')}
           onDismiss={dismissToolbar}
         />
       )}

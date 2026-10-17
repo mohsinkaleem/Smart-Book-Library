@@ -26,6 +26,18 @@ export interface PageHighlight {
   color: string;
   /** The full selected passage. */
   text: string;
+  /**
+   * Accept a prefix of `text` when the whole of it cannot be found.
+   *
+   * A saved highlight came from this very text layer, so if it does not match
+   * exactly the page has reflowed and marking a guess would be worse than
+   * marking nothing. A *retrieved* passage did not: its text was extracted by
+   * the indexer, which hyphenates, orders columns and spaces ligatures
+   * differently from pdf.js, and it can also run onto the next page. Marking
+   * its first sentence is the whole point of the jump; marking nothing
+   * because its last line disagrees is not.
+   */
+  approximate?: boolean;
 }
 
 /** What one text run should be painted as. */
@@ -80,6 +92,37 @@ function compact(source: string): { text: string; offsets: number[] } {
   return { text, offsets };
 }
 
+/** Shorter than this, a prefix stops identifying a passage. */
+const MIN_NEEDLE = 24;
+
+/**
+ * Where a passage sits in the page text, and how much of it was found.
+ *
+ * Halves the needle until something matches or it gets too short to identify
+ * a passage. Two halvings are not enough, measured against the real index: a
+ * 1,229-character passage on page 315 of *Minkowski Spacetime* matched at
+ * one eighth and at nothing longer, because the page's rendered text differs
+ * from the indexer's somewhere in the first quarter — a ligature, a
+ * hyphenated line break, a run that pdf.js emits without a trailing space.
+ * Each disagreement only costs the reader the tail of the mark, and the
+ * opening lines are what a jump needs to land on.
+ */
+function locate(
+  haystack: string,
+  needle: string,
+  approximate: boolean,
+): { at: number; length: number } {
+  const exact = haystack.indexOf(needle);
+  if (exact !== -1 || !approximate) return { at: exact, length: needle.length };
+
+  for (let cut = Math.floor(needle.length / 2); cut >= MIN_NEEDLE; cut = Math.floor(cut / 2)) {
+    const probe = needle.slice(0, cut);
+    const at = haystack.indexOf(probe);
+    if (at !== -1) return { at, length: probe.length };
+  }
+  return { at: -1, length: 0 };
+}
+
 /**
  * Which text runs each highlight covers.
  *
@@ -111,11 +154,11 @@ export function mapHighlightsToRuns(
     const needle = normalize(highlight.text);
     if (needle.length < 8) continue;      // too short to place unambiguously
 
-    const at = page.text.indexOf(needle);
+    const { at, length } = locate(page.text, needle, highlight.approximate === true);
     if (at === -1) continue;              // not on this page, or reflowed away
 
     const from = page.offsets[at];
-    const to = page.offsets[Math.min(at + needle.length - 1, page.offsets.length - 1)];
+    const to = page.offsets[Math.min(at + length - 1, page.offsets.length - 1)];
 
     for (let i = 0; i < items.length; i++) {
       const start = runStarts[i];

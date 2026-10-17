@@ -12,13 +12,18 @@ Modules:
     ocr_extractor    - OCR for image-based PDFs (pytesseract + pdf2image)
     isbn_extractor   - ISBN extraction from text content
     api_enricher     - OpenLibrary + Google Books API enrichment
+    enrichment_status - What the gate concluded: verified | unmatched | …
     llm_enricher     - LLM-powered summaries & themes (Ollama)
+    covers           - The one place an image becomes a cover file
     cover_scraper    - Playwright-based cover image scraping
     theme_analyzer   - Extract themes/categories from text content
     embeddings       - Generate vector embeddings for semantic search
     duplicate_detector - Find duplicate books
     reading_tracker  - Track reading progress via filesystem metadata
     watcher          - Incremental folder watching with watchdog
+    full_text        - Whole-document text + offset map, cached in data/text
+    chunking         - Passage chunker, anchored by character span
+    passage_index    - Builds the passage index (chunks + vectors)
     store            - SQLite catalog store (the store of record)
     schema           - Canonical SQLite DDL and migrations
     pipeline         - Orchestrate the full enrichment pipeline

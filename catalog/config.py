@@ -186,7 +186,28 @@ FULL_TEXT_MAX_PAGES = _env_int("FULL_TEXT_MAX_PAGES", 0)
 
 # Reciprocal Rank Fusion constant. RRF needs no score normalisation between the
 # dense and BM25 rankings, which is the usual source of hybrid-search bugs.
-RRF_K = _env_int("RRF_K", 60)
+#
+# 20, not the textbook 60. `k` is a rank-compression knob, and 60 is tuned for
+# TREC runs a thousand deep. This pool is 30-50: at k=60 it spans 1/61 to
+# 1/110, so the rank a chunk reached barely registers and "proposed by both
+# systems" decides almost every ordering on its own — measured on this index,
+# a 0.722 chunk outranked a 0.725 one for that reason alone. k=20 spans 1/21
+# to 1/70, which lets a strong dense rank count for something while keeping
+# the agreement bonus RRF exists for.
+RRF_K = _env_int("RRF_K", 20)
+
+# ─── Result diversity ───────────────────────────────────────────────────────
+# Without a cap, one book owns the page. Measured on the 251,110-chunk index:
+# "quantum tunnelling" filled 8 of the dense top 20 from a single book and 5
+# of those were consecutive chunks — which, at CHUNK_OVERLAP_CHARS of overlap,
+# is largely the same prose three times.
+#
+# Both limits *demote* rather than drop. The candidate pool is three times the
+# page, so a result is only lost when the pool runs dry: this reorders the
+# page, it does not shorten it. 0 disables either one.
+PASSAGE_MAX_PER_BOOK = _env_int("PASSAGE_MAX_PER_BOOK", 3)
+# Two chunks this close in one book overlap by construction.
+PASSAGE_NEIGHBOUR_GAP = _env_int("PASSAGE_NEIGHBOUR_GAP", 1)
 
 # Cross-encoder reranking of the fused top-N (§1.11 phase 2). Off by default:
 # it is a large precision gain for ~50 ms, but the model is an ~80 MB download
@@ -231,15 +252,22 @@ MAX_WORKERS = _env_int("MAX_WORKERS", 4)         # parallel per-book workers
 SCHEMA_VERSION = "2.0"
 
 # ─── Stage Versions ─────────────────────────────────────────────────────────────
-# A stage re-runs for a record when its version here is newer than the version
+# Work re-runs for a record when the version here is newer than the version
 # recorded on that record, or when the file's content hash changed. Bump a
-# version after changing that stage's logic to re-run it on the next pass.
+# version after changing that code to re-run it on the next pass.
+#
+# These are *units of staleness*, not stages. `parse`, `extract`, `ocr`,
+# `identify` and `enrich` used to carry five independent version numbers, but
+# the pipeline dragged all five along whenever any one of them was stale —
+# they write the same bibliographic fields and settle conflicts by
+# SOURCE_RANK, so re-running one without the others drops values nothing
+# restores. Five numbers that always moved together are one number; collapsing
+# them also removes the cohort rule that existed only to re-couple them.
+#
+# The numbering restarts here: every record in an existing catalog predates
+# the `metadata` key and is stale on the next run either way.
 STAGE_VERSIONS = {
-    "parse": 3,        # download artefacts, dotted/CamelCase names, [Author]_ prefixes
-    "extract": 3,      # EPUB spine order, cover-image, identifier/language hygiene
-    "ocr": 1,
-    "identify": 2,     # ISBN harvesting from filename / front matter / text
-    "enrich": 4,       # file-exact fields no longer overwritten; work-level OL fields dropped
+    "metadata": 1,     # parse + extract + ocr + identify + enrich
     "analyze": 2,      # controlled vocabulary + normalised scoring
     "llm": 2,
     "embed": 3,        # bge-small-en-v1.5; vectors from other models are not comparable

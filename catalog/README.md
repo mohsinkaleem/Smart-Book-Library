@@ -84,9 +84,16 @@ python build_catalog.py -v                # verbose
 
 ## Pipeline stages
 
-Per book, in order. Each stage carries a version in `STAGE_VERSIONS`
-(`config.py`); it re-runs only when that version is newer than the version
-stored on the record, when the file's content hash changed, or under `--force`.
+Per book, in order. Work re-runs only when its version in `STAGE_VERSIONS`
+(`config.py`) is newer than the version stored on the record, when the file's
+content hash changed, or under `--force`.
+
+Versions are carried by **units**, not by individual stages. The five metadata
+stages share the `metadata` unit: they write the same bibliographic fields and
+settle conflicts by `SOURCE_RANK`, so re-running one without the others drops
+values nothing restores — the pipeline already forced them to move together,
+and one version says that directly. The units are `metadata`, `analyze`,
+`llm`, `embed` and `chunk`.
 
 | Stage | Description |
 |---|---|
@@ -99,6 +106,18 @@ stored on the record, when the file's content hash changed, or under `--force`.
 | `analyze` | Categories (controlled vocabulary), themes, deterministic keywords, fallback summary |
 | `llm` | Ollama summary, description, adjudication of borderline matches (optional) |
 | `embed` | Vector embeddings of the content sample (optional) |
+
+| Unit | Stages | Depends on |
+|---|---|---|
+| `metadata` | `parse`, `extract`, `ocr`, `identify`, `enrich` | — |
+| `analyze` | `analyze` | `metadata` |
+| `llm` | `llm` | `analyze` |
+| `embed` | `embed` | `metadata`, `analyze` |
+
+`enrich` is the one stage inside `metadata` that can be switched off
+(`--no-api`), so it is also the only one whose provenance labels are withdrawn
+separately: a run with it off re-runs the local stages and keeps the verified
+values it is not going to look up again.
 
 Closing stages run in a `finally` block, so an interrupted run still leaves a
 consistent catalog: batched embedding → cover scraping → reading progress →
@@ -124,7 +143,12 @@ catalog/
 ├── pdf_extractor.py       # pypdf metadata, text, cover
 ├── epub_extractor.py      # ebooklib metadata, text, cover, calibre:isbn/dc:source
 ├── ocr_extractor.py       # pytesseract + pdf2image
+├── covers.py              # the one place an image becomes a cover file
+├── full_text.py           # whole-document text + offset map, cached in data/text
+├── chunking.py            # passages, anchored by character span
+├── passage_index.py       # chunk + embed + write the passage index
 │
+├── enrichment_status.py   # verified | borderline | rejected | unmatched | …
 ├── evidence.py            # Evidence, Candidate, scoring, the verification gate
 ├── providers.py           # OpenLibrary + Google Books: session, retries, cache, rate limits
 ├── api_enricher.py        # orchestration: evidence → candidates → verify → merge
@@ -150,9 +174,17 @@ the web server reads it. `data/catalog.json` is produced only by
 
 | Table | Contents |
 |---|---|
-| `books` | Everything the pipeline produces, including `field_sources`, `match_score`, `needs_review`, `review_reasons`, `rejected_candidates`, `stage_versions` |
+| `books` | Everything the pipeline produces, including `field_sources`, `match_score`, `enrichment_status`, `needs_review`, `review_reasons`, `rejected_candidates`, `stage_versions` |
 | `user_data` | Ratings, tags, favourites, reading progress, pinned field corrections. **The pipeline never writes these** |
 | `embeddings` | Content and metadata vectors |
+| `chunks` | One row per passage: the character span it occupies in `data/text/{book_id}.txt`, its page or spine item, and its section. **Not its text** |
+| `chunks_fts` | Contentless fts5 over the passages, filled by the index builder |
+
+A chunk row holds no prose. It used to, and the database held every passage
+twice — once as a row and once as the file in `data/text` it was cut from —
+which was 329 MB of a 670 MB catalog before the FTS index on top. Opening an
+older database migrates it in place; `python scripts/build_passage_index.py
+--vacuum` then returns the pages to the operating system.
 
 Also on disk: `data/api_cache.json` (provider answers with an explicit status),
 `data/covers/`, `data/processing_log.json`, `data/enrichment_report.json`.
@@ -163,7 +195,7 @@ Also on disk: `data/api_cache.json` (provider answers with an explicit status),
 - **Bibliographic** — title, subtitle, authors, publisher, year, language, script, pages, ISBN-10/13, `source_ids`
 - **Content** — description, summary, themes, `categories` (controlled), `subjects_raw` (external, searchable), keywords
 - **Text** — `front_matter` (evidence, never embedded), `content_sample` (embedded and summarised), `text_excerpt` (reader preview)
-- **Provenance** — `field_sources`, `match_score`, `needs_review`, `review_reasons`, `rejected_candidates`
+- **Provenance** — `field_sources`, `match_score`, `enrichment_status`, `needs_review`, `review_reasons`, `rejected_candidates`
 - **Processing** — `has_text`, `ocr_required`, `api_sources`, `stage_versions`, `processing_errors`
 - **User** *(in `user_data`)* — reading status, progress, rating, tags, favourite
 
@@ -238,10 +270,29 @@ python build_catalog.py --review            # the review queue on the command li
 
 ## Review queue
 
-Records the gate could not confirm surface at `/review` in the web app and
-through `/api/review`. A correction made there is pinned as `source: "user"`,
-`confidence: 1.0`, stored in `user_data.field_overrides`, and re-applied after
-every future run — including a full rebuild.
+Two lists, because they ask different questions. `enrichment_status` records
+where the gate ended up; `needs_review` means a person's judgement would
+change something.
+
+| Bucket | `enrichment_status` | What it is |
+|---|---|---|
+| Needs a decision | `borderline` (and anything with no title at all) | We found a plausible match and declined to trust it with the identity fields |
+| Not in any provider | `unmatched`, `rejected`, `no_evidence` | Nothing is wrong with these; OpenLibrary and Google Books simply do not have them |
+
+They were one list. Much of this library is not in either catalogue, so 153
+records that no human could confirm buried the handful that needed deciding —
+220 flagged, of which 2 were actionable.
+
+```bash
+python build_catalog.py --review          # waiting on a decision
+python build_catalog.py --unidentified    # no provider could name these
+```
+
+Both surface at `/review` in the web app, as tabs, and through
+`/api/review/queue?bucket=review|unidentified`. A correction made there is
+pinned as `source: "user"`, `confidence: 1.0`, stored in
+`user_data.field_overrides`, and re-applied after every future run —
+including a full rebuild.
 
 ## Tests
 

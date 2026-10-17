@@ -9,6 +9,12 @@ interface SidebarProps {
   onClearFilters: () => void;
   collapsed: boolean;
   searchQuery?: string;
+  /**
+   * Dismiss the sidebar. Only meaningful below `md`, where it is a drawer
+   * laid over the grid: there, picking a filter and then having to find the
+   * toggle again to see the result is the whole interaction going wrong.
+   */
+  onDismiss?: () => void;
 }
 
 /**
@@ -83,7 +89,9 @@ function FilterRadio({ label, selected, count, onChange }: {
   );
 }
 
-export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, searchQuery }: SidebarProps) {
+export function Sidebar({
+  filters, onFilterChange, onClearFilters, collapsed, searchQuery, onDismiss,
+}: SidebarProps) {
   // Build params for reactive facet query: include search + all active filters
   const facetParams = useMemo(() => {
     const params: Record<string, string> = {};
@@ -99,8 +107,26 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
   if (collapsed) return null;
 
+  // Below `md` this is a drawer over the content, not a column beside it.
+  // As a static `w-64` column it took two thirds of a 375px viewport and
+  // squeezed the grid into roughly 110px, where a card is narrower than its
+  // own title and renders one letter per line.
+  const choose = (key: string, value: string) => {
+    onFilterChange(key, value);
+    onDismiss?.();
+  };
+
   return (
-    <aside className="h-full w-64 shrink-0 overflow-y-auto border-r border-slate-200 bg-white px-4 py-4 dark:border-slate-700 dark:bg-slate-800/50">
+    <>
+      <div
+        onClick={onDismiss}
+        aria-hidden="true"
+        className="fixed inset-0 top-14 z-40 bg-slate-900/40 backdrop-blur-[1px] md:hidden"
+      />
+      <aside
+        aria-label="Filters"
+        className="fixed bottom-0 left-0 top-14 z-50 w-72 max-w-[85vw] overflow-y-auto border-r border-slate-200 bg-white px-4 py-4 shadow-xl md:static md:z-auto md:h-full md:w-64 md:max-w-none md:shrink-0 md:shadow-none dark:border-slate-700 dark:bg-slate-800 md:dark:bg-slate-800/50"
+      >
       <div className="mb-4 flex items-center justify-between">
         <h2 className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
           <BookOpen size={18} className="text-primary-500" /> Filters
@@ -117,48 +143,48 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
 
       {/* Categories */}
       <FilterSection title="Categories">
-        <FilterRadio label="All" selected={!filters.category} onChange={() => onFilterChange('category', '')} />
+        <FilterRadio label="All" selected={!filters.category} onChange={() => choose('category', '')} />
         {facets?.categories.slice(0, 15).map((c) => (
           <FilterRadio
             key={c.name} label={c.name} count={c.count}
             selected={filters.category === c.name}
-            onChange={() => onFilterChange('category', filters.category === c.name ? '' : c.name)}
+            onChange={() => choose('category', filters.category === c.name ? '' : c.name)}
           />
         ))}
       </FilterSection>
 
       {/* File Type */}
       <FilterSection title="File Type">
-        <FilterRadio label="All" selected={!filters.file_type} onChange={() => onFilterChange('file_type', '')} />
+        <FilterRadio label="All" selected={!filters.file_type} onChange={() => choose('file_type', '')} />
         {facets?.file_types.map((ft) => (
           <FilterRadio
             key={ft.name} label={ft.name.toUpperCase()} count={ft.count}
             selected={filters.file_type === ft.name}
-            onChange={() => onFilterChange('file_type', filters.file_type === ft.name ? '' : ft.name)}
+            onChange={() => choose('file_type', filters.file_type === ft.name ? '' : ft.name)}
           />
         ))}
       </FilterSection>
 
       {/* Reading Status */}
       <FilterSection title="Status" defaultOpen={false}>
-        <FilterRadio label="All" selected={!filters.reading_status} onChange={() => onFilterChange('reading_status', '')} />
+        <FilterRadio label="All" selected={!filters.reading_status} onChange={() => choose('reading_status', '')} />
         {facets?.reading_statuses.map((rs) => (
           <FilterRadio
             key={rs.name} label={rs.name.replace('_', ' ')} count={rs.count}
             selected={filters.reading_status === rs.name}
-            onChange={() => onFilterChange('reading_status', filters.reading_status === rs.name ? '' : rs.name)}
+            onChange={() => choose('reading_status', filters.reading_status === rs.name ? '' : rs.name)}
           />
         ))}
       </FilterSection>
 
       {/* Language */}
       <FilterSection title="Language" defaultOpen={false}>
-        <FilterRadio label="All" selected={!filters.language} onChange={() => onFilterChange('language', '')} />
+        <FilterRadio label="All" selected={!filters.language} onChange={() => choose('language', '')} />
         {facets?.languages.slice(0, 10).map((l) => (
           <FilterRadio
             key={l.name} label={languageLabel(l.name)} count={l.count}
             selected={filters.language === l.name}
-            onChange={() => onFilterChange('language', filters.language === l.name ? '' : l.name)}
+            onChange={() => choose('language', filters.language === l.name ? '' : l.name)}
           />
         ))}
       </FilterSection>
@@ -168,28 +194,28 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
         <FilterRadio
           label="Favorites"
           selected={filters.favorite === 'true'}
-          onChange={() => onFilterChange('favorite', filters.favorite === 'true' ? '' : 'true')}
+          onChange={() => choose('favorite', filters.favorite === 'true' ? '' : 'true')}
         />
         <FilterRadio
           label="Has Cover"
           selected={filters.has_cover === 'true'}
-          onChange={() => onFilterChange('has_cover', filters.has_cover === 'true' ? '' : 'true')}
+          onChange={() => choose('has_cover', filters.has_cover === 'true' ? '' : 'true')}
         />
         <FilterRadio
           label="Has Description"
           selected={filters.has_description === 'true'}
-          onChange={() => onFilterChange('has_description', filters.has_description === 'true' ? '' : 'true')}
+          onChange={() => choose('has_description', filters.has_description === 'true' ? '' : 'true')}
         />
       </FilterSection>
 
       {/* Themes */}
       <FilterSection title="Themes" defaultOpen={false}>
-        <FilterRadio label="All" selected={!filters.theme} onChange={() => onFilterChange('theme', '')} />
+        <FilterRadio label="All" selected={!filters.theme} onChange={() => choose('theme', '')} />
         {facets?.themes.slice(0, 12).map((t) => (
           <FilterRadio
             key={t.name} label={t.name} count={t.count}
             selected={filters.theme === t.name}
-            onChange={() => onFilterChange('theme', filters.theme === t.name ? '' : t.name)}
+            onChange={() => choose('theme', filters.theme === t.name ? '' : t.name)}
           />
         ))}
       </FilterSection>
@@ -221,6 +247,7 @@ export function Sidebar({ filters, onFilterChange, onClearFilters, collapsed, se
           Clear all filters
         </button>
       )}
-    </aside>
+      </aside>
+    </>
   );
 }

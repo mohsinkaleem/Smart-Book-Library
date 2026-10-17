@@ -143,6 +143,11 @@ class BookRecord:
 
     # ─── Provenance & Review ────────────────────────────────────────────────
     field_sources: dict = field(default_factory=dict)  # field -> {source, confidence, at}
+    # Where enrichment ended up: verified | borderline | rejected | unmatched |
+    # no_evidence | deferred, or "" when the stage never ran. It answers "did
+    # we identify this book"; `needs_review` answers the different question
+    # "would a human looking at this change anything".
+    enrichment_status: str = ""
     needs_review: bool = False
     review_reasons: list = field(default_factory=list)
     match_score: Optional[float] = None             # best accepted candidate score
@@ -257,14 +262,22 @@ class BookRecord:
         ]
         return [name for name in names if self.reset_field(name)]
 
-    def flag_review(self, reason: str):
-        self.needs_review = True
+    def note_reason(self, reason: str):
+        """Record why the record is in the state it is, without claiming a
+        human can do anything about it. "Not in OpenLibrary" is a fact about
+        the provider, not a defect in the record."""
         if reason not in self.review_reasons:
             self.review_reasons.append(reason)
+
+    def flag_review(self, reason: str):
+        """Record a reason *and* ask for a human decision."""
+        self.needs_review = True
+        self.note_reason(reason)
 
     def clear_review(self):
         self.needs_review = False
         self.review_reasons = []
+        self.enrichment_status = ""
 
     def stage_is_current(self, stage: str, expected_version: int) -> bool:
         return int(self.stage_versions.get(stage, 0)) >= expected_version

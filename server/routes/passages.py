@@ -25,6 +25,7 @@ from ..passages import (
     MIN_SIMILAR_PASSAGE_SCORE,
     PASSAGE_RELATIVE_FLOOR,
     PassageHit,
+    is_apparatus,
 )
 from .params import Filters
 
@@ -39,24 +40,14 @@ Scope = Literal["book", "catalog", "category", "author"]
 STANCE_EXCERPT_CHARS = 700
 STANCE_MAX_PASSAGES = 8
 
-# A concept thread must be about a concept.
+# A concept thread must be about a concept — see `is_apparatus`, which this
+# module used to own a private copy of.
 #
 # The first run of §1.9.4 over a conference proceedings returned four threads
 # at strength 0.935, and every one of them was a *bibliography* — each paper in
 # the volume ends in a reference list, and reference lists resemble each other
 # more than any two arguments do. They are recurring, and they are not a
-# finding.
-#
-# The tell is density: a reference list is mostly digits, initials and
-# punctuation. `prose_score` does not catch it, because the lines are long
-# enough to count as prose.
-_REFERENCE_MARKERS = re.compile(
-    r"\b(?:pp?\.|vol\.|no\.|ed(?:s)?\.|ibid|op\.\s*cit|doi:|isbn|"
-    r"retrieved\s+from|available\s+at|proceedings\s+of|j\.\s|int\.\s)",
-    re.IGNORECASE,
-)
-MAX_DIGIT_RATIO = 0.08
-MIN_THREAD_SENTENCES = 3
+# finding. Passage search had the same leak and now shares the fix.
 
 
 class PassageSearchRequest(BaseModel):
@@ -185,14 +176,22 @@ def _resolve_scope(request: Request, body, filters_dict: dict) -> dict:
         if not body.book_id:
             raise HTTPException(422, "scope='book' requires book_id")
         return {"book_id": body.book_id}
+    # Searching one book is the user pointing at that book, duplicate or not.
+    # Every other scope is a search of "the library", which shows one copy of
+    # each book — so the hidden copies' passages must not come back either.
+    duplicates = db.duplicate_book_ids()
     if scope in ("category", "author"):
         if not filters_dict:
             raise HTTPException(422, f"scope='{scope}' requires a category or author filter")
         return {
             "allowed_books": db.filtered_ids(**filters_dict),
             "exclude_book": getattr(body, "exclude_book", None),
+            "exclude_books": duplicates,
         }
-    return {"exclude_book": getattr(body, "exclude_book", None) or body.book_id}
+    return {
+        "exclude_book": getattr(body, "exclude_book", None) or body.book_id,
+        "exclude_books": duplicates,
+    }
 
 
 @router.get("/api/passages/status")
@@ -257,7 +256,12 @@ def similar_passages(body: SimilarPassagesRequest, request: Request):
             raise HTTPException(422, "scope='book' requires book_id")
         scope_args = {"book_id": body.book_id}
     else:
-        scope_args = {"exclude_book": body.book_id}
+        # "Where else does this idea appear" must not answer with the same
+        # paragraph out of the library's hidden second copy of this book.
+        scope_args = {
+            "exclude_book": body.book_id,
+            "exclude_books": request.app.state.db.duplicate_book_ids(),
+        }
 
     # Ask for one extra: in-book search will return the selection's own chunk,
     # which is a 1.0 match and tells the reader nothing.
@@ -313,6 +317,7 @@ async def passage_stance(body: StanceRequest, request: Request):
         body.text, similarity.encode_passage(body.text),
         limit=body.limit, mode="hybrid", rerank=True,
         exclude_book=body.book_id,
+        exclude_books=request.app.state.db.duplicate_book_ids(),
         min_score=MIN_SIMILAR_PASSAGE_SCORE, relative_floor=PASSAGE_RELATIVE_FLOOR,
     )
     passages = _serialise(request.app.state.db, hits)
@@ -481,19 +486,12 @@ def _is_conceptual(text: str) -> bool:
     """
     Whether a passage is an argument rather than an apparatus.
 
-    Rejects reference lists, endnote blocks and index tails — the things that
-    recur across a book without meaning anything by recurring. Three cheap
-    signals, all of which a bibliography trips and ordinary prose does not:
-    digit density, citation vocabulary, and having almost no sentences.
+    The signals live in `is_apparatus`, which passage search applies too. This
+    adds the one rule that is specific to threads: a thread is a claim about a
+    recurring *passage*, and anything under 200 characters is a heading or a
+    page number that happens to recur.
     """
     body = (text or "").strip()
     if len(body) < 200:
         return False
-    digits = sum(1 for c in body if c.isdigit())
-    if digits > len(body) * MAX_DIGIT_RATIO:
-        return False
-    if len(_REFERENCE_MARKERS.findall(body)) >= 3:
-        return False
-    if body.count(".") and sum(1 for s in body.split(".") if len(s.strip()) > 60) < MIN_THREAD_SENTENCES:
-        return False
-    return True
+    return not is_apparatus(body)

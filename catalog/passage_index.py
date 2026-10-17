@@ -16,6 +16,12 @@ a free list and a compaction pass, which buys nothing at this scale and gets
 the mapping wrong exactly once, silently, in a way no test would catch. So the
 builder owns the id space: it renumbers every chunk on every build.
 
+**A chunk row holds no text.** It holds the character span it occupies in
+``data/text/{book_id}.txt``, and `full_text.read_span` reads the words back.
+The database used to keep a second copy of every passage — 329 MB, more than
+the files themselves because chunks overlap — and `chunks_fts` a third. The
+FTS index is now contentless and this builder fills it directly.
+
 **Rewriting the file does not mean re-embedding the library.** Vectors for
 books that were not re-chunked are carried over from the previous file by
 (book_id, chunk_idx), so adding one book costs one book's worth of embedding —
@@ -37,15 +43,15 @@ from typing import Callable, Iterable, Optional
 
 import numpy as np
 
-from .chunking import Chunk, chunk_document
+from .chunking import Chunk, chunk_document, make_anchor_text
 from .config import (
     CHUNK_OVERLAP_CHARS,
     CHUNK_TARGET_CHARS,
     CHUNK_VECTORS_FILE,
     EMBEDDING_BATCH_SIZE,
 )
-from .full_text import clear_cached, get_full_text
-from .schema import ensure_schema
+from .full_text import clear_cached, get_full_text, read_span
+from .schema import CHUNK_COLUMNS, ensure_schema
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,14 @@ def _candidate_books(conn: sqlite3.Connection, only: Optional[Iterable[str]]) ->
         wanted = set(only)
         rows = [r for r in rows if r[0] in wanted]
     return rows
+
+
+def _book_files(conn: sqlite3.Connection) -> dict[str, tuple[Path, str]]:
+    """book_id -> (path, file_type), so a chunk's text can be re-read."""
+    return {
+        r[0]: (Path(r[1]), r[2])
+        for r in conn.execute("SELECT id, file_path, file_type FROM books")
+    }
 
 
 def _chunk_one(book_id: str, file_path: str, file_type: str, force_text: bool) -> list[Chunk]:
@@ -258,21 +272,55 @@ def build_index(
     retained: dict[str, list[tuple[Chunk, Optional[np.ndarray]]]] = {}
     if not model_changed:
         rows = conn.execute(
-            "SELECT book_id, chunk_idx, text, char_start, char_end, page_start, page_end, "
-            "       spine_index, anchor_text, section "
+            "SELECT book_id, chunk_idx, char_start, char_end, page_start, page_end, "
+            "       spine_index, section "
             "FROM chunks WHERE book_id NOT IN ({}) ORDER BY book_id, chunk_idx".format(
                 ",".join("?" * len(target_ids)) or "''"
             ),
             tuple(target_ids),
         ).fetchall()
+        # Their text is not in the row any more; it is read back from the span
+        # each row records.
+        files = _book_files(conn)
+        unreadable: set[str] = set()
         for r in rows:
+            book_id = r[0]
+            if book_id in unreadable:
+                continue
+            path, file_type = files.get(book_id, (None, ""))
+            text = read_span(book_id, r[2], r[3], path, file_type)
+            if not text:
+                # The book's extracted text is gone and could not be produced
+                # again. Carrying a chunk forward with no words would shrink
+                # the index silently, so the book is re-chunked below instead.
+                unreadable.add(book_id)
+                retained.pop(book_id, None)
+                continue
             chunk = Chunk(
-                chunk_idx=r[1], text=r[2], char_start=r[3], char_end=r[4],
-                page_start=r[5], page_end=r[6], spine_index=r[7],
-                anchor_text=r[8] or "", section=r[9] or "",
+                chunk_idx=r[1], text=text, char_start=r[2], char_end=r[3],
+                page_start=r[4], page_end=r[5], spine_index=r[6],
+                anchor_text=make_anchor_text(text), section=r[7] or "",
             )
-            vec = carried.get((r[0], r[1]))
-            retained.setdefault(r[0], []).append((chunk, vec))
+            vec = carried.get((book_id, r[1]))
+            retained.setdefault(book_id, []).append((chunk, vec))
+
+        for book_id in sorted(unreadable):
+            path, file_type = files.get(book_id, (None, ""))
+            logger.warning(
+                f"Cached text for {book_id} is unreadable; re-chunking it rather "
+                "than dropping its passages"
+            )
+            try:
+                chunks = _chunk_one(book_id, str(path), file_type, True) if path else []
+            except Exception as e:
+                chunks = []
+                result.errors.append(f"{book_id}: re-chunk failed: {e}")
+            if chunks:
+                fresh[book_id] = chunks
+                result.books_indexed += 1
+            else:
+                result.books_failed += 1
+                result.errors.append(f"{book_id}: cached text lost and cannot be re-read")
 
     # ── Embed what has no vector ────────────────────────────────────────────
     pending: list[tuple[str, int, str]] = []
@@ -358,20 +406,32 @@ def _write_index(
         CHUNK_VECTORS_FILE.parent.mkdir(parents=True, exist_ok=True)
         np.save(tmp, matrix)
 
+    columns = ", ".join(CHUNK_COLUMNS)
+    placeholders = ", ".join("?" * len(CHUNK_COLUMNS))
     with conn:
         conn.execute("DELETE FROM chunks")
         conn.executemany(
-            "INSERT INTO chunks (id, book_id, chunk_idx, text, char_start, char_end, "
-            "                    page_start, page_end, spine_index, anchor_text, section) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            f"INSERT INTO chunks ({columns}) VALUES ({placeholders})",
             [
                 (
-                    row_id, book_id, chunk.chunk_idx, chunk.text,
+                    row_id, book_id, chunk.chunk_idx,
                     chunk.char_start, chunk.char_end,
                     chunk.page_start, chunk.page_end, chunk.spine_index,
-                    chunk.anchor_text, chunk.section,
+                    chunk.section,
                 )
                 for row_id, (book_id, chunk, _) in enumerate(ordered)
+            ],
+        )
+        # `chunks_fts` is contentless, so it is filled here rather than by a
+        # trigger reading a column that no longer exists. The builder already
+        # owns the id space and rewrites every row, so clearing it wholesale
+        # is the same operation the rest of this function performs.
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')")
+        conn.executemany(
+            "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+            [
+                (row_id, chunk.text)
+                for row_id, (_, chunk, _) in enumerate(ordered)
             ],
         )
         conn.execute("DELETE FROM chunk_index_meta")
@@ -397,5 +457,6 @@ def drop_index(conn: sqlite3.Connection) -> None:
     ensure_schema(conn)
     with conn:
         conn.execute("DELETE FROM chunks")
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')")
         conn.execute("DELETE FROM chunk_index_meta")
     CHUNK_VECTORS_FILE.unlink(missing_ok=True)

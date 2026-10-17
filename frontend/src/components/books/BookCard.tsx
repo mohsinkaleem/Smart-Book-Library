@@ -52,9 +52,16 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
           {book.author_primary || book.authors?.[0] || 'Unknown'}
         </p>
         {book.snippet && <SnippetText snippet={book.snippet} />}
-        <div className="mt-auto flex items-center justify-between pt-1">
-          {book.categories?.[0] && <Badge label={book.categories[0]} className="text-[10px]" />}
-          <Rating value={book.user_rating} size={12} readonly />
+        {/* `min-w-0` on the badge's cell is what lets it truncate: without it
+            a long category name is an unshrinkable flex item, so it wrapped
+            and every card in the row ended up a different height. */}
+        <div className="mt-auto flex items-center justify-between gap-1.5 pt-1">
+          <span className="min-w-0">
+            {book.categories?.[0] && <Badge label={book.categories[0]} className="text-[10px]" />}
+          </span>
+          {book.user_rating != null && (
+            <Rating value={book.user_rating} size={12} readonly />
+          )}
         </div>
       </div>
 

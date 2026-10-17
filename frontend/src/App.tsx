@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Header } from './components/layout/Header';
@@ -53,7 +53,13 @@ function Page({ className, children }: { className: string; children: React.Reac
 
 function AppShell() {
   const [view, setView] = useLocalStorage<'grid' | 'list'>('bookView', 'grid');
-  const [sidebarOpen, setSidebarOpen] = useLocalStorage('sidebarOpen', true);
+  // Open by default on a desktop-width viewport, closed on a phone, where it
+  // is a drawer over the grid rather than a column beside it. Lazy, so the
+  // width is only read when nothing is stored yet.
+  const [sidebarOpen, setSidebarOpen] = useLocalStorage(
+    'sidebarOpen',
+    () => typeof window === 'undefined' || window.innerWidth >= 768,
+  );
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [pageCount, setPageCount] = useState(1);
   const location = useLocation();
@@ -85,6 +91,14 @@ function AppShell() {
   });
 
   useScrollToTop();
+
+  // Applying a filter from the drawer should reveal the result it produced.
+  // At `md` and up the sidebar is a permanent column and must stay put.
+  const dismissSidebarOnMobile = useCallback(() => {
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      setSidebarOpen(false);
+    }
+  }, [setSidebarOpen]);
 
   // Listen for keyboard shortcut dialog event from Header button
   useEffect(() => {
@@ -121,6 +135,7 @@ function AppShell() {
                   onClearFilters={clearFilters}
                   collapsed={!sidebarOpen}
                   searchQuery={searchQuery}
+                  onDismiss={dismissSidebarOnMobile}
                 />
                 <Page className="flex-1 overflow-y-auto">
                   <HomePage

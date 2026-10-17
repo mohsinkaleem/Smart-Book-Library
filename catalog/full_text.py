@@ -10,7 +10,11 @@ Two things this module owns:
 
 * **The text.** Written to ``data/text/{book_id}.txt`` rather than into a
   `books` column — 340 MB of prose in a row that every list query reads would
-  make the catalog unusable.
+  make the catalog unusable. It is also the *only* copy: a `chunks` row stores
+  the character span it occupies here and `read_span` reads it back, rather
+  than keeping a second copy of every passage in the database. That second
+  copy was 329 MB of a 670 MB catalog, and the overlap between chunks meant
+  parts of it were stored twice over.
 * **The offset map.** A parallel table saying which page (PDF) or spine item
   (EPUB) each character offset belongs to, cached in
   ``data/text/{book_id}.json``.
@@ -34,11 +38,14 @@ import bisect
 import json
 import logging
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .config import FULL_TEXT_MAX_PAGES, TEXT_DIR
+from .text_utils import clean_page
 
 logger = logging.getLogger(__name__)
 
@@ -97,29 +104,6 @@ class DocumentText:
         }
 
 
-def _clean_page(text: str) -> str:
-    """
-    Tidy one unit of extracted text.
-
-    Deliberately the same shape as `pdf_extractor._clean_extracted_text`:
-    collapse runs of spaces, drop lines that are only a page number, drop
-    one- and two-character line noise. Anything more aggressive (de-hyphenation,
-    header/footer stripping) changes offsets in ways that are hard to reason
-    about and buys little at chunk scale.
-    """
-    if not text:
-        return ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"^\s*\d+\s*$", "", text, flags=re.MULTILINE)
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if stripped and (len(stripped) > 3 or stripped in {".", ",", ":", ";"}):
-            lines.append(stripped)
-    return "\n".join(lines)
-
-
 def _assemble(units: list[str], kind: str, hrefs: Optional[list[str]] = None) -> DocumentText:
     """
     Join cleaned units and record where each one starts.
@@ -147,8 +131,11 @@ def extract_pdf_full_text(file_path: Path) -> DocumentText:
     """Every page of a PDF, via PyMuPDF, with a page offset map."""
     try:
         import pymupdf
-    except ImportError:  # pragma: no cover - dependency is declared in pyproject
-        logger.error("pymupdf not installed. Run: pip install pymupdf")
+    except ImportError:  # pragma: no cover - supplied by the `passages` extra
+        logger.error(
+            "pymupdf not installed — the passage index cannot read PDFs. "
+            "Run: pip install 'books[passages]'"
+        )
         return DocumentText(kind="pdf")
 
     pages: list[str] = []
@@ -157,7 +144,7 @@ def extract_pdf_full_text(file_path: Path) -> DocumentText:
             limit = FULL_TEXT_MAX_PAGES or doc.page_count
             for i in range(min(doc.page_count, limit)):
                 try:
-                    pages.append(_clean_page(doc[i].get_text()))
+                    pages.append(clean_page(doc[i].get_text()))
                 except Exception as e:
                     # One unreadable page must not cost the other 600. It keeps
                     # its slot so every later page number stays correct.
@@ -195,7 +182,7 @@ def extract_epub_full_text(file_path: Path) -> DocumentText:
     items: list[tuple[str, str]] = []
     for item in spine_documents(book):
         try:
-            text = _clean_page(_extract_text_from_html(item.get_content() or b""))
+            text = clean_page(_extract_text_from_html(item.get_content() or b""))
         except Exception as e:
             logger.debug(f"Spine item {item.get_id()} of {file_path.name} failed: {e}")
             text = ""
@@ -256,6 +243,72 @@ def save_cached(book_id: str, doc: DocumentText) -> None:
 def clear_cached(book_id: str) -> None:
     for path in (text_path(book_id), meta_path(book_id)):
         path.unlink(missing_ok=True)
+
+
+# ── Reading passages back out ───────────────────────────────────────────────
+#
+# A passage search touches a handful of books and then asks for ten spans out
+# of them, so whole-book texts are worth holding briefly. Eight books is a few
+# MB and covers a result page, its neighbours and a follow-up query.
+TEXT_CACHE_BOOKS = 8
+
+_text_cache: "OrderedDict[str, str]" = OrderedDict()
+_text_cache_lock = threading.Lock()
+
+
+def clear_text_cache() -> None:
+    with _text_cache_lock:
+        _text_cache.clear()
+
+
+def book_text(
+    book_id: str, file_path: Optional[Path] = None, file_type: str = ""
+) -> str:
+    """
+    A book's extracted text, memoised across calls.
+
+    `data/text` is a cache, not a store of record: when its file is gone and
+    the book itself is still on disk, the text is extracted again rather than
+    leaving every passage in that book unreadable.
+    """
+    with _text_cache_lock:
+        if book_id in _text_cache:
+            _text_cache.move_to_end(book_id)
+            return _text_cache[book_id]
+
+    doc = load_cached(book_id)
+    if doc is None and file_path is not None and Path(file_path).exists():
+        logger.info(f"Cached text for {book_id} is gone; re-extracting")
+        doc = get_full_text(book_id, Path(file_path), file_type)
+    text = doc.text if doc else ""
+
+    with _text_cache_lock:
+        _text_cache[book_id] = text
+        _text_cache.move_to_end(book_id)
+        while len(_text_cache) > TEXT_CACHE_BOOKS:
+            _text_cache.popitem(last=False)
+    return text
+
+
+def read_span(
+    book_id: str,
+    char_start: Optional[int],
+    char_end: Optional[int],
+    file_path: Optional[Path] = None,
+    file_type: str = "",
+) -> str:
+    """
+    One chunk's text, read back from the book's extracted text by offset.
+
+    `.strip()` because the chunker stores the span it cut and reports the
+    stripped body; the two differ by the whitespace at a boundary.
+    """
+    if char_start is None or char_end is None:
+        return ""
+    text = book_text(book_id, file_path, file_type)
+    if not text:
+        return ""
+    return text[char_start:char_end].strip()
 
 
 def get_full_text(

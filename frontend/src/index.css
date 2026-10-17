@@ -204,6 +204,24 @@ body, header, aside, main {
 .react-pdf__Page__textContent mark.pdf-hl-blue   { background-color: rgba(191, 219, 254, 0.72); }
 .react-pdf__Page__textContent mark.pdf-hl-pink   { background-color: rgba(251, 207, 232, 0.72); }
 
+/* Where a retrieved passage landed. Not a highlight the reader saved, so it
+   announces itself and then gets out of the way: `PASSAGE_FLASH_MS` later
+   `PdfReader` drops the mark entirely. */
+.react-pdf__Page__textContent mark.pdf-hl-flash {
+  background-color: rgba(129, 140, 248, 0.45);
+  box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.45);
+  animation: passage-flash 1.6s ease-out 2;
+}
+
+@keyframes passage-flash {
+  0%, 100% { background-color: rgba(129, 140, 248, 0.45); }
+  50%      { background-color: rgba(129, 140, 248, 0.78); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .react-pdf__Page__textContent mark.pdf-hl-flash { animation: none; }
+}
+
 /* epub.js paints its highlights as SVG rects in an overlay above the text,
    so they need the same blend treatment to keep the words underneath legible. */
 .epub-highlight {

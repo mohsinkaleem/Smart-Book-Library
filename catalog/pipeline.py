@@ -10,21 +10,28 @@ allowed anywhere near the record.
                                                                        │
                               covers → reading progress → dedupe → reconcile → save
 
-Resumability: every stage carries a version. A stage runs when its version is
-newer than the version stored on the record, or when the file's content hash
-changed, or when `--force` is given. Everything else is skipped, which makes
-re-running cheap and makes "re-run just the LLM stage" a one-line config change
-instead of `--force`.
+Resumability works in *units*, not stages. A unit carries a version; it runs
+when that version is newer than the one stored on the record, when the file's
+content hash changed, or when `--force` is given. Everything else is skipped,
+which makes re-running cheap and makes "re-run just the LLM stage" a one-line
+config change instead of `--force`.
 
-Invalidation is the delicate half of that. Two rules keep a partial re-run from
-silently destroying data:
+The five metadata stages share one unit (`STAGE_UNIT`). They write the same
+bibliographic fields and settle conflicts by SOURCE_RANK, so re-running one
+without the others would drop a value nothing restores — and the pipeline
+already forced them to run together. One version says that directly.
 
-* a stale stage drags its *dependents* along (`STAGE_DEPENDS_ON`), so `analyze`
+Invalidation is the delicate half of that. Two rules keep a partial re-run
+from silently destroying data:
+
+* a stale unit drags its *dependents* along (`UNIT_DEPENDS_ON`), so `analyze`
   cannot keep categories derived from a description `enrich` has replaced;
-* a re-running stage first withdraws the values it previously wrote
-  (`STAGE_SOURCES` / `STAGE_FIELDS`), so a stale value cannot outrank the fresh
-  one through `SOURCE_RANK`. Output written by a stage that is *not* re-running
-  is left alone — which is why `--no-api` no longer erases verified metadata.
+* re-running work first withdraws the values it previously wrote, so a stale
+  value cannot outrank the fresh one through `SOURCE_RANK`. Output nothing is
+  about to rewrite is left alone — which is why `--no-api` does not erase
+  verified metadata. `enrich` is the one stage inside the metadata unit that
+  can be switched off, so it is also the only one whose provenance labels are
+  withdrawn separately.
 """
 import logging
 import re
@@ -57,47 +64,57 @@ logger = logging.getLogger(__name__)
 
 PER_BOOK_STAGES = ("parse", "extract", "ocr", "identify", "enrich", "analyze", "llm", "embed")
 
-# These five all write the same bibliographic fields and settle conflicts by
-# SOURCE_RANK, so they are invalidated as a cohort: re-running `enrich` while
-# skipping `parse` would drop the filename title with nothing to restore it.
-METADATA_COHORT = ("parse", "extract", "ocr", "identify", "enrich")
+# stage -> the unit of staleness it belongs to. A unit is what carries a
+# version in `STAGE_VERSIONS`, what is marked on the record, and what the
+# dependency graph is expressed over.
+STAGE_UNIT = {
+    "parse": "metadata",
+    "extract": "metadata",
+    "ocr": "metadata",
+    "identify": "metadata",
+    "enrich": "metadata",
+    "analyze": "analyze",
+    "llm": "llm",
+    "embed": "embed",
+}
 
-# stage -> stages whose output it consumes. A stale producer makes every
+# unit -> units whose output it consumes. A stale producer makes every
 # consumer stale, transitively.
-STAGE_DEPENDS_ON = {
-    "analyze": ("extract", "ocr", "enrich"),
+UNIT_DEPENDS_ON = {
+    "analyze": ("metadata",),
     "llm": ("analyze",),
-    "embed": ("extract", "ocr", "enrich", "analyze"),
+    "embed": ("metadata", "analyze"),
 }
 
-# stage -> provenance labels it writes. Re-running the stage resets every field
-# currently carrying one of these labels (user-pinned fields excepted).
-STAGE_SOURCES = {
-    "parse": ("filename",),
-    "extract": ("file_meta",),
-    "ocr": ("file_meta",),
-    "identify": ("front_matter", "derived"),
-    "enrich": ("api_verified", "api_partial", "isbn_match"),
-    "analyze": ("analyzer",),
-    "llm": ("llm",),
-}
+# The metadata stages that read only the file itself. They always re-run
+# together, so they are withdrawn together.
+LOCAL_METADATA_STAGES = frozenset({"parse", "extract", "ocr", "identify"})
+
+# Provenance labels the local stages write. (They overlap by design: an ISBN
+# lifted from the filename by `identify` is tagged `filename`, and `ocr`
+# rewrites the `file_meta` text `extract` produced. That overlap is harmless
+# precisely because the four run as one.)
+LOCAL_SOURCES = ("filename", "file_meta", "front_matter", "derived")
+
+# Provenance labels `enrich` writes. Held separately because `--no-api` turns
+# that stage off while the local ones still run, and a verified title must
+# survive a run that is not going to look it up again.
+API_SOURCES = ("api_verified", "api_partial", "isbn_match")
 
 # stage -> fields it owns outright, written without provenance.
 STAGE_FIELDS = {
     "extract": ("text_excerpt", "front_matter", "content_sample", "has_text",
                 "ocr_required", "page_count", "original_title_meta"),
-    "enrich": ("api_sources", "match_score", "rejected_candidates"),
+    "enrich": ("api_sources", "match_score", "rejected_candidates",
+               "enrichment_status",
+               # Merged lists several stages append to. The local writers
+               # always run together, so these are withdrawn exactly when
+               # `enrich` is re-running too; otherwise a `--no-api` run would
+               # drop the half nobody is about to rewrite.
+               "subjects_raw", "source_ids"),
     "embed": ("embedding", "metadata_embedding"),
 }
 
-# Merged lists several stages append to without provenance. One is withdrawn
-# only when *every* writer is about to re-run, or a partial run (`--no-api`)
-# would drop the part nobody rewrites; left alone, junk from an old extractor
-# stayed forever.
-SHARED_FIELDS = {
-    "subjects_raw": ("extract", "enrich"),
-    "source_ids": ("parse", "extract", "identify", "enrich"),
-}
 
 class StageDeferred(Exception):
     """The stage could not do its job this run (tool missing, provider down); retry next run."""
@@ -179,6 +196,7 @@ class Pipeline:
             "covers_scraped": 0,
             "duplicates_found": 0,
             "needs_review": 0,
+            "unidentified": 0,
             "missing_files": 0,
             "errors": 0,
             "stages_completed": [],
@@ -195,7 +213,7 @@ class Pipeline:
         cheap enough to run on the whole library.
         """
         files = self._stage_scan() if self.config.scan else []
-        per_stage: dict[str, int] = {s: 0 for s in PER_BOOK_STAGES}
+        per_unit: dict[str, int] = {u: 0 for u in STAGE_UNIT.values()}
         new_files = 0
         stale_records = 0
 
@@ -212,15 +230,15 @@ class Pipeline:
                 new_files += 1
             elif outdated:
                 stale_records += 1
-            for stage in outdated:
-                per_stage[stage] += 1
+            for unit in {STAGE_UNIT[s] for s in outdated}:
+                per_unit[unit] += 1
 
         return {
             "files_found": len(files),
             "new_files": new_files,
             "stale_records": stale_records,
             "up_to_date": len(files) - new_files - stale_records,
-            "per_stage": {s: n for s, n in per_stage.items() if n},
+            "per_unit": {u: n for u, n in per_unit.items() if n},
         }
 
     def run(self, max_books: Optional[int] = None, **overrides) -> dict:
@@ -277,6 +295,7 @@ class Pipeline:
         self.stats["elapsed_seconds"] = round(time.time() - start_time, 1)
         self.stats["total_in_catalog"] = self.store.count()
         self.stats["needs_review"] = len(self.store.needs_review())
+        self.stats["unidentified"] = len(self.store.unidentified())
         self.stats["provider_metrics"] = get_metrics()
         self.stats["unhealthy_sources"] = unhealthy_sources()
         self.stats["interrupted"] = interrupted
@@ -362,35 +381,30 @@ class Pipeline:
         """
         Stages that must run for this record.
 
-        A stage is stale when its version moved on. Staleness then spreads two
-        ways: across the metadata cohort (they share fields) and down the
-        dependency graph (a consumer cannot keep output derived from a producer
-        that is about to change).
+        Staleness is decided per *unit* (`STAGE_UNIT`) and then expanded back
+        to the stages that make it up, so the five metadata stages are
+        scheduled as the one thing they have always been. A stale unit also
+        drags its consumers along: `analyze` cannot keep categories derived
+        from a description `enrich` is about to replace.
         """
         enabled = {s for s in PER_BOOK_STAGES if self.config.stage_enabled(s)}
         if record is None or not content_unchanged or self.config.force_reprocess:
             return enabled
 
-        outdated = {
-            s for s in enabled
-            if not record.stage_is_current(s, STAGE_VERSIONS[s])
-        }
-        if not outdated:
-            return outdated
+        units = {STAGE_UNIT[s] for s in enabled}
+        stale = {u for u in units if not record.stage_is_current(u, STAGE_VERSIONS[u])}
 
-        if outdated & set(METADATA_COHORT):
-            outdated |= enabled & set(METADATA_COHORT)
-
-        # Fixed point: PER_BOOK_STAGES is topologically ordered, but iterate
+        # Fixed point: UNIT_DEPENDS_ON is acyclic and shallow, but iterate
         # anyway so the graph can be edited without ordering assumptions.
         while True:
-            grown = outdated | {
-                stage for stage in enabled
-                if outdated & set(STAGE_DEPENDS_ON.get(stage, ()))
+            grown = stale | {
+                unit for unit in units if stale & set(UNIT_DEPENDS_ON.get(unit, ()))
             }
-            if grown == outdated:
-                return outdated
-            outdated = grown
+            if grown == stale:
+                break
+            stale = grown
+
+        return {s for s in enabled if STAGE_UNIT[s] in stale}
 
     def _process_single_book(self, file_path: Path) -> Optional[BookRecord]:
         rel_path = str(file_path.relative_to(PROJECT_ROOT))
@@ -458,40 +472,70 @@ class Pipeline:
         return record
 
     def _invalidate(self, record: BookRecord, outdated: set[str]):
-        """Withdraw the output of every stage that is about to re-run."""
+        """
+        Withdraw the output of every stage that is about to re-run.
+
+        Leaving an old value in place would let it outrank the fresh one
+        through `SOURCE_RANK` and never be replaced. The one split that
+        matters is local-versus-`enrich`: with `--no-api` the local stages
+        re-run and `enrich` does not, so its verified values stay.
+        """
         if not outdated:
             return
         record.processing_errors = []
+
+        sources: set[str] = set()
+        if outdated & LOCAL_METADATA_STAGES:
+            sources.update(LOCAL_SOURCES)
+        if "enrich" in outdated:
+            sources.update(API_SOURCES)
+        if "analyze" in outdated:
+            sources.add("analyzer")
+        if "llm" in outdated:
+            sources.add("llm")
+        record.reset_fields_from(sources)
+
         for stage in outdated:
-            record.reset_fields_from(STAGE_SOURCES.get(stage, ()))
             for name in STAGE_FIELDS.get(stage, ()):
                 record.reset_field(name)
-        for name, writers in SHARED_FIELDS.items():
-            if set(writers) <= outdated:
-                record.reset_field(name)
-        # `enrich` owns the review queue; clearing it there meant a --no-api run
-        # could never retire a stale flag.
-        if outdated & set(METADATA_COHORT):
+
+        # The review queue belongs to the metadata unit as a whole; clearing it
+        # in `enrich` alone meant a --no-api run could never retire a stale flag.
+        if any(STAGE_UNIT[s] == "metadata" for s in outdated):
             record.clear_review()
 
     def _run_book_stages(self, record: BookRecord, file_path: Path, outdated: set[str]):
+        """
+        Run the outdated stages in order and mark the units that completed.
+
+        A unit is marked only when every stage in it finished: one stage that
+        deferred (tool missing, provider down) or failed leaves the whole unit
+        stale so the next run retries it. That is what the per-stage marking
+        amounted to anyway — a stale stage dragged its unit along on the next
+        pass — said in one place instead of two.
+        """
+        incomplete: set[str] = set()
         for name in PER_BOOK_STAGES:
             if name not in outdated:
                 continue
             handler = getattr(self, f"_stage_{name}")
             try:
                 handler(record, file_path)
-                if name != "embed":      # marked by the deferred batch instead
-                    record.mark_stage(name, STAGE_VERSIONS[name])
             except StageDeferred as e:
                 logger.debug(f"   stage '{name}' deferred for {file_path.name}: {e}")
+                incomplete.add(STAGE_UNIT[name])
                 with self._lock:
                     self.stats["stages_deferred"] += 1
             except Exception as e:
                 logger.debug(f"   stage '{name}' failed for {file_path.name}: {e}")
                 record.processing_errors.append(f"{name} failed: {e}")
+                incomplete.add(STAGE_UNIT[name])
                 with self._lock:
                     self.stats["errors"] += 1
+
+        for unit in {STAGE_UNIT[s] for s in outdated} - incomplete:
+            if unit != "embed":      # marked by the deferred batch instead
+                record.mark_stage(unit, STAGE_VERSIONS[unit])
 
     # ── Per-book stages ──────────────────────────────────────────────────────
 
@@ -791,7 +835,9 @@ class Pipeline:
         logger.info(f"    rejected:       {s['api_rejected']}")
         logger.info(f"    no evidence:    {s['api_no_evidence']} (no ISBN, unusable title)")
         logger.info(f"    deferred:       {s['api_deferred']} (provider errors — retried next run)")
-        logger.info(f"    needs review:   {s['needs_review']}")
+        logger.info("")
+        logger.info(f"  Needs a decision: {s['needs_review']} (a human changes something)")
+        logger.info(f"  Unidentified:     {s['unidentified']} (no provider had the book)")
         logger.info("")
         logger.info("  Provider health:")
         for source, counts in (s.get("provider_metrics") or {}).items():

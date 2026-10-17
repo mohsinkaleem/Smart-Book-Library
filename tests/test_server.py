@@ -349,7 +349,9 @@ def test_has_description_false_on_the_list_endpoint(client):
 def test_health_reports_the_catalog(client):
     body = client.get("/api/health").json()
     assert body["status"] == "ok"
-    assert body["books"] == 3          # `book-gone` is `missing`
+    # `book-gone` is `missing`, `book-one-again` is a hidden duplicate —
+    # health reports what the library lists, so all three figures agree.
+    assert body["books"] == 3
     assert body["version"]
     assert "embeddings_loaded" in body
 

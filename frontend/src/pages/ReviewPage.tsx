@@ -7,7 +7,13 @@
  */
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useReviewQueue, usePinField, useResolveReview, type ReviewBook } from '../api/review';
+import {
+  useReviewQueue,
+  usePinField,
+  useResolveReview,
+  type ReviewBook,
+  type ReviewBucket,
+} from '../api/review';
 import { Spinner } from '../components/common/Spinner';
 import { EmptyState } from '../components/common/EmptyState';
 
@@ -144,54 +150,110 @@ function ReviewCard({ book }: { book: ReviewBook }) {
   );
 }
 
-export function ReviewPage() {
-  const [page, setPage] = useState(1);
-  const { data, isLoading, error } = useReviewQueue(page);
+const TABS: { key: ReviewBucket; label: string; blurb: string; empty: string }[] = [
+  {
+    key: 'review',
+    label: 'Needs a decision',
+    blurb:
+      "record(s) where your judgement changes something — a borderline match we declined to trust, or a file we could not title at all. Least certain identity first; corrections are pinned and survive future pipeline runs.",
+    empty: 'Nothing waiting on a decision — every match was either accepted outright or rejected outright.',
+  },
+  {
+    key: 'unidentified',
+    label: 'Not in any provider',
+    blurb:
+      'record(s) no provider could name. Nothing here is wrong, so there is nothing to confirm — but a title read off the cover is worth pinning, and pinned values outrank anything a later run finds.',
+    empty: 'Every book was found in OpenLibrary or Google Books.',
+  },
+];
 
-  if (isLoading) return <div className="p-8"><Spinner /></div>;
+export function ReviewPage() {
+  const [bucket, setBucket] = useState<ReviewBucket>('review');
+  const [page, setPage] = useState(1);
+  const { data, isLoading, error } = useReviewQueue(page, 25, bucket);
+
+  const tab = TABS.find((t) => t.key === bucket) ?? TABS[0];
+
+  const selectTab = (next: ReviewBucket) => {
+    setBucket(next);
+    setPage(1);
+  };
+
+  const tabs = (
+    <div className="mb-4 flex gap-1 border-b border-slate-200 dark:border-slate-700">
+      {TABS.map((t) => {
+        const count = data?.counts?.[t.key];
+        const active = t.key === bucket;
+        return (
+          <button
+            key={t.key}
+            onClick={() => selectTab(t.key)}
+            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+              active
+                ? 'border-blue-600 text-blue-700 dark:text-blue-400'
+                : 'border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+            }`}
+          >
+            {t.label}
+            {count !== undefined && (
+              <span className="ml-1.5 rounded bg-slate-200 px-1.5 py-0.5 text-xs text-slate-700 dark:bg-slate-700 dark:text-slate-200">
+                {count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+
   if (error) return <div className="p-8 text-rose-600">Failed to load the review queue.</div>;
-  if (!data || data.total === 0) {
-    return (
-      <div className="p-8">
-        <EmptyState message="Nothing to review — every record was either verified against a provider or left untouched." />
-      </div>
-    );
-  }
 
   return (
     <div className="mx-auto max-w-4xl p-6">
       <header className="mb-4">
         <h1 className="text-xl font-bold text-slate-900 dark:text-white">Review queue</h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          {data.total} record(s) the verification gate could not confirm, least certain identity
-          first. Corrections are pinned and survive future pipeline runs.
-        </p>
       </header>
 
-      <div className="space-y-3">
-        {data.items.map((book) => (
-          <ReviewCard key={book.id} book={book} />
-        ))}
-      </div>
+      {tabs}
 
-      {data.pages > 1 && (
-        <div className="mt-4 flex items-center justify-between text-sm">
-          <button
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            disabled={page <= 1}
-            className="rounded border border-slate-300 px-3 py-1 disabled:opacity-40 dark:border-slate-600"
-          >
-            Previous
-          </button>
-          <span className="text-slate-500 dark:text-slate-400">Page {page} of {data.pages}</span>
-          <button
-            onClick={() => setPage((p) => Math.min(data.pages, p + 1))}
-            disabled={page >= data.pages}
-            className="rounded border border-slate-300 px-3 py-1 disabled:opacity-40 dark:border-slate-600"
-          >
-            Next
-          </button>
-        </div>
+      {isLoading ? (
+        <div className="p-8"><Spinner /></div>
+      ) : !data || data.total === 0 ? (
+        <div className="p-8"><EmptyState message={tab.empty} /></div>
+      ) : (
+        <>
+          <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
+            {data.total} {tab.blurb}
+          </p>
+
+          <div className="space-y-3">
+            {data.items.map((book) => (
+              <ReviewCard key={book.id} book={book} />
+            ))}
+          </div>
+
+          {data.pages > 1 && (
+            <div className="mt-4 flex items-center justify-between text-sm">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                className="rounded border border-slate-300 px-3 py-1 disabled:opacity-40 dark:border-slate-600"
+              >
+                Previous
+              </button>
+              <span className="text-slate-500 dark:text-slate-400">
+                Page {page} of {data.pages}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(data.pages, p + 1))}
+                disabled={page >= data.pages}
+                className="rounded border border-slate-300 px-3 py-1 disabled:opacity-40 dark:border-slate-600"
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

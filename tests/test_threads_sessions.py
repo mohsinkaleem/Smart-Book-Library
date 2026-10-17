@@ -266,31 +266,58 @@ def test_export_rejects_an_unknown_book(client):
 # ── Duplicates (Part 5) ─────────────────────────────────────────────────────
 
 def test_duplicates_are_grouped_under_their_canonical_book(client):
-    """`book-two` is flagged `duplicate_of: book-one` by the fixture."""
+    """`book-one-again` is flagged `duplicate_of: book-one` by the fixture."""
     groups = client.get("/api/duplicates").json()["groups"]
     assert len(groups) == 1
     assert groups[0]["canonical"]["id"] == "book-one"
-    assert [c["id"] for c in groups[0]["copies"]] == ["book-two"]
+    assert [c["id"] for c in groups[0]["copies"]] == ["book-one-again"]
 
 
 def test_keeping_a_copy_makes_it_canonical_and_leaves_one_group(client):
-    client.post("/api/duplicates/book-two/keep")
+    client.post("/api/duplicates/book-one-again/keep")
 
     groups = client.get("/api/duplicates").json()["groups"]
     assert len(groups) == 1
-    assert groups[0]["canonical"]["id"] == "book-two"
+    assert groups[0]["canonical"]["id"] == "book-one-again"
     assert [c["id"] for c in groups[0]["copies"]] == ["book-one"]
 
     # The new canonical must not point at anything, or the group is a cycle.
-    assert client.get("/api/books/book-two").json()["duplicate_of"] in (None, "")
+    assert client.get("/api/books/book-one-again").json()["duplicate_of"] in (None, "")
 
 
-def test_dismissing_removes_the_mark_and_keeps_both_books(client):
-    client.delete("/api/duplicates/book-two")
+def test_keeping_a_copy_swaps_which_one_the_library_lists(client):
+    """
+    The point of the screen. `routes/duplicates` says resolving a group
+    "hides a copy from the library view"; nothing read `duplicate_of`, so
+    both copies stayed listed whichever button was pressed.
+    """
+    def listed():
+        return {b["id"] for b in client.get("/api/books").json()["items"]}
+
+    assert listed() == {"book-one", "book-two", "book-junk-lang"}
+
+    client.post("/api/duplicates/book-one-again/keep")
+    assert listed() == {"book-one-again", "book-two", "book-junk-lang"}
+
+
+def test_dismissing_removes_the_mark_and_lists_both_books(client):
+    client.delete("/api/duplicates/book-one-again")
 
     assert client.get("/api/duplicates").json()["groups"] == []
-    assert client.get("/api/books/book-two").status_code == 200
+    assert client.get("/api/books/book-one-again").status_code == 200
     assert client.get("/api/books/book-one").status_code == 200
+    # Not a duplicate any more, so the library stops hiding it.
+    listed = {b["id"] for b in client.get("/api/books").json()["items"]}
+    assert {"book-one", "book-one-again"} <= listed
+
+
+def test_a_hidden_copy_is_still_reachable_by_id(client):
+    """
+    Hidden from listings, not deleted: the Duplicates page links straight to
+    it, and that link must not 404.
+    """
+    assert client.get("/api/books/book-one-again").status_code == 200
+    assert client.get("/api/books/book-one-again").json()["duplicate_of"] == "book-one"
 
 
 def test_duplicate_actions_reject_unknown_books(client):

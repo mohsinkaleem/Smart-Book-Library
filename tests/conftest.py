@@ -58,8 +58,27 @@ def catalog_db(tmp_path, monkeypatch):
             "themes": '["computing"]',
             "user_tags": "[]",
             "text_excerpt": "Gradient descent converges slowly on ill-conditioned problems.",
-            # Flagged by the pipeline's duplicate detector — counted by
-            # `/api/stats` and rendered on the book page.
+        },
+        {
+            # A second copy of `book-one`, flagged by the pipeline's duplicate
+            # detector. The library shows the canonical record only, so this
+            # one is absent from every listing, every facet count and the
+            # dashboard total — and present on `/api/duplicates`, which is
+            # where it can be resolved.
+            "id": "book-one-again",
+            "title": "The Art of Thinking",
+            "authors": '["Ada Lovelace"]',
+            "author_primary": "Ada Lovelace",
+            "file_name": "one-copy.pdf",
+            "file_path": "pdfs/one-copy.pdf",
+            "file_type": "pdf",
+            "language": "en",
+            "publication_year": 1998,
+            "description": "A book about self-help.",
+            "status": "ok",
+            "categories": '["Philosophy"]',
+            "themes": '["ethics"]',
+            "user_tags": "[]",
             "duplicate_of": "book-one",
         },
         {

@@ -79,6 +79,46 @@ describe('mapHighlightsToRuns', () => {
     expect(mapHighlightsToRuns(items, [highlight('the')]).size).toBe(0);
   });
 
+  describe('approximate passages', () => {
+    // A retrieved passage was transcribed by the indexer, not taken from this
+    // text layer, and it can run onto the next page. Its beginning is what
+    // the jump is for.
+    const passage =
+      'These interpretive methods constituted the tools of ijtihad, the process ' +
+      'by which a jurist reached a ruling, and they continued onto the next page ' +
+      'where this reader cannot see them at all.';
+
+    it('marks the beginning when the whole passage is not on the page', () => {
+      const items = runs(
+        'These interpretive methods constituted the tools of ijtihad, the process ',
+        'by which a jurist reached a ruling, and they',
+      );
+      const approximate: PageHighlight = {
+        id: 'flash', color: 'flash', text: passage, approximate: true,
+      };
+      expect(mapHighlightsToRuns(items, [approximate]).has(0)).toBe(true);
+    });
+
+    it('marks nothing for the same passage when exactness is required', () => {
+      const items = runs(
+        'These interpretive methods constituted the tools of ijtihad, the process ',
+        'by which a jurist reached a ruling, and they',
+      );
+      // A saved highlight came from this very text layer: a miss means the
+      // page reflowed, and marking a guess would be worse than marking
+      // nothing.
+      expect(mapHighlightsToRuns(items, [highlight(passage)]).size).toBe(0);
+    });
+
+    it('still refuses a page the passage is simply not on', () => {
+      const items = runs('An entirely unrelated page about marine biology.');
+      const approximate: PageHighlight = {
+        id: 'flash', color: 'flash', text: passage, approximate: true,
+      };
+      expect(mapHighlightsToRuns(items, [approximate]).size).toBe(0);
+    });
+  });
+
   it('keeps two highlights on the same page apart', () => {
     const items = runs('First passage here.', ' Middle. ', 'Second passage here.');
     const marks = mapHighlightsToRuns(items, [
