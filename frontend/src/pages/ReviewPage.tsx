@@ -65,7 +65,15 @@ function ReviewCard({ book }: { book: ReviewBook }) {
     <div className="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
       <div className="mb-2 flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <Link to={`/books/${book.id}`} className="truncate font-medium text-slate-900 hover:underline dark:text-white">
+          {/* `block` is what makes `truncate` work: text-overflow needs a
+              block container, and on an inline <a> it does nothing — so a long
+              filename overflowed the min-w-0 column and ran underneath the two
+              score badges to its right. */}
+          <Link
+            to={`/books/${book.id}`}
+            title={book.file_name}
+            className="block truncate font-medium text-slate-900 hover:underline dark:text-white"
+          >
             {book.file_name}
           </Link>
           <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">

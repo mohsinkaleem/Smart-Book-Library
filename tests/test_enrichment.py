@@ -262,6 +262,23 @@ class TestEmbeddedTitles(unittest.TestCase):
         self.assertEqual("", clean_meta_title("Adobe InDesign CS5.5 (7.5)"))
         self.assertEqual("", clean_meta_title("Untitled"))
 
+    def test_presentation_and_converter_extensions_are_artefacts_too(self):
+        """
+        The extension list covered Word and typesetting formats only, so
+        "The Divine Reality - Sapience Institute.pptx" sat in the live catalog
+        as a title — a real title with a filename's extension welded on.
+        """
+        from catalog.pdf_extractor import clean_meta_title
+        self.assertEqual(
+            "The Divine Reality - Sapience Institute",
+            clean_meta_title("The Divine Reality - Sapience Institute.pptx"),
+        )
+        self.assertEqual("Lecture 3", clean_meta_title("Microsoft PowerPoint - Lecture 3.pptx"))
+        self.assertEqual("Ihya Ulum al-Din", clean_meta_title("Ihya Ulum al-Din.epub"))
+        # A working-file name is still no title, whatever it was authored in.
+        self.assertEqual("", clean_meta_title("Microsoft PowerPoint - deck final.pptx"))
+        self.assertEqual("", clean_meta_title("Presentation1"))
+
 
 class TestCoverUsability(unittest.TestCase):
     """

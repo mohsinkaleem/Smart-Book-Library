@@ -1,22 +1,31 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Header } from './components/layout/Header';
 import { Sidebar } from './components/layout/Sidebar';
 import { SearchBar } from './components/search/SearchBar';
 import { HomePage } from './pages/HomePage';
-import { BookPage } from './pages/BookPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { ReviewPage } from './pages/ReviewPage';
-import { Dashboard } from './components/stats/Dashboard';
-import { ReadingView } from './components/reading/ReadingView';
 import { KeyboardShortcutsDialog } from './components/common/KeyboardShortcutsDialog';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
-import { EpubReader } from './components/reading/EpubReader';
-import { PdfReader } from './components/reading/PdfReader';
-import { ReaderRoute } from './components/reading/ReaderRoute';
-import { DuplicatesPage } from './pages/DuplicatesPage';
-import { PassageSearchPage } from './pages/PassageSearchPage';
+import { Spinner } from './components/common/Spinner';
+
+/* Split per route, because the library page was paying for the readers.
+ *
+ * Everything lived in one 1.2 MB entry chunk: react-pdf and pdf.js, Recharts
+ * for a dashboard most visits never open, the duplicate and review screens.
+ * The grid needs none of it, and it is the page every visit starts on.
+ * `react-reader` was already pulled out — EpubReader imports it dynamically —
+ * which is why the EPUB half of the reader is not in that figure either. */
+const BookPage = lazy(() => import('./pages/BookPage').then((m) => ({ default: m.BookPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })));
+const ReviewPage = lazy(() => import('./pages/ReviewPage').then((m) => ({ default: m.ReviewPage })));
+const Dashboard = lazy(() => import('./components/stats/Dashboard').then((m) => ({ default: m.Dashboard })));
+const ReadingView = lazy(() => import('./components/reading/ReadingView').then((m) => ({ default: m.ReadingView })));
+const EpubReader = lazy(() => import('./components/reading/EpubReader').then((m) => ({ default: m.EpubReader })));
+const PdfReader = lazy(() => import('./components/reading/PdfReader').then((m) => ({ default: m.PdfReader })));
+const ReaderRoute = lazy(() => import('./components/reading/ReaderRoute').then((m) => ({ default: m.ReaderRoute })));
+const DuplicatesPage = lazy(() => import('./pages/DuplicatesPage').then((m) => ({ default: m.DuplicatesPage })));
+const PassageSearchPage = lazy(() => import('./pages/PassageSearchPage').then((m) => ({ default: m.PassageSearchPage })));
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useScrollToTop } from './hooks/useScrollToTop';
@@ -42,17 +51,30 @@ export default function App() {
   );
 }
 
-/** Each route body gets its own boundary, so one bad page is not a blank app. */
+/**
+ * Each route body gets its own boundary, so one bad page is not a blank app,
+ * and its own Suspense, so a lazily loaded route shows a spinner in the
+ * content area rather than blanking the shell around it.
+ */
 function Page({ className, children }: { className: string; children: React.ReactNode }) {
   return (
     <main className={className}>
-      <ErrorBoundary>{children}</ErrorBoundary>
+      <ErrorBoundary>
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center p-12">
+              <Spinner />
+            </div>
+          }
+        >
+          {children}
+        </Suspense>
+      </ErrorBoundary>
     </main>
   );
 }
 
 function AppShell() {
-  const [view, setView] = useLocalStorage<'grid' | 'list'>('bookView', 'grid');
   // Open by default on a desktop-width viewport, closed on a phone, where it
   // is a drawer over the grid rather than a column beside it. Lazy, so the
   // width is only read when nothing is stored yet.
@@ -65,8 +87,8 @@ function AppShell() {
   const location = useLocation();
 
   const {
-    searchQuery, searchMode, page, sort, order, filters,
-    setSearchQuery, setSearchMode, setFilter, clearFilters, setPage, setSort,
+    searchQuery, searchMode, page, sort, order, filters, view,
+    setSearchQuery, setSearchMode, setFilter, clearFilters, setPage, setSort, setView,
   } = useLibraryParams();
 
   // The reader routes run `useReaderKeyboard` on the same window; leaving the
@@ -109,19 +131,27 @@ function AppShell() {
 
   return (
     <div className="flex h-screen flex-col">
-      <Header
-        view={view}
-        onViewChange={setView}
-        sidebarOpen={sidebarOpen}
-        onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
-      >
-        <SearchBar
-          value={searchQuery}
-          onChange={setSearchQuery}
-          mode={searchMode}
-          onModeChange={setSearchMode}
-        />
-      </Header>
+      {/* No library chrome over a book. The readers have their own toolbar and
+          their own back button, and the global header put a search box above
+          the page you were reading: typing in it navigated out of the book,
+          mid-page, with no way back to where you were. It also spent 56px of
+          height on controls — grid/list, theme, filters — that mean nothing
+          while reading. */}
+      {!inReader && (
+        <Header
+          view={view}
+          onViewChange={setView}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+        >
+          <SearchBar
+            value={searchQuery}
+            onChange={setSearchQuery}
+            mode={searchMode}
+            onModeChange={setSearchMode}
+          />
+        </Header>
+      )}
 
       <div className="flex flex-1 overflow-hidden">
         <Routes>

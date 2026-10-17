@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { BookOpen, CornerDownRight, Layers, Search, Sparkles } from 'lucide-react';
 import { useSimilarPassages, usePassageIndexStatus } from '../../api/passages';
 import { MIN_COMPARE_CHARS } from './selection';
-import { passageLocation } from './passageLocation';
+import { passageLocation, SIMILARITY_HINT } from './passageLocation';
 import { Spinner } from '../common/Spinner';
 import type { Passage } from '../../api/types';
 
@@ -60,7 +60,10 @@ function PassageCard({
   const body = (
     <>
       <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-        <span className="rounded bg-primary-100 px-1.5 py-0.5 text-[10px] font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300">
+        <span
+          title={SIMILARITY_HINT}
+          className="rounded bg-primary-100 px-1.5 py-0.5 text-[10px] font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300"
+        >
           {Math.round(passage.score * 100)}%
         </span>
         <MatchBadge matched={passage.matched} />

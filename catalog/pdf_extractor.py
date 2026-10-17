@@ -31,10 +31,18 @@ from .text_utils import clean_page, detect_language, detect_script, partition_pa
 
 logger = logging.getLogger(__name__)
 
+# Extensions that turn up *inside* an embedded title, because the authoring
+# tool wrote its own filename into the metadata. `.pptx` was missing and left
+# "The Divine Reality - Sapience Institute.pptx" in the catalog as a title.
+_DOC_EXT = r"doc|docx|dot|dotx|odt|odp|ppt|pptx|pages|key|indd|qxd|tex|rtf"
+#: The same list plus the formats a converter emits, which are artefacts in a
+#: title too but say nothing about the file being a working draft.
+_ANY_EXT = _DOC_EXT + r"|pdf|epub|mobi|azw3|djvu|txt"
+
 _JUNK_TITLE = re.compile(
-    r"^(microsoft\s+word\s*-\s*)|(\.(?:doc|docx|pdf|indd|qxd|tex|rtf)\s*$)|"
-    r"^(untitled|unknown|document\d*|print|output|final|draft|scan\d*|book\d*|"
-    r"new\s+document|copy\s+of\b)",
+    r"^(microsoft\s+(?:word|powerpoint|excel)\s*-\s*)|(\.(?:" + _ANY_EXT + r")\s*$)|"
+    r"^(untitled|unknown|document\d*|presentation\d*|print|output|final|draft|scan\d*|"
+    r"book\d*|new\s+document|copy\s+of\b)",
     re.IGNORECASE,
 )
 
@@ -44,12 +52,13 @@ def clean_meta_title(raw: str) -> str:
     if not raw:
         return ""
     title = re.sub(r"\s+", " ", raw).strip()
-    was_document_name = bool(re.match(r"^microsoft\s+word\s*-\s*", title, flags=re.I))
-    title = re.sub(r"^microsoft\s+word\s*-\s*", "", title, flags=re.I)
+    _tool_prefix = r"^microsoft\s+(?:word|powerpoint|excel)\s*-\s*"
+    was_document_name = bool(re.match(_tool_prefix, title, flags=re.I))
+    title = re.sub(_tool_prefix, "", title, flags=re.I)
     was_document_name = was_document_name or bool(
-        re.search(r"\.(?:doc|docx|indd|qxd|tex|rtf)$", title, flags=re.I)
+        re.search(r"\.(?:" + _DOC_EXT + r")$", title, flags=re.I)
     )
-    title = re.sub(r"\.(?:doc|docx|pdf|indd|qxd|tex|rtf)$", "", title, flags=re.I)
+    title = re.sub(r"\.(?:" + _ANY_EXT + r")$", "", title, flags=re.I)
     title = title.replace("_", " ").strip()
     # "Microsoft Word - AbuUmar_final.doc" leaves "AbuUmar final", which is a
     # working-file name, not a title. Fall back to the filename instead.

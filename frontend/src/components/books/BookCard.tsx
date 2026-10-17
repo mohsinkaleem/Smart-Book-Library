@@ -72,8 +72,15 @@ export function BookCard({ book, onFavorite }: BookCardProps) {
           so the author sits on the same baseline across a row instead of
           floating up on every short title. */}
       <div className="flex flex-1 flex-col gap-1 p-3">
+        {/* `title` carries the full text for the titles `line-clamp-2` cuts
+            off, with the subtitle after it — the card has no room for a third
+            line but the payload already carries the answer. */}
         <h3 className="line-clamp-2 min-h-[2.2rem] text-sm font-semibold leading-tight text-slate-900 dark:text-white">
-          <Link to={`/books/${book.id}`} className="after:absolute after:inset-0 after:content-['']">
+          <Link
+            to={`/books/${book.id}`}
+            title={[book.title, book.subtitle].filter(Boolean).join(' — ') || undefined}
+            className="after:absolute after:inset-0 after:content-['']"
+          >
             {book.title || 'Untitled'}
           </Link>
         </h3>

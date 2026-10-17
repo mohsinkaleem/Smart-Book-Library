@@ -116,6 +116,7 @@ export interface CompareMatch {
   page_end?: number | null;
   spine_index?: number | null;
   section?: string;
+  /** Reader URL for the passage; absent on a book-level fallback match. */
   deep_link?: string;
 }
 

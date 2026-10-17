@@ -24,8 +24,18 @@ export function BookRow({ book }: BookRowProps) {
       className="flex items-center gap-4 border-b border-slate-100 px-4 py-2.5 transition-colors hover:bg-slate-50 dark:border-slate-700/50 dark:hover:bg-slate-800/50"
     >
       <BookCover coverUrl={book.cover_url} title={book.title} fileType={book.file_type} className="h-10 w-8 shrink-0" />
+      {/* The subtitle was selected by the list projection for all 618 books
+          and rendered nowhere. The row is where it belongs: a truncated title
+          is exactly the case it disambiguates, and the data is already here. */}
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-slate-900 dark:text-white">{book.title || 'Untitled'}</p>
+        <p className="truncate text-sm font-medium text-slate-900 dark:text-white" title={book.title}>
+          {book.title || 'Untitled'}
+        </p>
+        {book.subtitle && !book.snippet && (
+          <p className="truncate text-xs text-slate-500 dark:text-slate-400" title={book.subtitle}>
+            {book.subtitle}
+          </p>
+        )}
         {book.snippet && <SnippetText snippet={book.snippet} className="line-clamp-1" />}
       </div>
       <div className="hidden w-40 truncate text-sm text-slate-600 dark:text-slate-400 md:block">

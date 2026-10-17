@@ -6,7 +6,9 @@ import { Spinner } from '../common/Spinner';
 import { ErrorState } from '../common/ErrorBoundary';
 import { formatBytes } from '../../utils/format';
 import { ReadingActivity } from './ReadingActivity';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend,
+} from 'recharts';
 
 /**
  * Recharts wants real colour values, not classes, so the charts cannot pick
@@ -41,6 +43,20 @@ function useChartColors() {
   }, [theme]);
 }
 
+/**
+ * Reading status has meaning, so it gets fixed hues rather than the next
+ * colours off the categorical ramp — the same ones `BookCard`'s status dot
+ * uses. It shares a card with the file-type pie, and both series used to start
+ * at `series[0]`: "PDF" and "Unread" were the same colour, "EPUB" and
+ * "Reading" the same, in two legends six inches apart.
+ */
+const STATUS_COLORS: Record<string, string> = {
+  not_started: '#94a3b8',
+  in_progress: '#3b82f6',
+  finished: '#10b981',
+  abandoned: '#f87171',
+};
+
 /** `x / 0` rendered as `NaN%` on an empty library. */
 function percent(part: number, whole: number): string {
   if (!whole) return '—';
@@ -73,8 +89,9 @@ export function Dashboard() {
   if (!stats) return null;
 
   const typeData = Object.entries(stats.by_type).map(([name, value]) => ({ name: name.toUpperCase(), value }));
-  const statusData = Object.entries(stats.by_status).map(([name, value]) => ({
-    name: name.replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase()), value,
+  const statusData = Object.entries(stats.by_status).map(([key, value]) => ({
+    key,
+    name: key.replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase()), value,
   }));
 
   return (
@@ -131,22 +148,34 @@ export function Dashboard() {
           <h2 className="mb-4 text-sm font-bold text-slate-700 dark:text-slate-300">By File Type</h2>
           <ResponsiveContainer width="100%" height={200}>
             <PieChart>
-              <Pie data={typeData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label>
+              {/* The slices carried no names: the default `label` prints the
+                  value, so the chart read "521" and "97" with no way to tell
+                  which was which but hovering. */}
+              <Pie
+                data={typeData}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                outerRadius={70}
+                label={({ name, value }) => `${name} ${value}`}
+              >
                 {typeData.map((_, i) => (
                   <Cell key={i} fill={colors.series[i % colors.series.length]} />
                 ))}
               </Pie>
+              <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: 12 }} />
               <Tooltip contentStyle={tooltipStyle} />
             </PieChart>
           </ResponsiveContainer>
 
           <h2 className="mb-4 mt-6 text-sm font-bold text-slate-700 dark:text-slate-300">Reading Status</h2>
           <div className="space-y-2">
-            {statusData.map((s, i) => (
-              <div key={s.name} className="flex items-center gap-3">
+            {statusData.map((s) => (
+              <div key={s.key} className="flex items-center gap-3">
                 <div
                   className="h-2.5 w-2.5 rounded-full"
-                  style={{ backgroundColor: colors.series[i % colors.series.length] }}
+                  style={{ backgroundColor: STATUS_COLORS[s.key] ?? colors.axis }}
                 />
                 <span className="flex-1 text-sm text-slate-600 dark:text-slate-400">{s.name}</span>
                 <span className="text-sm font-bold text-slate-900 dark:text-white">{s.value}</span>

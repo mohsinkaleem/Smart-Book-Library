@@ -6,7 +6,7 @@ import {
   usePassageSearch,
   type PassageMode,
 } from '../api/passages';
-import { passageLocation } from '../components/reading/passageLocation';
+import { passageLocation, SIMILARITY_HINT } from '../components/reading/passageLocation';
 import { Spinner } from '../components/common/Spinner';
 import type { Passage } from '../api/types';
 
@@ -34,7 +34,10 @@ function ResultRow({ passage }: { passage: Passage }) {
         <span className="ml-auto flex items-center gap-2 text-xs text-slate-400">
           {location && <span>{location}</span>}
           {passage.score > 0 && (
-            <span className="rounded bg-primary-100 px-1.5 py-0.5 font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300">
+            <span
+              title={SIMILARITY_HINT}
+              className="rounded bg-primary-100 px-1.5 py-0.5 font-bold text-primary-700 dark:bg-primary-900/50 dark:text-primary-300"
+            >
               {Math.round(passage.score * 100)}%
             </span>
           )}
